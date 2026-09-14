@@ -7,12 +7,18 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "postinstall": "prisma skills sync || exit 0"
+    "prisma:generate": "prisma generate",
+    "prisma:push": "prisma db push",
+    "create:api-key": "tsx scripts/create-api-key.ts",
+    "test": "tsx scripts/verify-service.ts",
+    "test:e2e": "tsx scripts/e2e-live-test.ts",
+    "test:live": "tsx scripts/test-live-features.ts"
   },
   "dependencies": {
-    "@prisma/client": "^7.10.0",
+    "@prisma/client": "^6.19.0",
+    "dotenv": "^17.4.2",
     "next": "16.3.5",
-    "prisma": "^8.0.0-rc.13",
+    "prisma": "^6.19.0",
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "zod": "^4.6.2"

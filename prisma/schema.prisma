@@ -1,0 +1,182 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+enum MessageDirection {
+  INBOUND
+  OUTBOUND
+}
+
+enum MessageType {
+  TEXT
+  TEMPLATE
+  IMAGE
+  DOCUMENT
+  AUDIO
+  VIDEO
+  INTERACTIVE
+}
+
+enum MessageStatus {
+  QUEUED
+  SENT
+  DELIVERED
+  READ
+  FAILED
+  RECEIVED
+}
+
+enum ProcessingStatus {
+  PENDING
+  PROCESSED
+  FAILED
+}
+
+enum DeliveryStatus {
+  PENDING
+  SUCCESS
+  FAILED
+}
+
+enum OtpStatus {
+  PENDING
+  VERIFIED
+  EXPIRED
+  FAILED
+}
+
+model Message {
+  id                 String           @id @default(uuid())
+  providerMessageId  String?          @unique
+  direction          MessageDirection
+  type               MessageType      @default(TEXT)
+  status             MessageStatus    @default(QUEUED)
+  from               String
+  to                 String
+  body               String?
+  templateName       String?
+  templateLanguage   String?
+  templateParameters String?
+  mediaId            String?
+  mediaUrl           String?
+  errorCode          String?
+  errorMessage       String?
+  metadata           String?
+  idempotencyKey     String?          @unique
+  sentAt             DateTime?
+  deliveredAt        DateTime?
+  readAt             DateTime?
+  failedAt           DateTime?
+  createdAt          DateTime         @default(now())
+  updatedAt          DateTime         @updatedAt
+
+  @@index([providerMessageId])
+  @@index([to])
+  @@index([from])
+  @@index([status])
+  @@index([direction])
+  @@index([createdAt])
+}
+
+model MessageEvent {
+  id                String           @id @default(uuid())
+  providerEventId   String?          @unique
+  providerMessageId String?
+  eventType         String
+  payload           String
+  processingStatus  ProcessingStatus @default(PENDING)
+  errorMessage      String?
+  receivedAt        DateTime         @default(now())
+  processedAt       DateTime?
+  createdAt         DateTime         @default(now())
+
+  @@index([providerEventId])
+  @@index([providerMessageId])
+  @@index([eventType])
+}
+
+model ApiClient {
+  id          String   @id @default(uuid())
+  name        String
+  description String?
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  keys        ApiKey[]
+}
+
+model ApiKey {
+  id         String    @id @default(uuid())
+  clientId   String
+  name       String
+  keyPrefix  String
+  keyHash    String    @unique
+  lastUsedAt DateTime?
+  expiresAt  DateTime?
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  client ApiClient @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@index([keyHash])
+  @@index([keyPrefix])
+  @@index([clientId])
+}
+
+model WebhookEndpoint {
+  id               String            @id @default(uuid())
+  name             String
+  url              String
+  secretHash       String
+  active           Boolean           @default(true)
+  subscribedEvents String
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+  deliveries       WebhookDelivery[]
+}
+
+model WebhookDelivery {
+  id             String         @id @default(uuid())
+  endpointId     String
+  eventId        String?
+  messageEventId String?
+  eventType      String
+  payload        String
+  status         DeliveryStatus @default(PENDING)
+  attemptCount   Int            @default(0)
+  nextAttemptAt  DateTime?
+  lastAttemptAt  DateTime?
+  responseStatus Int?
+  responseBody   String?
+  errorMessage   String?
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  endpoint WebhookEndpoint @relation(fields: [endpointId], references: [id], onDelete: Cascade)
+
+  @@index([endpointId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model OtpVerification {
+  id          String    @id @default(uuid())
+  destination String
+  purpose     String
+  codeHash    String
+  status      OtpStatus @default(PENDING)
+  expiresAt   DateTime
+  attempts    Int       @default(0)
+  verifiedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([destination])
+  @@index([purpose])
+  @@index([status])
+}
