@@ -26,17 +26,19 @@ export async function GET() {
 
     return NextResponse.json({
       success: true,
-      stats: {
-        totalMessages,
-        outboundCount,
-        inboundCount,
-        failedCount,
+      data: {
+        stats: {
+          totalMessages,
+          outboundCount,
+          inboundCount,
+          failedCount,
+        },
+        health: {
+          database: dbStatus,
+          metaCloudApi: isMetaConfigured() ? "configured" : "unconfigured",
+        },
+        recentMessages,
       },
-      health: {
-        database: dbStatus,
-        metaCloudApi: isMetaConfigured() ? "configured" : "unconfigured",
-      },
-      recentMessages,
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Error loading dashboard overview";

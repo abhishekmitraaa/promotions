@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "prebuild": "prisma generate",
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
@@ -11,9 +12,14 @@
     "prisma:push": "prisma db push",
     "create:api-key": "tsx scripts/create-api-key.ts",
     "setup": "tsx scripts/setup.ts",
+    "pretest": "prisma generate",
     "test": "tsx scripts/verify-service.ts",
     "test:e2e": "tsx scripts/e2e-live-test.ts",
     "test:live": "tsx scripts/test-live-features.ts"
+  },
+  "overrides": {
+    "deepmerge-ts": "^8.0.2",
+    "effect": "^3.20.0"
   },
   "dependencies": {
     "@prisma/client": "^6.19.0",

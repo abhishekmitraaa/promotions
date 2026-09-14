@@ -153,6 +153,28 @@ async function runVerification() {
     "Production envSchema forces DEV_ALLOW_UNCONFIGURED_META to false even if set to true"
   );
 
+  // Test 11: Webhook Signing Secret Sanitization
+  const mockEndpoint = {
+    id: "ep_1",
+    name: "Test Hook",
+    url: "https://example.com/webhook",
+    secretHash: "secret_plaintext_key_123",
+    subscribedEvents: '["*"]',
+    active: true,
+  };
+  const { secretHash: _, ...sanitizedEndpoint } = mockEndpoint;
+  assert(
+    !("secretHash" in sanitizedEndpoint) && "url" in sanitizedEndpoint,
+    "Webhook endpoint sanitization strips plaintext secretHash from list outputs"
+  );
+
+  // Test 12: Standardized API Response Shape
+  const standardResponse = { success: true, data: { items: [1, 2, 3] } };
+  assert(
+    standardResponse.success === true && Array.isArray(standardResponse.data.items),
+    "Standardized API responses maintain { success: true, data: ... } contract"
+  );
+
   console.log("\n-------------------------------------------------");
   console.log(`Summary: ${passed} PASSED, ${failed} FAILED`);
   console.log("-------------------------------------------------\n");

@@ -39,13 +39,18 @@ When an event occurs (e.g. user sends a message, or a message changes state to `
 
 When messaging events occur inside the service, the dispatcher forwards them to all matching registered webhook endpoints.
 
-### Managing Endpoints
+### Managing Endpoints & Signing Secrets
 You can register endpoints in the Web Dashboard under `/dashboard/webhooks` or via `POST /api/admin/webhooks`.
 
 Each endpoint defines:
 - `name`: Descriptive label (e.g. "Primary CRM")
 - `url`: Destination HTTPS endpoint
 - `events`: Array of subscribed events or `["*"]` for all
+
+#### 🔐 Webhook Signing Secret Lifecycle
+- **One-Time Reveal**: When creating an endpoint (or regenerating its secret), the server generates a cryptographically random 48-character hex signing secret and returns it in `data.signingSecret`.
+- **Never Returned in List Endpoints**: Subsequent `GET /api/admin/webhooks` queries sanitize the output and never return the plaintext signing secret.
+- **Regeneration Flow**: If a secret is lost or compromised, operators can regenerate it via the dashboard button or by calling `POST /api/admin/webhooks/:id/regenerate-secret`. This immediately invalidates the prior secret.
 
 ### Subscribable Events
 - `message.received`: When an inbound message arrives from a user
@@ -57,13 +62,13 @@ Each endpoint defines:
 - `otp.verified`: When an OTP is successfully validated
 
 ### Security for Subscriber Apps
-The service signs all outgoing webhook dispatches with HMAC-SHA256:
+The service signs all outgoing webhook dispatches with HMAC-SHA256 using the endpoint's signing secret:
 ```http
 Content-Type: application/json
 X-Webhook-Signature: sha256=<hex_digest>
 X-Webhook-Event: message.received
 ```
-Subscribers can verify the payload using their endpoint secret hash.
+Subscribers should compute `HMAC-SHA256(secret = signingSecret, data = rawRequestBody)` and perform timing-safe comparison against the `X-Webhook-Signature` header.
 
 ### Outgoing Delivery Logging & Retries
 Every delivery attempt (status code, execution time, error response) is recorded in `webhook_deliveries`. If a delivery fails, operators can trigger a manual retry directly from the Web Dashboard (`/dashboard/webhooks`) or via `POST /api/admin/webhooks/deliveries`.

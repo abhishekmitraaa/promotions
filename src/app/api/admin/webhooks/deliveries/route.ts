@@ -14,7 +14,7 @@ export async function GET() {
       take: 50,
     });
 
-    return NextResponse.json({ success: true, deliveries, data: deliveries });
+    return NextResponse.json({ success: true, data: deliveries });
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Error fetching delivery history";
     return NextResponse.json({ success: false, error: msg }, { status: 500 });
@@ -48,7 +48,10 @@ export async function POST(req: NextRequest) {
       delivery.eventType
     ).catch(() => {});
 
-    return NextResponse.json({ success: true, message: "Delivery retry initiated" });
+    return NextResponse.json({
+      success: true,
+      data: { message: "Delivery retry initiated", deliveryId },
+    });
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Error retrying webhook delivery";
     return NextResponse.json({ success: false, error: msg }, { status: 500 });

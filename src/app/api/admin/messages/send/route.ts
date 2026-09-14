@@ -36,18 +36,20 @@ export async function POST(req: NextRequest) {
     const result = await MessageService.send(parseResult.data);
     const statusCode = result.status === MessageStatus.FAILED ? 502 : 200;
 
+    const messageData = {
+      id: result.id,
+      providerMessageId: result.providerMessageId,
+      status: result.status,
+      to: result.to,
+      type: result.type,
+      sentAt: result.sentAt,
+      ...(result.error ? { error: result.error } : {}),
+    };
+
     return NextResponse.json(
       {
         success: result.status !== MessageStatus.FAILED,
-        message: {
-          id: result.id,
-          providerMessageId: result.providerMessageId,
-          status: result.status,
-          to: result.to,
-          type: result.type,
-          sentAt: result.sentAt,
-          ...(result.error ? { error: result.error } : {}),
-        },
+        data: messageData,
       },
       { status: statusCode }
     );

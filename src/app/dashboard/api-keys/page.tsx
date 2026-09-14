@@ -44,7 +44,7 @@ export default function DashboardApiKeysPage() {
       const res = await fetch("/api/admin/api-keys");
       const json = await res.json();
       if (json.success) {
-        setClients(json.clients);
+        setClients(json.data || json.clients || []);
       }
     } catch (err) {
       console.error("Failed to load API keys:", err);

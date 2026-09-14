@@ -37,7 +37,7 @@ export default function DashboardOverviewPage() {
       const res = await fetch("/api/admin/overview");
       const json = await res.json();
       if (json.success) {
-        setData(json);
+        setData(json.data || json);
       }
     } catch (err) {
       console.error("Failed to fetch dashboard stats:", err);

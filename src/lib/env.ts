@@ -98,30 +98,40 @@ export const envSchema = z
 export type Env = z.infer<typeof envSchema>;
 
 let parsedEnv: Env;
+const isBuildPhase = process.env.NEXT_PHASE === "phase-production-build";
 
 try {
   parsedEnv = envSchema.parse(process.env);
 } catch (error) {
-  if (error instanceof z.ZodError) {
-    console.error("❌ Invalid environment variables configuration:", JSON.stringify(error.format(), null, 2));
-  } else {
-    console.error("❌ Failed to parse environment variables:", error);
-  }
-
-  // In production, never fall back silently to defaults!
+  // In production runtime, NEVER start the server with invalid environment!
   if (process.env.NODE_ENV === "production") {
-    const isBuildPhase = process.env.NEXT_PHASE === "phase-production-build";
     if (!isBuildPhase) {
+      if (error instanceof z.ZodError) {
+        console.error(
+          "❌ Fatal Production Environment Error:",
+          JSON.stringify(error.format(), null, 2)
+        );
+      } else {
+        console.error("❌ Failed to parse environment variables:", error);
+      }
       throw new Error(
         "Fatal: Production environment configuration validation failed. Server startup halted."
       );
     }
-    console.warn(
-      "⚠️ Warning: Production environment configuration validation failed during build. Server startup will fail if valid secrets are not supplied at runtime."
-    );
+    // During build phase, suppress worker thread error dumps
+  } else {
+    // In local development, log validation errors for developer visibility
+    if (error instanceof z.ZodError) {
+      console.error(
+        "❌ Invalid environment variables configuration:",
+        JSON.stringify(error.format(), null, 2)
+      );
+    } else {
+      console.error("❌ Failed to parse environment variables:", error);
+    }
   }
 
-  // In non-production development/test only, fall back to safe local dev defaults
+  // In non-production or during build phase fallback, initialize with safe defaults
   parsedEnv = envSchema.parse({});
 }
 

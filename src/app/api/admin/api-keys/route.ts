@@ -22,7 +22,7 @@ export async function GET() {
       orderBy: { createdAt: "desc" },
     });
 
-    return NextResponse.json({ success: true, clients, data: clients });
+    return NextResponse.json({ success: true, data: clients });
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Error listing API clients";
     return NextResponse.json({ success: false, error: msg }, { status: 500 });

@@ -1,0 +1,50 @@
+import { NextRequest, NextResponse } from "next/server";
+import { prisma } from "@/lib/prisma";
+import crypto from "crypto";
+
+export async function POST(
+  req: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const { id } = await params;
+
+  try {
+    const existing = await prisma.webhookEndpoint.findUnique({
+      where: { id },
+    });
+
+    if (!existing) {
+      return NextResponse.json(
+        { success: false, error: "Webhook endpoint not found" },
+        { status: 404 }
+      );
+    }
+
+    const newSigningSecret = crypto.randomBytes(24).toString("hex");
+
+    const updated = await prisma.webhookEndpoint.update({
+      where: { id },
+      data: { secretHash: newSigningSecret },
+      select: {
+        id: true,
+        name: true,
+        url: true,
+        active: true,
+        subscribedEvents: true,
+        createdAt: true,
+        updatedAt: true,
+      },
+    });
+
+    return NextResponse.json({
+      success: true,
+      data: {
+        ...updated,
+        signingSecret: newSigningSecret,
+      },
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Error regenerating signing secret";
+    return NextResponse.json({ success: false, error: msg }, { status: 500 });
+  }
+}

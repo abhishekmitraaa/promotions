@@ -91,7 +91,7 @@ export default function DashboardMessagesPage() {
       if (res.ok && json.success) {
         setSendResult({
           success: true,
-          msg: `Message queued successfully! Provider ID: ${json.message.providerMessageId || "Simulated"}`,
+          msg: `Message queued successfully! Provider ID: ${json.data?.providerMessageId || json.message?.providerMessageId || "Simulated"}`,
         });
         fetchMessages();
         setTimeout(() => {

@@ -13,7 +13,7 @@ export async function POST(
       data: { revokedAt: new Date() },
     });
 
-    return NextResponse.json({ success: true, key: updated });
+    return NextResponse.json({ success: true, data: updated });
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Error revoking API key";
     return NextResponse.json({ success: false, error: msg }, { status: 500 });
