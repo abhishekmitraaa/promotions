@@ -1,7 +1,7 @@
 import { prisma } from "../prisma";
 import { normalizePhoneNumber } from "../crypto";
 import { sendWhatsAppMessage } from "../whatsapp/client";
-import { MetaOutboundPayload } from "../whatsapp/types";
+import { MetaOutboundPayload, MetaTemplateComponent } from "../whatsapp/types";
 import { CreateMessageInput } from "../validation/messages";
 import { MessageDirection, MessageStatus, MessageType } from "@prisma/client";
 import { WhatsAppApiError } from "../whatsapp/errors";
@@ -26,13 +26,14 @@ export interface SendMessageResult {
 
 export class MessageService {
   /**
-   * Process and send an outbound WhatsApp message.
+   * Dispatch an outbound WhatsApp message (Text or Template)
    */
   static async send(
     input: CreateMessageInput,
     options?: SendMessageOptions
   ): Promise<SendMessageResult> {
     const normalizedTo = normalizePhoneNumber(input.to);
+    const typeEnum = input.type.toUpperCase() as MessageType;
     const idempotencyKey = options?.idempotencyKey?.trim();
 
     // 1. Idempotency Check
@@ -40,6 +41,7 @@ export class MessageService {
       const existing = await prisma.message.findUnique({
         where: { idempotencyKey },
       });
+
       if (existing) {
         return {
           id: existing.id,
@@ -48,14 +50,9 @@ export class MessageService {
           to: existing.to,
           type: existing.type,
           sentAt: existing.sentAt,
-          error: existing.errorMessage
-            ? { code: existing.errorCode, message: existing.errorMessage }
-            : undefined,
         };
       }
     }
-
-    const typeEnum = input.type === "template" ? MessageType.TEMPLATE : MessageType.TEXT;
 
     // 2. Create QUEUED Record in DB
     const messageRecord = await prisma.message.create({
@@ -90,6 +87,9 @@ export class MessageService {
           language: {
             code: input.templateLanguage || "en_US",
           },
+          ...(input.templateParameters && input.templateParameters.length > 0
+            ? { components: input.templateParameters as unknown as MetaTemplateComponent[] }
+            : {}),
         },
       };
     } else {

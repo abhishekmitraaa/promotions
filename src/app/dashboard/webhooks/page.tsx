@@ -36,13 +36,8 @@ export default function DashboardWebhooksPage() {
   const [events, setEvents] = useState<string[]>(["*"]);
   const [adding, setAdding] = useState(false);
 
-  useEffect(() => {
-    fetchWebhookData();
-  }, []);
-
   async function fetchWebhookData() {
     try {
-      setLoading(true);
       const [epRes, delRes] = await Promise.all([
         fetch("/api/admin/webhooks"),
         fetch("/api/admin/webhooks/deliveries"),
@@ -59,6 +54,10 @@ export default function DashboardWebhooksPage() {
       setLoading(false);
     }
   }
+
+  useEffect(() => {
+    fetchWebhookData();
+  }, []);
 
   async function handleAddEndpoint(e: React.FormEvent) {
     e.preventDefault();
@@ -80,7 +79,7 @@ export default function DashboardWebhooksPage() {
       } else {
         alert(json.error || "Failed to add webhook endpoint");
       }
-    } catch (err) {
+    } catch {
       alert("Error adding webhook endpoint");
     } finally {
       setAdding(false);
@@ -134,7 +133,7 @@ export default function DashboardWebhooksPage() {
             <div className="p-8 text-center text-zinc-500 text-sm">Loading webhooks...</div>
           ) : endpoints.length === 0 ? (
             <div className="p-8 text-center text-zinc-500 text-sm">
-              No outgoing webhook endpoints registered yet. Click "Add Webhook Endpoint" to receive real-time events.
+              No outgoing webhook endpoints registered yet. Click &quot;Add Webhook Endpoint&quot; to receive real-time events.
             </div>
           ) : (
             endpoints.map((ep) => (
@@ -283,7 +282,7 @@ export default function DashboardWebhooksPage() {
                 <label className="block text-xs font-semibold text-zinc-400 uppercase mb-1">
                   Subscribed Event Types
                 </label>
-                <p className="text-[11px] text-zinc-500 mb-2">Use '*' for all events, or comma-separated list like 'message.received, message.sent'</p>
+                <p className="text-[11px] text-zinc-500 mb-2">Use &apos;*&apos; for all events, or comma-separated list like &apos;message.received, message.sent&apos;</p>
                 <input
                   type="text"
                   required

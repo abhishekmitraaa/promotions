@@ -3,10 +3,31 @@ import { authenticateApiKey } from "@/lib/api-auth";
 import { createMessageSchema } from "@/lib/validation/messages";
 import { MessageService } from "@/lib/services/message-service";
 import { MessageDirection, MessageStatus } from "@prisma/client";
+import { checkRateLimit } from "@/lib/rate-limit";
 
 export async function POST(req: NextRequest) {
   const auth = await authenticateApiKey(req);
   if (!auth.authenticated) return auth.errorResponse!;
+
+  // In-memory rate limiting per API key (60 messages per minute)
+  const rateLimit = checkRateLimit(`msg_key_${auth.keyId || "anon"}`, 60, 60000);
+  if (!rateLimit.success) {
+    return NextResponse.json(
+      {
+        success: false,
+        error: {
+          code: "RATE_LIMITED",
+          message: `Too many message dispatch requests. Rate limit exceeded. Retry in ${rateLimit.resetSeconds} seconds.`,
+        },
+      },
+      {
+        status: 429,
+        headers: {
+          "Retry-After": String(rateLimit.resetSeconds),
+        },
+      }
+    );
+  }
 
   let bodyJson: unknown;
   try {
@@ -42,18 +63,21 @@ export async function POST(req: NextRequest) {
     const result = await MessageService.send(parseResult.data, { idempotencyKey });
     const statusCode = result.status === MessageStatus.FAILED ? 502 : 200;
 
+    const messageData = {
+      id: result.id,
+      providerMessageId: result.providerMessageId,
+      status: result.status,
+      to: result.to,
+      type: result.type,
+      sentAt: result.sentAt,
+      ...(result.error ? { error: result.error } : {}),
+    };
+
     return NextResponse.json(
       {
         success: result.status !== MessageStatus.FAILED,
-        message: {
-          id: result.id,
-          providerMessageId: result.providerMessageId,
-          status: result.status,
-          to: result.to,
-          type: result.type,
-          sentAt: result.sentAt,
-          ...(result.error ? { error: result.error } : {}),
-        },
+        data: messageData,
+        message: messageData,
       },
       { status: statusCode }
     );

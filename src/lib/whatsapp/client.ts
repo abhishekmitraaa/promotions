@@ -23,7 +23,7 @@ export async function sendWhatsAppMessage(
 
   // Local development check
   if (!isMetaConfigured()) {
-    if (env.DEV_ALLOW_UNCONFIGURED_META) {
+    if (env.DEV_ALLOW_UNCONFIGURED_META && process.env.NODE_ENV !== "production") {
       logger.warn(
         `[Dev Mode] META credentials missing. Simulating send for recipient ${payload.to}`
       );
@@ -36,7 +36,9 @@ export async function sendWhatsAppMessage(
     }
 
     throw new WhatsAppApiError(
-      "Meta WhatsApp Cloud API credentials (META_ACCESS_TOKEN and META_PHONE_NUMBER_ID) are missing or invalid in environment configuration.",
+      process.env.NODE_ENV === "production"
+        ? "Meta WhatsApp Cloud API credentials are not configured on this server."
+        : "Meta WhatsApp Cloud API credentials (META_ACCESS_TOKEN and META_PHONE_NUMBER_ID) are missing or invalid in environment configuration.",
       400
     );
   }

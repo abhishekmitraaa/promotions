@@ -5,7 +5,7 @@ import path from "path";
 function ensureServerlessDatabase() {
   if (process.env.NETLIFY || process.env.AWS_LAMBDA_FUNCTION_NAME || process.env.DATABASE_URL?.includes("/tmp/")) {
     const targetPath = "/tmp/dev.db";
-    if (!fs.existsSync(targetPath)) {
+    if (!fs.existsSync(/*turbopackIgnore: true*/ targetPath)) {
       const candidates = [
         path.join(process.cwd(), "prisma", "dev.db"),
         path.join(process.cwd(), "dev.db"),
@@ -16,7 +16,7 @@ function ensureServerlessDatabase() {
       ];
 
       for (const candidate of candidates) {
-        if (fs.existsSync(candidate)) {
+        if (fs.existsSync(/*turbopackIgnore: true*/ candidate)) {
           try {
             fs.copyFileSync(candidate, targetPath);
             break;

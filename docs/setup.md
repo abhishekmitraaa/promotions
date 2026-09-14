@@ -1,41 +1,95 @@
-# Setup & Environment Guide
+# Setup & Local Developer Guide
 
-## Prerequisites
+This guide walks through configuring, installing, and running the WhatsApp Hub infrastructure service locally.
 
-1. **Node.js**: v20 or higher recommended.
-2. **npm**: v10 or higher.
-3. **SQLite**: Used automatically via Prisma ORM for local development (`dev.db`).
+---
 
-## Step-by-Step Installation
+## 1. System Requirements
+
+- **Node.js**: v20.x or higher
+- **npm**: v10.x or higher
+- **Database**: SQLite (managed automatically via Prisma ORM)
+
+---
+
+## 2. Automated Initialization
+
+The easiest way to bootstrap the project is using the automated setup script:
 
 ```bash
-# 1. Install dependencies
+# Clone the repository
+git clone https://github.com/abhishekmitraaa/promotions.git
+cd whatsapp-hub
+
+# Install dependencies
 npm install
 
-# 2. Setup environment configuration
-cp .env.example .env.local
-
-# 3. Push Prisma schema to SQLite database
-npx prisma db push
-
-# 4. Generate local API Key
-npx tsx scripts/create-api-key.ts --client "MyLocalApp"
-
-# 5. Start dev server
-npm run dev
+# Run automated setup
+npm run setup
 ```
 
-## Environment Variables Reference
+### What `npm run setup` Does:
+1. Verifies existing environment files; if `.env.local` is missing, it clones `.env.example`.
+2. Checks if `API_KEY_PEPPER` is set or default; if missing, it automatically generates a 64-character cryptographically secure random string.
+3. Automatically executes `npx prisma db push` to synchronize the SQLite database schema (`prisma/dev.db`).
+4. Ensures SQLite database files (`dev.db`, `dev.db-journal`) remain untracked by Git.
 
-| Variable | Required | Default | Description |
+---
+
+## 3. Environment Variables Reference
+
+All configurations are defined in `.env.local`:
+
+| Variable | Type | Default | Description |
 |---|---|---|---|
-| `DATABASE_URL` | Yes | `file:./dev.db` | SQLite connection URL |
-| `APP_URL` | Yes | `http://localhost:3000` | Application base URL |
-| `META_GRAPH_API_VERSION` | Yes | `v22.0` | Meta Graph API version |
-| `META_ACCESS_TOKEN` | Production | `""` | Permanent system user token |
-| `META_PHONE_NUMBER_ID` | Production | `""` | WhatsApp Phone Number ID |
-| `META_WABA_ID` | Production | `""` | WhatsApp Business Account ID |
-| `META_APP_SECRET` | Production | `""` | App secret for signature validation |
-| `META_WEBHOOK_VERIFY_TOKEN` | Production | `""` | Verification token for GET challenge |
-| `API_KEY_PEPPER` | Yes | `[secret]` | Salt pepper for HMAC hashing API keys |
-| `DEV_ALLOW_UNCONFIGURED_META` | No | `true` | Permits dashboard UI without Meta secrets |
+| `DATABASE_URL` | String | `file:./dev.db` | Prisma SQLite connection URL. |
+| `APP_URL` | String | `http://localhost:3000` | Base public URL of your service. |
+| `ADMIN_USERNAME` | String | `admin` | HTTP Basic Auth username for `/dashboard/*` and `/api/admin/*`. |
+| `ADMIN_PASSWORD` | String | `admin` | HTTP Basic Auth password for `/dashboard/*` and `/api/admin/*`. |
+| `API_KEY_PEPPER` | String | Auto-generated | Secret pepper used for HMAC-SHA256 hashing of API keys. |
+| `META_GRAPH_API_VERSION` | String | `v22.0` | Meta Graph API version. |
+| `META_ACCESS_TOKEN` | String | `""` | Meta Permanent System User Access Token. |
+| `META_PHONE_NUMBER_ID` | String | `""` | Sender WhatsApp Business Phone Number ID. |
+| `META_WABA_ID` | String | `""` | WhatsApp Business Account ID. |
+| `META_APP_SECRET` | String | `""` | Meta App Secret for validating `X-Hub-Signature-256`. |
+| `META_WEBHOOK_VERIFY_TOKEN` | String | `""` | Custom secret token for Meta webhook GET challenge verification. |
+| `DEV_ALLOW_UNCONFIGURED_META` | Boolean | `true` | Allows local development simulation if Meta credentials are not yet set. |
+| `OTP_EXPIRY_SECONDS` | Number | `300` | OTP validity window in seconds (default 5 minutes). |
+| `OTP_MAX_ATTEMPTS` | Number | `5` | Maximum failed verification attempts before invalidation. |
+| `OUTGOING_WEBHOOK_TIMEOUT_MS`| Number | `5000` | Timeout in ms for outgoing webhook delivery dispatches. |
+
+---
+
+## 4. Local Development vs Live Production Mode
+
+### Local Simulation Mode (`NODE_ENV !== "production"`)
+If `META_ACCESS_TOKEN` or `META_PHONE_NUMBER_ID` are omitted in development:
+- The service **does not fail**.
+- It records messages into the local database as `SENT`.
+- It generates a simulated provider ID (`sim_msg_<uuid>`).
+- It outputs simulation debug logs in your console.
+- The web dashboard will display amber diagnostic cards indicating that Meta credentials are unconfigured.
+
+### Live Production Mode
+When deployed or running with live credentials:
+- Set `META_ACCESS_TOKEN`, `META_PHONE_NUMBER_ID`, `META_APP_SECRET`, and `META_WEBHOOK_VERIFY_TOKEN`.
+- The service will perform live HTTPS calls to `https://graph.facebook.com/v22.0/{META_PHONE_NUMBER_ID}/messages`.
+- Meta webhook signatures will be verified using timing-safe HMAC-SHA256.
+
+---
+
+## 5. Running the Service
+
+```bash
+# Start Next.js development server
+npm run dev
+
+# Run automated verification suite (22 checks)
+npm test
+
+# Check codebase formatting and linting
+npm run lint
+
+# Build production bundle
+npm run build
+```

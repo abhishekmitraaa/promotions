@@ -10,6 +10,7 @@
     "prisma:generate": "prisma generate",
     "prisma:push": "prisma db push",
     "create:api-key": "tsx scripts/create-api-key.ts",
+    "setup": "tsx scripts/setup.ts",
     "test": "tsx scripts/verify-service.ts",
     "test:e2e": "tsx scripts/e2e-live-test.ts",
     "test:live": "tsx scripts/test-live-features.ts"

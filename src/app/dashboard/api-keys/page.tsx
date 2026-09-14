@@ -96,7 +96,7 @@ export default function DashboardApiKeysPage() {
       } else {
         alert(json.error || "Failed to revoke API key");
       }
-    } catch (err) {
+    } catch {
       alert("Error revoking API key");
     }
   }
@@ -139,7 +139,7 @@ export default function DashboardApiKeysPage() {
           <div className="text-center py-12 text-zinc-500">Loading API keys...</div>
         ) : clients.length === 0 ? (
           <div className="bg-zinc-900/40 border border-zinc-800 rounded-2xl p-8 text-center text-zinc-500 text-sm">
-            No API clients or keys created yet. Click <span className="text-emerald-400 font-semibold">"Generate New API Key"</span> above or run <code className="bg-zinc-800 px-1.5 py-0.5 rounded text-zinc-300 font-mono">npm run create:api-key</code> in CLI.
+            No API clients or keys created yet. Click <span className="text-emerald-400 font-semibold">&quot;Generate New API Key&quot;</span> above or run <code className="bg-zinc-800 px-1.5 py-0.5 rounded text-zinc-300 font-mono">npm run create:api-key</code> in CLI.
           </div>
         ) : (
           clients.map((client) => (

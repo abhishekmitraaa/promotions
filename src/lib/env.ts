@@ -14,8 +14,10 @@ const envSchema = z.object({
   META_APP_SECRET: z.string().optional().default(""),
   META_WEBHOOK_VERIFY_TOKEN: z.string().optional().default(""),
 
-  // Security
+  // Security & Admin Credentials
   API_KEY_PEPPER: z.string().default("default_local_dev_pepper_change_in_production_12345"),
+  ADMIN_USERNAME: z.string().default("admin"),
+  ADMIN_PASSWORD: z.string().default("admin"),
 
   // OTP Configuration
   OTP_CODE_LENGTH: z.coerce.number().int().min(4).max(10).default(6),

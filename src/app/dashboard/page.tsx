@@ -32,13 +32,8 @@ export default function DashboardOverviewPage() {
   const [data, setData] = useState<OverviewData | null>(null);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    fetchOverviewData();
-  }, []);
-
   async function fetchOverviewData() {
     try {
-      setLoading(true);
       const res = await fetch("/api/admin/overview");
       const json = await res.json();
       if (json.success) {
@@ -50,6 +45,10 @@ export default function DashboardOverviewPage() {
       setLoading(false);
     }
   }
+
+  useEffect(() => {
+    fetchOverviewData();
+  }, []);
 
   return (
     <div className="space-y-8">

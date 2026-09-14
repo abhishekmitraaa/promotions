@@ -77,6 +77,24 @@ async function runVerification() {
   assert(validOtpVer.success, "Zod accepts valid OTP verify payload");
   assert(!invalidOtpVer.success, "Zod rejects non-numeric code in OTP verify");
 
+  // Test 8: Admin Basic Auth Header Format
+  const validHeader = "Basic " + Buffer.from("admin:secret123").toString("base64");
+  const decoded = Buffer.from(validHeader.slice(6), "base64").toString("utf-8");
+  const [user, pass] = decoded.split(":");
+  assert(user === "admin" && pass === "secret123", "Basic auth header decodes credentials accurately");
+
+  // Test 9: Template Components Payload Validation
+  const validCompTemplate = createMessageSchema.safeParse({
+    to: "919876543210",
+    type: "template",
+    templateName: "auth_otp",
+    templateParameters: [
+      { type: "body", parameters: [{ type: "text", text: "123456" }] },
+      { type: "button", sub_type: "url", index: "0", parameters: [{ type: "text", text: "123456" }] },
+    ],
+  });
+  assert(validCompTemplate.success, "Zod accepts structured template components array with button & body");
+
   console.log("\n-------------------------------------------------");
   console.log(`Summary: ${passed} PASSED, ${failed} FAILED`);
   console.log("-------------------------------------------------\n");

@@ -1,51 +1,101 @@
-# Public REST API Specification (`/api/v1`)
+# Public REST API Reference (`/api/v1`)
 
-All endpoints in `/api/v1` require Bearer API key authorization:
+The Public REST API enables external applications (e.g. e-commerce engines, notification services, CRM platforms) to send and receive WhatsApp messages and perform OTP verification.
+
+---
+
+## Authentication
+
+All `/api/v1/*` endpoints require Bearer API Key authentication:
 
 ```http
-Authorization: Bearer YOUR_API_KEY
+Authorization: Bearer whub_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+API keys are validated against HMAC-SHA256 digests stored in the database. Raw keys are never stored.
+
+---
+
+## Rate Limiting
+
+The public API enforces sliding-window in-memory rate limiting:
+
+| Endpoint | Rate Limit | Scope |
+|---|---|---|
+| `POST /api/v1/messages` | 60 requests / minute | Per API Key |
+| `POST /api/v1/otp/request` | 5 requests / minute | Per Destination Phone Number |
+| `POST /api/v1/otp/verify` | 10 attempts / minute | Per Destination Phone Number |
+
+If a limit is exceeded, the server returns HTTP `429 Too Many Requests`:
+```json
+{
+  "success": false,
+  "error": "Rate limit exceeded. Please try again later."
+}
 ```
 
 ---
 
 ## 1. Send Message
+
 `POST /api/v1/messages`
 
-### Headers
-- `Authorization: Bearer <key>` (Required)
-- `Content-Type: application/json` (Required)
-- `Idempotency-Key: <unique-string>` (Optional)
+Dispatches a text message or a pre-approved Meta template message.
 
-### Request Payload (Text Message)
+### Request Headers
+- `Authorization: Bearer <raw_api_key>` (Required)
+- `Content-Type: application/json` (Required)
+- `Idempotency-Key: <unique_client_key>` (Optional - prevents duplicate sending)
+
+### Payload 1: Free-form Text Message
+> Requires an open 24-hour customer care window with the recipient.
+
 ```json
 {
   "to": "919876543210",
   "type": "text",
-  "body": "Hello world!"
+  "body": "Your appointment is confirmed for tomorrow at 10:00 AM."
 }
 ```
 
-### Request Payload (Template Message)
+### Payload 2: Meta Template Message with Parameters
 ```json
 {
   "to": "919876543210",
   "type": "template",
-  "templateName": "hello_world",
-  "templateLanguage": "en_US"
+  "templateName": "order_confirmation",
+  "templateLanguage": "en_US",
+  "templateParameters": [
+    {
+      "type": "body",
+      "parameters": [
+        { "type": "text", "text": "Alice" },
+        { "type": "text", "text": "ORD-12345" }
+      ]
+    },
+    {
+      "type": "button",
+      "sub_type": "url",
+      "index": "0",
+      "parameters": [
+        { "type": "text", "text": "orders/ORD-12345" }
+      ]
+    }
+  ]
 }
 ```
 
-### Response (200 OK)
+### Success Response (HTTP 200 OK)
 ```json
 {
   "success": true,
-  "message": {
-    "id": "c1f7b8...-uuid",
+  "data": {
+    "id": "cm7...unique_uuid",
     "providerMessageId": "wamid.HBgL...",
     "status": "SENT",
     "to": "919876543210",
     "type": "TEXT",
-    "sentAt": "2026-09-13T22:00:00.000Z"
+    "sentAt": "2026-09-14T17:00:00.000Z"
   }
 }
 ```
@@ -53,14 +103,116 @@ Authorization: Bearer YOUR_API_KEY
 ---
 
 ## 2. Get Message Details
-`GET /api/v1/messages/[id]`
+
+`GET /api/v1/messages/{id}`
+
+Retrieves message metadata, current status, and full delivery audit trail.
+
+### Success Response (HTTP 200 OK)
+```json
+{
+  "success": true,
+  "data": {
+    "id": "cm7...unique_uuid",
+    "providerMessageId": "wamid.HBgL...",
+    "direction": "OUTBOUND",
+    "type": "TEXT",
+    "status": "DELIVERED",
+    "to": "919876543210",
+    "from": "15550123456",
+    "body": "Your appointment is confirmed...",
+    "createdAt": "2026-09-14T17:00:00.000Z",
+    "events": [
+      { "id": "ev_1", "status": "SENT", "createdAt": "2026-09-14T17:00:01.000Z" },
+      { "id": "ev_2", "status": "DELIVERED", "createdAt": "2026-09-14T17:00:04.000Z" }
+    ]
+  }
+}
+```
 
 ---
 
 ## 3. List Messages
-`GET /api/v1/messages?direction=OUTBOUND&status=SENT&page=1&limit=20`
+
+`GET /api/v1/messages`
+
+### Query Parameters
+- `direction`: Filter by `INBOUND` or `OUTBOUND`
+- `status`: Filter by `QUEUED`, `SENT`, `DELIVERED`, `READ`, `FAILED`
+- `to`: Filter by recipient phone number
+- `from`: Filter by sender phone number
+- `page`: Page index (default: `1`)
+- `limit`: Items per page (default: `50`, max: `100`)
 
 ---
 
 ## 4. List Conversations
+
 `GET /api/v1/conversations`
+
+Returns grouped conversation summaries by participant phone number with latest message preview and unread counters.
+
+---
+
+## 5. Request OTP
+
+`POST /api/v1/otp/request`
+
+Generates a secure 6-digit numeric OTP, stores the HMAC hash, and dispatches it to the destination WhatsApp number.
+
+### Request Payload
+```json
+{
+  "to": "919876543210",
+  "purpose": "login",
+  "templateName": "auth_otp_code",
+  "templateLanguage": "en_US"
+}
+```
+
+### Success Response (HTTP 200 OK)
+```json
+{
+  "success": true,
+  "data": {
+    "message": "OTP generated and dispatched successfully",
+    "expiresInSeconds": 300
+  }
+}
+```
+
+---
+
+## 6. Verify OTP
+
+`POST /api/v1/otp/verify`
+
+Validates a user-submitted OTP against the stored digest. Increments attempt counters and automatically invalidates on match or exhaustion.
+
+### Request Payload
+```json
+{
+  "to": "919876543210",
+  "purpose": "login",
+  "code": "849201"
+}
+```
+
+### Success Response (HTTP 200 OK)
+```json
+{
+  "success": true,
+  "data": {
+    "verified": true,
+    "message": "OTP verified successfully"
+  }
+}
+```
+
+### Invalid / Expired Code (HTTP 400 Bad Request)
+```json
+{
+  "success": false,
+  "error": "Invalid or expired OTP code"
+}
+```

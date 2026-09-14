@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { authenticateApiKey } from "@/lib/api-auth";
 import { requestOtpSchema } from "@/lib/validation/otp";
 import { OtpService } from "@/lib/services/otp-service";
+import { checkRateLimit } from "@/lib/rate-limit";
 
 export async function POST(req: NextRequest) {
   const auth = await authenticateApiKey(req);
@@ -32,6 +33,24 @@ export async function POST(req: NextRequest) {
         },
       },
       { status: 400 }
+    );
+  }
+
+  // Rate limit: max 5 OTP requests per phone number per minute
+  const rateLimit = checkRateLimit(`otp_req_${parseResult.data.to}`, 5, 60000);
+  if (!rateLimit.success) {
+    return NextResponse.json(
+      {
+        success: false,
+        error: {
+          code: "RATE_LIMITED",
+          message: `Too many OTP requests for this phone number. Please wait ${rateLimit.resetSeconds} seconds.`,
+        },
+      },
+      {
+        status: 429,
+        headers: { "Retry-After": String(rateLimit.resetSeconds) },
+      }
     );
   }
 

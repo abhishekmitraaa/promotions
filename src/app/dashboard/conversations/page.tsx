@@ -21,13 +21,8 @@ export default function DashboardConversationsPage() {
   const [loading, setLoading] = useState(true);
   const [selectedPhone, setSelectedPhone] = useState<string | null>(null);
 
-  useEffect(() => {
-    fetchConversations();
-  }, []);
-
   async function fetchConversations() {
     try {
-      setLoading(true);
       const res = await fetch("/api/admin/conversations");
       const json = await res.json();
       if (json.success) {
@@ -42,6 +37,10 @@ export default function DashboardConversationsPage() {
       setLoading(false);
     }
   }
+
+  useEffect(() => {
+    fetchConversations();
+  }, []);
 
   const activeConversation = conversations.find((c) => c.phoneNumber === selectedPhone);
 

@@ -2,145 +2,153 @@
 
 A production-minded, locally runnable self-hosted WhatsApp messaging service built with **Next.js 16 (App Router)**, **TypeScript**, **Prisma ORM (SQLite)**, **Zod**, and **Meta's official WhatsApp Cloud API**.
 
-This service acts as an abstraction layer between external applications and Meta's Graph API, hiding access tokens and phone number IDs while providing a web dashboard, incoming webhook processing, OTP verification, and API-key protection.
+This service acts as a hardened, standardized abstraction layer between your external applications and Meta's Graph API—hiding access tokens and phone number IDs behind Bearer API keys while providing an administrative web dashboard, incoming webhook processing with HMAC validation, OTP verification, and outgoing webhook forwarding.
 
 ---
 
-## 🌟 Features
+## 🌟 Key Capabilities
 
-- **Public REST API (`/api/v1`)**: Secure API key authentication (`Authorization: Bearer <key>`), Zod validation, idempotency support (`Idempotency-Key` header).
-- **Meta WhatsApp Cloud API Client**: Native fetch with AbortController timeouts and structured error handling.
-- **Webhook Receiver (`/api/webhooks/whatsapp`)**: Meta challenge verification (`GET`) and timing-safe HMAC SHA-256 signature validation (`POST`).
-- **Outgoing Webhook Dispatcher**: Signed payload forwarding to external target applications with exponential backoff retries.
-- **OTP Verification System**: Secure numeric OTP generation, hashed storage, attempt limits, and expiration tracking.
-- **Web Dashboard (`/dashboard`)**: Analytics overview, message history & dispatch, conversation threads, API key management, outgoing webhook config, and Meta setup diagnostics.
-- **CLI Provisioning Tool**: `npm run create:api-key` to generate API clients and print raw keys securely.
+- **Secure Public REST API (`/api/v1/*`)**:
+  - Protected by Bearer API Key authentication (`Authorization: Bearer whub_...`).
+  - Strict input validation via Zod schemas.
+  - Idempotent message dispatch via `Idempotency-Key` header.
+  - Built-in rate limiting (60 req/min for messages, 5 req/min for OTP requests).
+- **Admin Dashboard & API (`/dashboard/*`, `/api/admin/*`)**:
+  - Protected by HTTP Basic Auth (`ADMIN_USERNAME` & `ADMIN_PASSWORD`).
+  - Real-time messaging metrics, health diagnostics, and audit logs.
+  - Manual message composer supporting free-form text & pre-approved Meta templates.
+  - Conversation viewer grouped by participant phone number.
+  - API Key creation, revocation, and metadata auditing.
+  - Outgoing webhook endpoint manager and delivery retry viewer.
+- **Meta WhatsApp Cloud API Client**:
+  - Direct HTTP integration using native `fetch` with `AbortController` timeouts.
+  - Full support for text messages and template messages with dynamic body & button parameters.
+  - Simulated sending mode in non-production environments when Meta credentials are absent.
+- **Inbound Webhook Engine (`/api/webhooks/whatsapp`)**:
+  - Automatic `GET` challenge handshake validation (`hub.challenge`).
+  - Cryptographic `POST` verification using timing-safe HMAC-SHA256 (`X-Hub-Signature-256`).
+  - Ingestion of incoming messages, contact updates, and delivery status events (`sent`, `delivered`, `read`, `failed`).
+- **Cryptographic OTP Service (`/api/v1/otp/*`)**:
+  - Raw OTP codes are NEVER stored in plaintext (HMAC-SHA256 hashed with salt pepper).
+  - Strict attempt tracking with automatic invalidation upon expiry or exceeding max attempts.
+- **Automated Developer Setup**:
+  - Single command `npm run setup` initializes environment, runs Prisma migrations, and untracks local database.
+  - 100% test pass verification via `npm test`.
 
 ---
 
-## 🚀 Quick Start & Setup
+## 🚀 Quick Start (Zero to Running in 2 Minutes)
 
 ### 1. Prerequisites
 - **Node.js**: v20+
 - **npm**: v10+
-- **Meta Developer Account**: (Optional for initial local UI test; required for live WhatsApp messaging)
-  - Meta App with WhatsApp Business product enabled
-  - WhatsApp Business Account (WABA)
-  - Phone Number ID
-  - Access Token (Permanent System User Token recommended)
 
-### 2. Installation
+### 2. Clone & Install
 ```bash
 git clone https://github.com/abhishekmitraaa/promotions.git
 cd whatsapp-hub
 npm install
 ```
 
-### 3. Environment Configuration
-Copy `.env.example` to `.env.local`:
+### 3. One-Command Setup
+Run the automated initialization script:
 ```bash
-cp .env.example .env.local
+npm run setup
 ```
+This script will:
+1. Generate `.env.local` from `.env.example` if not already present.
+2. Generate a secure, cryptographically random `API_KEY_PEPPER`.
+3. Apply Prisma database schema to the untracked local SQLite database (`prisma/dev.db`).
 
-Configure the following variables in `.env.local`:
-```env
-DATABASE_URL="file:./dev.db"
-APP_URL="http://localhost:3000"
-
-META_GRAPH_API_VERSION="v22.0"
-META_ACCESS_TOKEN="YOUR_META_ACCESS_TOKEN"
-META_PHONE_NUMBER_ID="YOUR_META_PHONE_NUMBER_ID"
-META_WABA_ID="YOUR_META_WABA_ID"
-META_APP_SECRET="YOUR_META_APP_SECRET"
-META_WEBHOOK_VERIFY_TOKEN="YOUR_CUSTOM_VERIFY_TOKEN"
-
-API_KEY_PEPPER="replace_with_a_random_32_character_string"
-```
-
-### 4. Database Initialization
-```bash
-npx prisma db push
-```
-
-### 5. Start Local Development Server
+### 4. Start the Server
 ```bash
 npm run dev
 ```
-Open [http://localhost:3000/dashboard](http://localhost:3000/dashboard) to view the Web Dashboard.
+Open [http://localhost:3000/dashboard](http://localhost:3000/dashboard) in your browser.
+
+### 5. Access the Dashboard
+When prompted by your browser's HTTP Basic Auth prompt:
+- **Username**: `admin` (or value of `ADMIN_USERNAME` in `.env.local`)
+- **Password**: `admin` (or value of `ADMIN_PASSWORD` in `.env.local`)
 
 ---
 
-## 🔑 Creating an API Key
+## 🔑 Provisioning an API Key
 
-To send messages via curl or external applications, generate an API key using the CLI command:
+To call the public API (`/api/v1/*`), you need a Bearer API Key. You can generate one via the Dashboard or via the CLI:
 
+### Via CLI:
 ```bash
-npx tsx scripts/create-api-key.ts --client "MyExternalApp" --key "Production Key"
+npx tsx scripts/create-api-key.ts --client "PaymentService" --key "Staging Key"
 ```
-
-Output example:
+Output:
 ```text
 🔐 RAW API KEY (COPY IT NOW - IT WILL NOT BE SHOWN AGAIN):
 
-  whub_9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d
+  whub_a1b2c3d4e5f6789012345678abcdef01
 ```
+
+### Via Dashboard:
+Navigate to `/dashboard/api-keys` and click **Create API Key**. Copy the raw key immediately upon generation.
 
 ---
 
-## 📤 Sending a Test Message
+## 📤 Sending Messages
 
-### Using curl:
+### 1. Free-form Text Message
+> **Note**: Free-form text messages require that the recipient has sent an inbound message to your WhatsApp number within the preceding 24 hours.
+
 ```bash
 curl -X POST http://localhost:3000/api/v1/messages \
-  -H "Authorization: Bearer YOUR_GENERATED_API_KEY" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "to": "919876543210",
     "type": "text",
-    "body": "Hello from my WhatsApp Infrastructure Service!"
+    "body": "Hello from WhatsApp Infrastructure Service!"
   }'
 ```
 
-### Using PowerShell:
-```powershell
-$headers = @{
-    "Authorization" = "Bearer YOUR_GENERATED_API_KEY"
-    "Content-Type"  = "application/json"
-}
-$body = @{
-    to   = "919876543210"
-    type = "text"
-    body = "Hello from my WhatsApp Infrastructure Service!"
-} | ConvertTo-Json
+### 2. Pre-Approved Meta Template Message
+Templates can be sent outside the 24-hour customer care window.
 
-Invoke-RestMethod -Uri "http://localhost:3000/api/v1/messages" -Method Post -Headers $headers -Body $body
-```
-
----
-
-## ⚡ Meta Webhook Setup (ngrok)
-
-Meta requires a publicly reachable HTTPS URL for webhooks.
-
-1. Start ngrok tunnel:
 ```bash
-ngrok http 3000
+curl -X POST http://localhost:3000/api/v1/messages \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "to": "919876543210",
+    "type": "template",
+    "templateName": "order_update",
+    "templateLanguage": "en_US",
+    "templateParameters": [
+      {
+        "type": "body",
+        "parameters": [
+          { "type": "text", "text": "ORD-9842" },
+          { "type": "text", "text": "Shipped" }
+        ]
+      },
+      {
+        "type": "button",
+        "sub_type": "url",
+        "index": "0",
+        "parameters": [
+          { "type": "text", "text": "track/ORD-9842" }
+        ]
+      }
+    ]
+  }'
 ```
-2. Copy your HTTPS URL (e.g., `https://xyz.ngrok-free.app`).
-3. In Meta Developer Console (**WhatsApp > Configuration**):
-   - **Callback URL**: `https://xyz.ngrok-free.app/api/webhooks/whatsapp`
-   - **Verify Token**: Must match `META_WEBHOOK_VERIFY_TOKEN` in `.env.local`
-4. Click **Verify and Save**.
-5. Under Webhook fields, subscribe to **messages**.
 
 ---
 
-## 🔐 OTP Verification Flow
+## 🔐 OTP Authentication Flow
 
-### Request OTP:
+### Request an OTP:
 ```bash
 curl -X POST http://localhost:3000/api/v1/otp/request \
-  -H "Authorization: Bearer YOUR_GENERATED_API_KEY" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "to": "919876543210",
@@ -148,10 +156,21 @@ curl -X POST http://localhost:3000/api/v1/otp/request \
   }'
 ```
 
-### Verify OTP:
+Response:
+```json
+{
+  "success": true,
+  "data": {
+    "message": "OTP generated and dispatched successfully",
+    "expiresInSeconds": 300
+  }
+}
+```
+
+### Verify an OTP:
 ```bash
 curl -X POST http://localhost:3000/api/v1/otp/verify \
-  -H "Authorization: Bearer YOUR_GENERATED_API_KEY" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "to": "919876543210",
@@ -160,30 +179,53 @@ curl -X POST http://localhost:3000/api/v1/otp/verify \
   }'
 ```
 
-> **Note**: For production OTP, Meta requires an approved Authentication/OTP template in Meta Business Manager. In local dev mode, the service falls back gracefully with a simulated log output if Meta credentials are unconfigured.
+Response:
+```json
+{
+  "success": true,
+  "data": {
+    "verified": true,
+    "message": "OTP verified successfully"
+  }
+}
+```
 
 ---
 
-## 🧪 Running Automated Verification Tests
+## 🌐 Configuring Meta Webhooks
 
-Run the full automated unit & integration test suite:
+1. Expose your local server via a secure HTTPS tunnel (e.g. using ngrok or Cloudflare):
+   ```bash
+   ngrok http 3000
+   ```
+2. Open **Meta Developer Portal** > **WhatsApp** > **Configuration**.
+3. In **Webhook**, click **Edit**:
+   - **Callback URL**: `https://<your-subdomain>.ngrok-free.app/api/webhooks/whatsapp`
+   - **Verify Token**: Must match `META_WEBHOOK_VERIFY_TOKEN` in your `.env.local`
+4. Click **Verify and Save**.
+5. Subscribe to the `messages` webhook field.
+
+---
+
+## 🧪 Automated Testing & Verification
+
+Run the test suite verifying crypto operations, rate limiters, Basic Auth parsing, and Zod validators:
 
 ```bash
 npm test
 ```
 
-Or execute directly:
+To run a production build check:
 ```bash
-npx tsx scripts/verify-service.ts
+npm run build
 ```
 
 ---
 
-## 📁 Detailed Documentation
+## 📚 Detailed Documentation
 
-For further architectural and API reference, see:
-- [Setup Guide](docs/setup.md)
-- [API Reference](docs/api.md)
-- [Meta WhatsApp Cloud API Details](docs/whatsapp-cloud-api.md)
-- [Webhooks & Dispatcher](docs/webhooks.md)
-- [OTP System](docs/otp.md)
+- [Setup & Environment Guide](docs/setup.md)
+- [Public REST API Reference](docs/api.md)
+- [Meta WhatsApp Cloud API Integration Guide](docs/whatsapp-cloud-api.md)
+- [Inbound & Outgoing Webhooks](docs/webhooks.md)
+- [OTP Verification Architecture](docs/otp.md)

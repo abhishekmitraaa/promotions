@@ -40,13 +40,8 @@ export default function DashboardMessagesPage() {
   const [sending, setSending] = useState(false);
   const [sendResult, setSendResult] = useState<{ success: boolean; msg: string } | null>(null);
 
-  useEffect(() => {
-    fetchMessages();
-  }, [direction, status]);
-
   async function fetchMessages() {
     try {
-      setLoading(true);
       const params = new URLSearchParams();
       if (direction) params.set("direction", direction);
       if (status) params.set("status", status);
@@ -64,6 +59,11 @@ export default function DashboardMessagesPage() {
       setLoading(false);
     }
   }
+
+  useEffect(() => {
+    fetchMessages();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [direction, status]);
 
   async function handleSendMessage(e: React.FormEvent) {
     e.preventDefault();
