@@ -3,7 +3,6 @@ import { env, isMetaConfigured } from "../env";
 import { generateSecureOtp, hashOtp, normalizePhoneNumber } from "../crypto";
 import { OtpStatus } from "@prisma/client";
 import { MessageService } from "./message-service";
-import { checkRateLimit } from "../rate-limit";
 import { dispatchOutgoingWebhooks } from "../webhooks/dispatcher";
 
 export class OtpService {
@@ -12,19 +11,6 @@ export class OtpService {
    */
   static async requestOtp(to: string, purpose: string = "login") {
     const normalizedTo = normalizePhoneNumber(to);
-
-    // Rate limit check: max 5 requests per destination per 5 minutes
-    const rateCheck = checkRateLimit(`otp_req_${normalizedTo}_${purpose}`, 5, 300000);
-    if (!rateCheck.success) {
-      return {
-        success: false,
-        status: 429,
-        error: {
-          code: "TOO_MANY_REQUESTS",
-          message: `Too many OTP requests for this number. Please wait ${rateCheck.resetSeconds} seconds.`,
-        },
-      };
-    }
 
     // Invalidate existing active OTPs for destination and purpose
     await prisma.otpVerification.updateMany({
@@ -85,9 +71,13 @@ export class OtpService {
       expiresAt: expiresAt.toISOString(),
     }).catch(() => {});
 
-    // For local dev when Meta credentials are missing, expose dev code safely in response
-    const devCode =
-      !isMetaConfigured() && env.DEV_ALLOW_UNCONFIGURED_META ? rawOtpCode : undefined;
+    // Only return devCode when NODE_ENV !== "production" and simulated Meta mode is active
+    const isSimulatedDevMode =
+      process.env.NODE_ENV !== "production" &&
+      !isMetaConfigured() &&
+      env.DEV_ALLOW_UNCONFIGURED_META;
+
+    const devCode = isSimulatedDevMode ? rawOtpCode : undefined;
 
     return {
       success: true,
@@ -109,19 +99,6 @@ export class OtpService {
    */
   static async verifyOtp(to: string, purpose: string = "login", code: string) {
     const normalizedTo = normalizePhoneNumber(to);
-
-    // Rate limit check: max 10 verification attempts per destination per 5 minutes
-    const rateCheck = checkRateLimit(`otp_ver_${normalizedTo}_${purpose}`, 10, 300000);
-    if (!rateCheck.success) {
-      return {
-        success: false,
-        status: 429,
-        error: {
-          code: "TOO_MANY_REQUESTS",
-          message: `Too many verification attempts. Please wait ${rateCheck.resetSeconds} seconds.`,
-        },
-      };
-    }
 
     const otpRecord = await prisma.otpVerification.findFirst({
       where: {

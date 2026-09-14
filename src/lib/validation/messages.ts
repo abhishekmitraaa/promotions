@@ -1,5 +1,23 @@
 import { z } from "zod";
 
+export const metaTemplateParameterSchema = z.object({
+  type: z.enum(["text", "currency", "date_time", "image", "document", "video", "payload"]),
+  text: z.string().optional(),
+  currency: z.record(z.string(), z.unknown()).optional(),
+  date_time: z.record(z.string(), z.unknown()).optional(),
+  image: z.record(z.string(), z.unknown()).optional(),
+  document: z.record(z.string(), z.unknown()).optional(),
+  video: z.record(z.string(), z.unknown()).optional(),
+  payload: z.string().optional(),
+});
+
+export const metaTemplateComponentSchema = z.object({
+  type: z.enum(["header", "body", "button"]),
+  sub_type: z.enum(["quick_reply", "url", "catalog"]).optional(),
+  index: z.union([z.string(), z.number()]).optional(),
+  parameters: z.array(metaTemplateParameterSchema).optional(),
+});
+
 export const createMessageSchema = z
   .object({
     to: z
@@ -11,7 +29,12 @@ export const createMessageSchema = z
     body: z.string().max(4096, "Message body exceeds maximum 4096 characters").optional(),
     templateName: z.string().min(1).optional(),
     templateLanguage: z.string().default("en_US").optional(),
-    templateParameters: z.array(z.union([z.string(), z.record(z.string(), z.unknown())])).optional(),
+    templateParameters: z
+      .union([
+        z.array(z.string()),
+        z.array(metaTemplateComponentSchema),
+      ])
+      .optional(),
     metadata: z.record(z.string(), z.unknown()).optional(),
   })
   .refine(
@@ -31,3 +54,5 @@ export const createMessageSchema = z
   );
 
 export type CreateMessageInput = z.infer<typeof createMessageSchema>;
+export type MetaTemplateParameterInput = z.infer<typeof metaTemplateParameterSchema>;
+export type MetaTemplateComponentInput = z.infer<typeof metaTemplateComponentSchema>;

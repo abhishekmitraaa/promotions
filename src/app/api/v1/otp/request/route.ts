@@ -3,6 +3,7 @@ import { authenticateApiKey } from "@/lib/api-auth";
 import { requestOtpSchema } from "@/lib/validation/otp";
 import { OtpService } from "@/lib/services/otp-service";
 import { checkRateLimit } from "@/lib/rate-limit";
+import { normalizePhoneNumber } from "@/lib/crypto";
 
 export async function POST(req: NextRequest) {
   const auth = await authenticateApiKey(req);
@@ -36,8 +37,9 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // Rate limit: max 5 OTP requests per phone number per minute
-  const rateLimit = checkRateLimit(`otp_req_${parseResult.data.to}`, 5, 60000);
+  // Rate limit: max 5 OTP requests per normalized phone number per minute
+  const normalizedPhone = normalizePhoneNumber(parseResult.data.to);
+  const rateLimit = checkRateLimit(`otp_req_${normalizedPhone}`, 5, 60000);
   if (!rateLimit.success) {
     return NextResponse.json(
       {

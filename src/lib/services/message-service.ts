@@ -24,6 +24,28 @@ export interface SendMessageResult {
   };
 }
 
+export function formatTemplateComponents(
+  rawParameters?: unknown[] | null
+): MetaTemplateComponent[] | undefined {
+  if (!rawParameters || rawParameters.length === 0) return undefined;
+
+  // Simple string array format: ["a", "b"] -> { type: "body", parameters: [{ type: "text", text: "a" }, { type: "text", text: "b" }] }
+  if (typeof rawParameters[0] === "string") {
+    return [
+      {
+        type: "body",
+        parameters: (rawParameters as string[]).map((text) => ({
+          type: "text",
+          text: String(text),
+        })),
+      },
+    ];
+  }
+
+  // Already Meta-shaped components (e.g. [{ type: "body", parameters: [...] }])
+  return rawParameters as MetaTemplateComponent[];
+}
+
 export class MessageService {
   /**
    * Dispatch an outbound WhatsApp message (Text or Template)
@@ -77,6 +99,8 @@ export class MessageService {
     let metaPayload: MetaOutboundPayload;
 
     if (typeEnum === MessageType.TEMPLATE) {
+      const components = formatTemplateComponents(input.templateParameters);
+
       metaPayload = {
         messaging_product: "whatsapp",
         recipient_type: "individual",
@@ -87,9 +111,7 @@ export class MessageService {
           language: {
             code: input.templateLanguage || "en_US",
           },
-          ...(input.templateParameters && input.templateParameters.length > 0
-            ? { components: input.templateParameters as unknown as MetaTemplateComponent[] }
-            : {}),
+          ...(components ? { components } : {}),
         },
       };
     } else {

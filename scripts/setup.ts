@@ -1,5 +1,6 @@
 import fs from "fs";
 import path from "path";
+import crypto from "crypto";
 import { execSync } from "child_process";
 import { prisma } from "../src/lib/prisma";
 import { generateApiKey } from "../src/lib/crypto";
@@ -14,13 +15,43 @@ async function main() {
   const envLocalPath = path.join(rootDir, ".env.local");
   const envPath = path.join(rootDir, ".env");
 
+  let createdLocalEnv = false;
+  let adminUsername = "hub_admin";
+  let adminPassword = "";
+
   // Step 1: Ensure .env.local or .env exists
   if (!fs.existsSync(envLocalPath) && !fs.existsSync(envPath)) {
-    console.log("📄 No .env.local found. Creating from .env.example...");
-    fs.copyFileSync(envExamplePath, envLocalPath);
-    console.log("✅ Created .env.local template");
+    console.log("📄 No .env.local found. Generating fresh configuration from .env.example...");
+    let content = fs.readFileSync(envExamplePath, "utf-8");
+
+    // Generate cryptographically random pepper & admin credentials
+    const generatedPepper = crypto.randomBytes(32).toString("hex");
+    adminPassword = crypto.randomBytes(12).toString("base64url");
+
+    content = content.replace(
+      /API_KEY_PEPPER="[^"]*"/,
+      `API_KEY_PEPPER="${generatedPepper}"`
+    );
+    content = content.replace(
+      /ADMIN_USERNAME="[^"]*"/,
+      `ADMIN_USERNAME="${adminUsername}"`
+    );
+    content = content.replace(
+      /ADMIN_PASSWORD="[^"]*"/,
+      `ADMIN_PASSWORD="${adminPassword}"`
+    );
+
+    fs.writeFileSync(envLocalPath, content, "utf-8");
+    createdLocalEnv = true;
+    console.log("✅ Created .env.local with random API pepper and secure admin credentials");
   } else {
     console.log("✅ Environment configuration file present");
+    const targetFile = fs.existsSync(envLocalPath) ? envLocalPath : envPath;
+    const existingContent = fs.readFileSync(targetFile, "utf-8");
+    const userMatch = existingContent.match(/ADMIN_USERNAME="([^"]+)"/);
+    const passMatch = existingContent.match(/ADMIN_PASSWORD="([^"]+)"/);
+    if (userMatch) adminUsername = userMatch[1];
+    if (passMatch) adminPassword = passMatch[1];
   }
 
   // Step 2: Push database schema using Prisma
@@ -77,7 +108,10 @@ async function main() {
   console.log("\nQuick Start Guide:");
   console.log("  1. Start dev server:      npm run dev");
   console.log("  2. Open Dashboard:        http://localhost:3000/dashboard");
-  console.log("     Default Admin Login:   Username: admin | Password: admin");
+  console.log(`     Admin Credentials:     Username: ${adminUsername} | Password: ${adminPassword || "(as configured in .env.local)"}`);
+  if (createdLocalEnv) {
+    console.log(`     ⚠️  Notice: The admin password above was randomly generated and saved to .env.local`);
+  }
   console.log("  3. Check Health API:      http://localhost:3000/api/health");
   console.log("  4. Run Test Suite:        npm test\n");
 }

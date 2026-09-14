@@ -8,10 +8,39 @@ export function middleware(req: NextRequest) {
   const isAdminApiRoute = pathname.startsWith("/api/admin");
 
   if (isDashboardRoute || isAdminApiRoute) {
-    const authHeader = req.headers.get("authorization");
-    const expectedUsername = process.env.ADMIN_USERNAME || "admin";
-    const expectedPassword = process.env.ADMIN_PASSWORD || "admin";
+    const isProduction = process.env.NODE_ENV === "production";
+    const rawUsername = process.env.ADMIN_USERNAME;
+    const rawPassword = process.env.ADMIN_PASSWORD;
 
+    // In production, strictly reject if admin credentials are missing or default "admin"
+    if (isProduction) {
+      const isMissingOrUnsafe =
+        !rawUsername ||
+        !rawPassword ||
+        rawUsername.trim().length === 0 ||
+        rawUsername.toLowerCase() === "admin" ||
+        rawPassword.toLowerCase() === "admin" ||
+        rawPassword.length < 12;
+
+      if (isMissingOrUnsafe) {
+        return NextResponse.json(
+          {
+            success: false,
+            error: {
+              code: "MISCONFIGURED_ADMIN_AUTH",
+              message:
+                "Production server admin credentials are misconfigured. Explicit non-default ADMIN_USERNAME and strong ADMIN_PASSWORD (min 12 chars) are required.",
+            },
+          },
+          { status: 500 }
+        );
+      }
+    }
+
+    const expectedUsername = rawUsername || "admin";
+    const expectedPassword = rawPassword || "admin";
+
+    const authHeader = req.headers.get("authorization");
     let isAuthenticated = false;
 
     if (authHeader && authHeader.startsWith("Basic ")) {

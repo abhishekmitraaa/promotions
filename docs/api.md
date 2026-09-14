@@ -58,7 +58,22 @@ Dispatches a text message or a pre-approved Meta template message.
 }
 ```
 
-### Payload 2: Meta Template Message with Parameters
+### Payload 2A: Template Message (Simple Format)
+Simple string arrays are automatically mapped to template body text parameters (`{{1}}`, `{{2}}`, etc.):
+
+```json
+{
+  "to": "919876543210",
+  "type": "template",
+  "templateName": "order_confirmation",
+  "templateLanguage": "en_US",
+  "templateParameters": ["Alice", "ORD-12345"]
+}
+```
+
+### Payload 2B: Template Message (Structured Meta Components)
+Full Meta template components for body, header, and dynamic buttons (URL/quick reply):
+
 ```json
 {
   "to": "919876543210",
@@ -216,3 +231,26 @@ Validates a user-submitted OTP against the stored digest. Increments attempt cou
   "error": "Invalid or expired OTP code"
 }
 ```
+
+---
+
+## 7. Administrative Data Cleanup (Local-Dev Only)
+
+`POST /api/admin/clean-data`
+
+> ⚠️ **SAFETY WARNING**: This endpoint is strictly for local development and test resetting. It is **permanently disabled in production environments** (returns HTTP 403 Forbidden).
+
+### Headers
+- `Authorization: Basic <base64(ADMIN_USERNAME:ADMIN_PASSWORD)>`
+- `Content-Type: application/json`
+
+### Required Request Payload
+To prevent accidental invocation, an explicit confirmation body is strictly mandatory:
+```json
+{
+  "confirm": "DELETE_ALL_LOCAL_DATA"
+}
+```
+
+Requests without this exact confirmation string are rejected with HTTP 400 Bad Request.
+
