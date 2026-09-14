@@ -44,5 +44,5 @@ yarn-error.log*
 next-env.d.ts
 
 # database
-prisma/dev.db
+# prisma/dev.db (bundled for serverless cold-start)
 prisma/dev.db-journal
