@@ -1,5 +1,5 @@
 [build]
-  command = "npx prisma generate && npx prisma db push --accept-data-loss && next build"
+  command = "npm i --no-save lightningcss-linux-x64-gnu && npx prisma generate && npx prisma db push --accept-data-loss && next build"
   publish = ".next"
 
 [build.environment]
