@@ -41,9 +41,21 @@ export function middleware(req: NextRequest) {
     const expectedPassword = rawPassword || "admin";
 
     const authHeader = req.headers.get("authorization");
+    const workerSecretHeader = req.headers.get("x-worker-secret");
     let isAuthenticated = false;
 
-    if (authHeader && authHeader.startsWith("Basic ")) {
+    // Allow internal worker secret for queue processing endpoint
+    if (
+      isAdminApiRoute &&
+      pathname.endsWith("/process-queue") &&
+      workerSecretHeader &&
+      (workerSecretHeader === process.env.INTERNAL_WORKER_SECRET ||
+        workerSecretHeader === expectedPassword)
+    ) {
+      isAuthenticated = true;
+    }
+
+    if (!isAuthenticated && authHeader && authHeader.startsWith("Basic ")) {
       try {
         const base64Credentials = authHeader.slice(6).trim();
         const credentials = atob(base64Credentials);

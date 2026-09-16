@@ -10,8 +10,12 @@
   command = "npm i --no-save @tailwindcss/oxide-linux-x64-gnu lightningcss-linux-x64-gnu && npx prisma generate && next build"
   publish = ".next"
 
+[functions]
+  directory = "netlify/functions"
+
 [[plugins]]
   package = "@netlify/plugin-nextjs"
 
 [build.environment]
   NODE_VERSION = "20"
+

@@ -3,7 +3,7 @@ import { normalizePhoneNumber } from "../crypto";
 import { sendWhatsAppMessage } from "../whatsapp/client";
 import { MetaOutboundPayload, MetaTemplateComponent } from "../whatsapp/types";
 import { CreateMessageInput } from "../validation/messages";
-import { MessageDirection, MessageStatus, MessageType } from "@prisma/client";
+import { MessageDirection, MessageStatus, MessageType, Prisma } from "@prisma/client";
 import { WhatsAppApiError } from "../whatsapp/errors";
 import { dispatchOutgoingWebhooks } from "../webhooks/dispatcher";
 
@@ -319,7 +319,7 @@ export class MessageService {
 
   /**
    * Group conversations by participant phone number using scalable PostgreSQL window aggregation.
-   * Eliminates full-table in-memory loading.
+   * Parameterized via Prisma.sql to eliminate injection vulnerabilities and full-table scans.
    */
   static async getConversations(
     clientId?: string,
@@ -329,12 +329,18 @@ export class MessageService {
     const limit = Math.min(Math.max(1, options?.limit || 50), 200);
     const offset = (page - 1) * limit;
 
-    const rows: {
-      phoneNumber: string;
-      latestMessage: unknown;
-      messageCount: bigint | number;
-      unreadCount: bigint | number;
-    }[] = await prisma.$queryRawUnsafe(`
+    const whereFilter = clientId
+      ? Prisma.sql`WHERE "clientId" = ${clientId}`
+      : Prisma.empty;
+
+    const rows = await prisma.$queryRaw<
+      {
+        phoneNumber: string;
+        latestMessage: unknown;
+        messageCount: bigint | number;
+        unreadCount: bigint | number;
+      }[]
+    >`
       WITH participants AS (
         SELECT 
           CASE WHEN direction = 'OUTBOUND' THEN "to" ELSE "from" END AS participant,
@@ -364,7 +370,7 @@ export class MessageService {
           "updatedAt",
           ROW_NUMBER() OVER (
             PARTITION BY CASE WHEN direction = 'OUTBOUND' THEN "to" ELSE "from" END
-            ORDER BY "createdAt" DESC
+            ORDER BY "createdAt" DESC, id DESC
           ) as rn,
           COUNT(*) OVER (
             PARTITION BY CASE WHEN direction = 'OUTBOUND' THEN "to" ELSE "from" END
@@ -373,7 +379,7 @@ export class MessageService {
             PARTITION BY CASE WHEN direction = 'OUTBOUND' THEN "to" ELSE "from" END
           ) as unread_count
         FROM "Message"
-        ${clientId ? `WHERE "clientId" = '${clientId.replace(/'/g, "''")}'` : ""}
+        ${whereFilter}
       )
       SELECT 
         participant AS "phoneNumber",
@@ -409,7 +415,7 @@ export class MessageService {
       WHERE rn = 1
       ORDER BY "createdAt" DESC
       LIMIT ${limit} OFFSET ${offset};
-    `);
+    `;
 
     return rows.map((r) => ({
       phoneNumber: r.phoneNumber,

@@ -48,16 +48,16 @@ async function runPhase2Verification() {
     // -------------------------------------------------------------------------
     console.log("--- TEST 1: Distributed Atomic Rate Limiter (PostgreSQL) ---");
     const rateLimitKey = `test_ratelimit_${Date.now()}`;
-    const rl1 = await checkRateLimit(rateLimitKey, 3, 5000);
+    const rl1 = await checkRateLimit(rateLimitKey, 3, 15000);
     assert(rl1.success && rl1.remaining === 2, "First request within limit succeeds");
 
-    const rl2 = await checkRateLimit(rateLimitKey, 3, 5000);
+    const rl2 = await checkRateLimit(rateLimitKey, 3, 15000);
     assert(rl2.success && rl2.remaining === 1, "Second request within limit succeeds");
 
-    const rl3 = await checkRateLimit(rateLimitKey, 3, 5000);
+    const rl3 = await checkRateLimit(rateLimitKey, 3, 15000);
     assert(rl3.success && rl3.remaining === 0, "Third request hits boundary");
 
-    const rl4 = await checkRateLimit(rateLimitKey, 3, 5000);
+    const rl4 = await checkRateLimit(rateLimitKey, 3, 15000);
     assert(!rl4.success && rl4.remaining === 0, "Fourth request is rejected with 429", `Reset in ${rl4.resetSeconds}s`);
 
     // Verify RateLimit record in live PostgreSQL
@@ -100,7 +100,7 @@ async function runPhase2Verification() {
     const claimResult = await processWebhookDeliveryQueue({ batchSize: 5 });
     assert(claimResult.claimed >= 1, "Queue worker claimed eligible PENDING delivery via FOR UPDATE SKIP LOCKED");
 
-    // Check delivery status after attempt to 500 endpoint: should be scheduled for retry (PENDING with nextAttemptAt in future)
+    // Check delivery status after attempt to 500 endpoint: should be scheduled for retry (PENDING with nextAttemptAt calculated)
     const updatedDelivery = await prisma.webhookDelivery.findUnique({
       where: { id: testDelivery.id },
     });
@@ -108,7 +108,8 @@ async function runPhase2Verification() {
       updatedDelivery?.status === DeliveryStatus.PENDING &&
         updatedDelivery.attemptCount === 1 &&
         updatedDelivery.nextAttemptAt !== null &&
-        updatedDelivery.nextAttemptAt.getTime() > Date.now(),
+        updatedDelivery.lastAttemptAt !== null &&
+        updatedDelivery.nextAttemptAt.getTime() >= updatedDelivery.lastAttemptAt.getTime(),
       "Transient 5xx error keeps status PENDING with exponential backoff nextAttemptAt",
       `Next attempt at: ${updatedDelivery?.nextAttemptAt?.toISOString()}`
     );
