@@ -1,3 +1,7 @@
+import dotenv from "dotenv";
+dotenv.config({ path: ".env.local" });
+dotenv.config({ path: ".env" });
+
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
@@ -18,6 +22,7 @@ async function main() {
   let createdLocalEnv = false;
   let adminUsername = "hub_admin";
   let adminPassword = "";
+  let activePepper = "";
 
   // Step 1: Ensure .env.local or .env exists
   if (!fs.existsSync(envLocalPath) && !fs.existsSync(envPath)) {
@@ -27,6 +32,7 @@ async function main() {
     // Generate cryptographically random pepper & admin credentials
     const generatedPepper = crypto.randomBytes(32).toString("hex");
     adminPassword = crypto.randomBytes(12).toString("base64url");
+    activePepper = generatedPepper;
 
     content = content.replace(
       /API_KEY_PEPPER="[^"]*"/,
@@ -50,15 +56,21 @@ async function main() {
     const existingContent = fs.readFileSync(targetFile, "utf-8");
     const userMatch = existingContent.match(/ADMIN_USERNAME="([^"]+)"/);
     const passMatch = existingContent.match(/ADMIN_PASSWORD="([^"]+)"/);
+    const pepperMatch = existingContent.match(/API_KEY_PEPPER="([^"]+)"/);
     if (userMatch) adminUsername = userMatch[1];
     if (passMatch) adminPassword = passMatch[1];
+    if (pepperMatch) activePepper = pepperMatch[1];
+  }
+
+  if (activePepper) {
+    process.env.API_KEY_PEPPER = activePepper;
   }
 
   // Step 2: Push database schema using Prisma
-  console.log("\n📦 Synchronizing SQLite database schema...");
+  console.log("\n📦 Synchronizing Supabase PostgreSQL database schema...");
   try {
     execSync("npx prisma generate", { stdio: "inherit", cwd: rootDir });
-    execSync("npx prisma db push --accept-data-loss", { stdio: "inherit", cwd: rootDir });
+    execSync("npx prisma db push --skip-generate", { stdio: "inherit", cwd: rootDir });
     console.log("✅ Database schema synchronized successfully");
   } catch (err) {
     console.error("❌ Failed to push Prisma database schema:", err);
@@ -83,7 +95,7 @@ async function main() {
       },
     });
 
-    const { rawKey, keyPrefix, keyHash } = generateApiKey();
+    const { rawKey, keyPrefix, keyHash } = generateApiKey(activePepper);
 
     await prisma.apiKey.create({
       data: {

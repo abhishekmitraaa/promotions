@@ -1,3 +1,7 @@
+import dotenv from "dotenv";
+dotenv.config({ path: ".env.local" });
+dotenv.config({ path: ".env" });
+
 import { prisma } from "../src/lib/prisma";
 import { generateApiKey } from "../src/lib/crypto";
 

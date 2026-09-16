@@ -31,8 +31,8 @@ npm run setup
 ### What `npm run setup` Does:
 1. Verifies existing environment files; if `.env.local` is missing, it clones `.env.example`.
 2. Checks if `API_KEY_PEPPER` is set or default; if missing, it automatically generates a 64-character cryptographically secure random string.
-3. Automatically executes `npx prisma db push` to synchronize the SQLite database schema (`prisma/dev.db`).
-4. Ensures SQLite database files (`dev.db`, `dev.db-journal`) remain untracked by Git.
+3. Automatically executes `npx prisma db push` to synchronize the PostgreSQL database schema.
+4. Ensures environment files remain untracked by Git.
 
 ---
 
@@ -42,7 +42,8 @@ All configurations are defined in `.env.local`:
 
 | Variable | Type | Default | Description |
 |---|---|---|---|
-| `DATABASE_URL` | String | `file:./dev.db` | Prisma SQLite connection URL. |
+| `DATABASE_URL` | String | Required | Supabase PostgreSQL pooled connection URL (port 6543, `?pgbouncer=true`). |
+| `DIRECT_URL` | String | Optional | Supabase PostgreSQL direct connection URL (port 5432) for migrations. |
 | `APP_URL` | String | `http://localhost:3000` | Base public URL of your service. |
 | `ADMIN_USERNAME` | String | `hub_admin` | HTTP Basic Auth username for `/dashboard/*` and `/api/admin/*`. In production, explicit non-default value is required. |
 | `ADMIN_PASSWORD` | String | Auto-generated | HTTP Basic Auth password for `/dashboard/*` and `/api/admin/*`. In production, must be at least 12 characters; "admin" is forbidden. |
@@ -60,10 +61,13 @@ All configurations are defined in `.env.local`:
 
 ---
 
-## 4. Database Architecture & Serverless Safety
+## 4. Database Architecture (Supabase PostgreSQL)
 
-- **SQLite for Local MVP**: By default, the application runs on SQLite (`prisma/dev.db`). This file is untracked by Git and initialized via `npm run setup`.
-- **Serverless Warning (Netlify / Vercel)**: Serverless function execution environments are stateless. Files written to local disk (like SQLite `.db` files) are discarded across lambda recycles and cold starts. For durable production deployments, configure `DATABASE_URL` to a hosted database (PostgreSQL via Supabase, Neon, or distributed SQLite via Turso/LibSQL).
+- **Managed Cloud PostgreSQL**: The application connects to hosted PostgreSQL on Supabase.
+- **Connection Pooling**: Use the Supavisor pooled connection on port 6543 (`?pgbouncer=true`) for application runtime, and the direct connection on port 5432 (`DIRECT_URL`) for Prisma schema migrations.
+- **Data Migration & Verification**:
+  - `npm run db:migrate-data`: Migrates historical records from SQLite exports to PostgreSQL.
+  - `npm run db:verify`: Compares source SQLite row counts against target PostgreSQL row counts.
 
 ---
 

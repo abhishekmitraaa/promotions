@@ -4,7 +4,18 @@ export const envSchema = z
   .object({
     // Server Environment
     NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
-    DATABASE_URL: z.string().default("file:./dev.db"),
+    DATABASE_URL: z
+      .string()
+      .min(1, "DATABASE_URL is required")
+      .refine(
+        (val) => val.startsWith("postgresql://") || val.startsWith("postgres://"),
+        {
+          message:
+            "DATABASE_URL must be a valid PostgreSQL connection string starting with postgresql:// or postgres://",
+        }
+      )
+      .default("postgresql://localhost:5432/postgres"),
+    DIRECT_URL: z.string().optional(),
     APP_URL: z.string().url().default("http://localhost:3000"),
 
     // Meta WhatsApp Cloud API Configuration
@@ -41,6 +52,20 @@ export const envSchema = z
   })
   .superRefine((data, ctx) => {
     if (data.NODE_ENV === "production") {
+      // 0. Enforce valid non-fallback PostgreSQL DATABASE_URL in production
+      if (
+        !data.DATABASE_URL ||
+        (!data.DATABASE_URL.startsWith("postgresql://") && !data.DATABASE_URL.startsWith("postgres://")) ||
+        data.DATABASE_URL.includes("localhost:5432")
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            "Production requires a valid, remote PostgreSQL DATABASE_URL connection string.",
+          path: ["DATABASE_URL"],
+        });
+      }
+
       // 1. Enforce strong API_KEY_PEPPER in production
       if (
         !data.API_KEY_PEPPER ||

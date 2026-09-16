@@ -1,13 +1,9 @@
 # ==============================================================================
 # Netlify Deployment Configuration
 # ==============================================================================
-# ⚠️ ARCHITECTURAL WARNING:
-# Netlify serverless functions and lambda workers are stateless and ephemeral.
-# Local SQLite (file:./dev.db) is strictly for local development and single-node MVP.
-# In a serverless deployment like Netlify, SQLite writes will NOT persist across
-# cold starts, lambda recycling, or concurrent instances.
-# For production durability, connect to a managed database (PostgreSQL on Supabase,
-# Neon, RDS, or distributed SQLite on Turso/LibSQL).
+# Database: Supabase PostgreSQL (Managed, serverless-ready)
+# Configure DATABASE_URL (pooled URL, port 6543) and DIRECT_URL (direct URL, port 5432)
+# in Netlify Environment Variables.
 # ==============================================================================
 
 [build]

@@ -143,6 +143,7 @@ async function runVerification() {
 
   const safeProdEnv = envSchema.safeParse({
     NODE_ENV: "production",
+    DATABASE_URL: "postgresql://postgres.sample_ref:super_secret_pw@aws-0-ap-south-1.pooler.supabase.com:6543/postgres?pgbouncer=true",
     ADMIN_USERNAME: "ops_admin",
     ADMIN_PASSWORD: "super_secure_admin_password_1234",
     API_KEY_PEPPER: "0123456789abcdef0123456789abcdef",

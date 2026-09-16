@@ -15,7 +15,9 @@
     "pretest": "prisma generate",
     "test": "tsx scripts/verify-service.ts",
     "test:e2e": "tsx scripts/e2e-live-test.ts",
-    "test:live": "tsx scripts/test-live-features.ts"
+    "test:live": "tsx scripts/test-live-features.ts",
+    "db:migrate-data": "tsx scripts/migrate-sqlite-to-postgres.ts",
+    "db:verify": "tsx scripts/verify-postgres-migration.ts"
   },
   "overrides": {
     "deepmerge-ts": "^8.0.2",

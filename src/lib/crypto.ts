@@ -6,7 +6,7 @@ import { env } from "./env";
  * Format: `whub_<24 random hex chars>`
  * Returns the raw key (shown to user once), prefix (`whub_...`), and peppered hash.
  */
-export function generateApiKey(): {
+export function generateApiKey(customPepper?: string): {
   rawKey: string;
   keyPrefix: string;
   keyHash: string;
@@ -14,7 +14,7 @@ export function generateApiKey(): {
   const randomBytes = crypto.randomBytes(18).toString("hex");
   const rawKey = `whub_${randomBytes}`;
   const keyPrefix = rawKey.substring(0, 10);
-  const keyHash = hashApiKey(rawKey);
+  const keyHash = hashApiKey(rawKey, customPepper);
 
   return {
     rawKey,
@@ -26,8 +26,8 @@ export function generateApiKey(): {
 /**
  * Hash an API key using HMAC SHA-256 with the configured API_KEY_PEPPER.
  */
-export function hashApiKey(rawKey: string): string {
-  const pepper = env.API_KEY_PEPPER || "default_pepper";
+export function hashApiKey(rawKey: string, customPepper?: string): string {
+  const pepper = customPepper || process.env.API_KEY_PEPPER || env.API_KEY_PEPPER || "default_pepper";
   return crypto.createHmac("sha256", pepper).update(rawKey).digest("hex");
 }
 

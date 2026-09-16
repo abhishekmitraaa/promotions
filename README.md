@@ -1,6 +1,6 @@
 # WhatsApp Messaging Infrastructure Service
 
-A production-minded, locally runnable self-hosted WhatsApp messaging service built with **Next.js 16 (App Router)**, **TypeScript**, **Prisma ORM (SQLite)**, **Zod**, and **Meta's official WhatsApp Cloud API**.
+A production-minded, locally runnable self-hosted WhatsApp messaging service built with **Next.js 16 (App Router)**, **TypeScript**, **Prisma ORM (Supabase PostgreSQL)**, **Zod**, and **Meta's official WhatsApp Cloud API**.
 
 This service acts as a hardened, standardized abstraction layer between your external applications and Meta's Graph API—hiding access tokens and phone number IDs behind Bearer API keys while providing an administrative web dashboard, incoming webhook processing with HMAC validation, OTP verification, and outgoing webhook forwarding.
 
@@ -211,10 +211,15 @@ Response:
 
 ---
 
-## ⚠️ Database Architecture & Production Deployments
+## 🗄️ Database Architecture (Supabase PostgreSQL)
 
-- **Local Development / Single-Node MVP**: The local SQLite database (`prisma/dev.db`) is ideal for rapid local development and testing.
-- **Serverless Platforms (e.g. Netlify, Vercel)**: Serverless functions are stateless and ephemeral. A local SQLite database is NOT durable across lambda instances or cold starts. For persistent multi-user production deployments, connect Prisma to a managed PostgreSQL (Supabase, Neon, AWS RDS) or distributed LibSQL (Turso) instance.
+- **Supabase Cloud PostgreSQL**: The application connects to hosted PostgreSQL on Supabase, delivering durable, multi-worker persistent storage ready for serverless hosting (Netlify, Vercel, Docker).
+- **Connection Architecture**:
+  - `DATABASE_URL`: Pooled connection URL (port 6543 with `?pgbouncer=true`) for fast, serverless-friendly application queries.
+  - `DIRECT_URL`: Direct database connection (port 5432) for schema migrations and administrative operations.
+- **Migration & Verifications**:
+  - `npm run db:migrate-data`: Upserts historical SQLite backup data into Supabase PostgreSQL.
+  - `npm run db:verify`: Compares row counts between SQLite source and PostgreSQL target.
 
 ---
 
