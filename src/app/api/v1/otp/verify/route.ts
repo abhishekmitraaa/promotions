@@ -7,7 +7,7 @@ import { normalizePhoneNumber } from "@/lib/crypto";
 
 export async function POST(req: NextRequest) {
   const auth = await authenticateApiKey(req);
-  if (!auth.authenticated) return auth.errorResponse!;
+  if (!auth.authenticated || !auth.clientId) return auth.errorResponse!;
 
   let bodyJson: unknown;
   try {
@@ -58,6 +58,7 @@ export async function POST(req: NextRequest) {
 
   try {
     const result = await OtpService.verifyOtp(
+      auth.clientId,
       parseResult.data.to,
       parseResult.data.purpose,
       parseResult.data.code

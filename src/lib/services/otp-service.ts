@@ -7,14 +7,19 @@ import { dispatchOutgoingWebhooks } from "../webhooks/dispatcher";
 
 export class OtpService {
   /**
-   * Request a new OTP code sent to destination via WhatsApp.
+   * Request a new OTP code sent to destination via WhatsApp, scoped to an ApiClient.
    */
-  static async requestOtp(to: string, purpose: string = "login") {
+  static async requestOtp(clientId: string, to: string, purpose: string = "login") {
+    if (!clientId) {
+      throw new Error("clientId is required to request an OTP");
+    }
+
     const normalizedTo = normalizePhoneNumber(to);
 
-    // Invalidate existing active OTPs for destination and purpose
+    // Invalidate existing active OTPs for this client, destination, and purpose
     await prisma.otpVerification.updateMany({
       where: {
+        clientId,
         destination: normalizedTo,
         purpose,
         status: OtpStatus.PENDING,
@@ -29,9 +34,10 @@ export class OtpService {
     const codeHash = hashOtp(rawOtpCode, normalizedTo, purpose);
     const expiresAt = new Date(Date.now() + env.OTP_EXPIRY_SECONDS * 1000);
 
-    // Create OTP database record
+    // Create OTP database record bound to clientId
     const otpRecord = await prisma.otpVerification.create({
       data: {
+        clientId,
         destination: normalizedTo,
         purpose,
         codeHash,
@@ -41,35 +47,42 @@ export class OtpService {
       },
     });
 
-    // Send WhatsApp message
+    // Send WhatsApp message scoped to this client
     const templateName = env.OTP_TEMPLATE_NAME;
     const templateLanguage = env.OTP_TEMPLATE_LANGUAGE;
 
-    const dispatchResult = await MessageService.send({
-      to: normalizedTo,
-      type: "template",
-      templateName,
-      templateLanguage,
-      templateParameters: [
-        {
-          type: "body",
-          parameters: [{ type: "text", text: rawOtpCode }],
-        },
-        {
-          type: "button",
-          sub_type: "url",
-          index: "0",
-          parameters: [{ type: "text", text: rawOtpCode }],
-        },
-      ],
-    });
+    const dispatchResult = await MessageService.send(
+      {
+        to: normalizedTo,
+        type: "template",
+        templateName,
+        templateLanguage,
+        templateParameters: [
+          {
+            type: "body",
+            parameters: [{ type: "text", text: rawOtpCode }],
+          },
+          {
+            type: "button",
+            sub_type: "url",
+            index: "0",
+            parameters: [{ type: "text", text: rawOtpCode }],
+          },
+        ],
+      },
+      { clientId }
+    );
 
-    dispatchOutgoingWebhooks("otp.requested", {
-      otpId: otpRecord.id,
-      destination: normalizedTo,
-      purpose,
-      expiresAt: expiresAt.toISOString(),
-    }).catch(() => {});
+    dispatchOutgoingWebhooks(
+      "otp.requested",
+      {
+        otpId: otpRecord.id,
+        destination: normalizedTo,
+        purpose,
+        expiresAt: expiresAt.toISOString(),
+      },
+      clientId
+    ).catch(() => {});
 
     // Only return devCode when NODE_ENV !== "production" and simulated Meta mode is active
     const isSimulatedDevMode =
@@ -95,13 +108,18 @@ export class OtpService {
   }
 
   /**
-   * Verify an OTP code against active record.
+   * Verify an OTP code against active record with strict atomic concurrency protection.
    */
-  static async verifyOtp(to: string, purpose: string = "login", code: string) {
+  static async verifyOtp(clientId: string, to: string, purpose: string = "login", code: string) {
+    if (!clientId) {
+      throw new Error("clientId is required to verify an OTP");
+    }
+
     const normalizedTo = normalizePhoneNumber(to);
 
     const otpRecord = await prisma.otpVerification.findFirst({
       where: {
+        clientId,
         destination: normalizedTo,
         purpose,
         status: OtpStatus.PENDING,
@@ -122,8 +140,8 @@ export class OtpService {
 
     // Check expiry
     if (new Date() > otpRecord.expiresAt) {
-      await prisma.otpVerification.update({
-        where: { id: otpRecord.id },
+      await prisma.otpVerification.updateMany({
+        where: { id: otpRecord.id, status: OtpStatus.PENDING },
         data: { status: OtpStatus.EXPIRED },
       });
       return {
@@ -138,8 +156,8 @@ export class OtpService {
 
     // Check max attempts
     if (otpRecord.attempts >= env.OTP_MAX_ATTEMPTS) {
-      await prisma.otpVerification.update({
-        where: { id: otpRecord.id },
+      await prisma.otpVerification.updateMany({
+        where: { id: otpRecord.id, status: OtpStatus.PENDING },
         data: { status: OtpStatus.FAILED },
       });
       return {
@@ -157,16 +175,23 @@ export class OtpService {
     const isValid = expectedHash === otpRecord.codeHash;
 
     if (!isValid) {
-      const nextAttempts = otpRecord.attempts + 1;
-      const isFailed = nextAttempts >= env.OTP_MAX_ATTEMPTS;
-
-      await prisma.otpVerification.update({
+      // Atomic attempt increment
+      const updated = await prisma.otpVerification.update({
         where: { id: otpRecord.id },
         data: {
-          attempts: nextAttempts,
-          status: isFailed ? OtpStatus.FAILED : OtpStatus.PENDING,
+          attempts: { increment: 1 },
         },
       });
+
+      const nextAttempts = updated.attempts;
+      const isFailed = nextAttempts >= env.OTP_MAX_ATTEMPTS;
+
+      if (isFailed) {
+        await prisma.otpVerification.updateMany({
+          where: { id: otpRecord.id, status: OtpStatus.PENDING },
+          data: { status: OtpStatus.FAILED },
+        });
+      }
 
       return {
         success: false,
@@ -179,21 +204,44 @@ export class OtpService {
       };
     }
 
-    // Successful verification
-    const verifiedRecord = await prisma.otpVerification.update({
-      where: { id: otpRecord.id },
+    // Atomic conditional update: Only ONE concurrent request can transition PENDING -> VERIFIED
+    const now = new Date();
+    const updateResult = await prisma.otpVerification.updateMany({
+      where: {
+        id: otpRecord.id,
+        clientId,
+        status: OtpStatus.PENDING,
+        attempts: { lt: env.OTP_MAX_ATTEMPTS },
+        expiresAt: { gt: now },
+      },
       data: {
         status: OtpStatus.VERIFIED,
-        verifiedAt: new Date(),
+        verifiedAt: now,
       },
     });
 
-    dispatchOutgoingWebhooks("otp.verified", {
-      otpId: verifiedRecord.id,
-      destination: normalizedTo,
-      purpose,
-      verifiedAt: verifiedRecord.verifiedAt?.toISOString(),
-    }).catch(() => {});
+    if (updateResult.count === 0) {
+      // Concurrency race: Another request completed verification or transitioned state first
+      return {
+        success: false,
+        status: 409,
+        error: {
+          code: "OTP_ALREADY_USED",
+          message: "This OTP code has already been verified or is no longer pending.",
+        },
+      };
+    }
+
+    dispatchOutgoingWebhooks(
+      "otp.verified",
+      {
+        otpId: otpRecord.id,
+        destination: normalizedTo,
+        purpose,
+        verifiedAt: now.toISOString(),
+      },
+      clientId
+    ).catch(() => {});
 
     return {
       success: true,
@@ -202,7 +250,7 @@ export class OtpService {
         verified: true,
         destination: normalizedTo,
         purpose,
-        verifiedAt: verifiedRecord.verifiedAt,
+        verifiedAt: now,
       },
     };
   }

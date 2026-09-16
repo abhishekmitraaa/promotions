@@ -1,9 +1,10 @@
-import { normalizePhoneNumber, generateApiKey, hashApiKey, generateSecureOtp, hashOtp, verifyHmacSha256, signHmacSha256 } from "../src/lib/crypto";
+import { normalizePhoneNumber, generateApiKey, hashApiKey, generateSecureOtp, hashOtp, verifyHmacSha256, signHmacSha256, encryptWebhookSecret, decryptWebhookSecret } from "../src/lib/crypto";
 import { checkRateLimit } from "../src/lib/rate-limit";
 import { createMessageSchema } from "../src/lib/validation/messages";
 import { requestOtpSchema, verifyOtpSchema } from "../src/lib/validation/otp";
 import { formatTemplateComponents } from "../src/lib/services/message-service";
 import { envSchema } from "../src/lib/env";
+import { validateWebhookUrlSync } from "../src/lib/webhooks/ssrf";
 
 async function runVerification() {
   console.log("=================================================");
@@ -147,6 +148,7 @@ async function runVerification() {
     ADMIN_USERNAME: "ops_admin",
     ADMIN_PASSWORD: "super_secure_admin_password_1234",
     API_KEY_PEPPER: "0123456789abcdef0123456789abcdef",
+    WEBHOOK_SECRET_ENCRYPTION_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     DEV_ALLOW_UNCONFIGURED_META: "true",
   });
   assert(
@@ -154,22 +156,41 @@ async function runVerification() {
     "Production envSchema forces DEV_ALLOW_UNCONFIGURED_META to false even if set to true"
   );
 
-  // Test 11: Webhook Signing Secret Sanitization
-  const mockEndpoint = {
-    id: "ep_1",
-    name: "Test Hook",
-    url: "https://example.com/webhook",
-    secretHash: "secret_plaintext_key_123",
-    subscribedEvents: '["*"]',
-    active: true,
-  };
-  const { secretHash: _, ...sanitizedEndpoint } = mockEndpoint;
+  const unsafeProdEncryptionKey = envSchema.safeParse({
+    NODE_ENV: "production",
+    DATABASE_URL: "postgresql://postgres.sample_ref:super_secret_pw@aws-0-ap-south-1.pooler.supabase.com:6543/postgres?pgbouncer=true",
+    ADMIN_USERNAME: "ops_admin",
+    ADMIN_PASSWORD: "super_secure_admin_password_1234",
+    API_KEY_PEPPER: "0123456789abcdef0123456789abcdef",
+    WEBHOOK_SECRET_ENCRYPTION_KEY: "default_dev_secret_encryption_key_32bytes_min_len!!",
+  });
   assert(
-    !("secretHash" in sanitizedEndpoint) && "url" in sanitizedEndpoint,
-    "Webhook endpoint sanitization strips plaintext secretHash from list outputs"
+    !unsafeProdEncryptionKey.success,
+    "Production envSchema rejects default WEBHOOK_SECRET_ENCRYPTION_KEY"
   );
 
-  // Test 12: Standardized API Response Shape
+  // Test 11: Reversible AES-256-GCM Webhook Secret Encryption
+  const rawSecret = "whsec_super_secret_signing_token_999";
+  const encrypted = encryptWebhookSecret(rawSecret);
+  assert(encrypted !== rawSecret && encrypted.split(":").length === 3, "Webhook secret is encrypted into iv:authTag:ciphertext format");
+  const decrypted = decryptWebhookSecret(encrypted);
+  assert(decrypted === rawSecret, "Webhook secret decrypts accurately to original plaintext");
+
+  // Test 12: SSRF Webhook URL Validation
+  assert(!validateWebhookUrlSync("http://localhost:3000/webhook").valid, "SSRF blocks localhost");
+  assert(!validateWebhookUrlSync("http://127.0.0.1:8080/hook").valid, "SSRF blocks IPv4 loopback (127.0.0.1)");
+  assert(!validateWebhookUrlSync("http://10.0.0.5/hook").valid, "SSRF blocks 10.0.0.0/8 private IPv4");
+  assert(!validateWebhookUrlSync("http://172.20.1.1/hook").valid, "SSRF blocks full 172.16.0.0/12 range (172.20.1.1)");
+  assert(!validateWebhookUrlSync("http://192.168.1.100/hook").valid, "SSRF blocks 192.168.0.0/16 private IPv4");
+  assert(!validateWebhookUrlSync("http://169.254.169.254/latest/meta-data").valid, "SSRF blocks cloud metadata service (169.254.169.254)");
+  assert(!validateWebhookUrlSync("http://100.64.0.1/hook").valid, "SSRF blocks Carrier-Grade NAT (100.64.0.0/10)");
+  assert(!validateWebhookUrlSync("http://[::1]/hook").valid, "SSRF blocks IPv6 loopback [::1]");
+  assert(!validateWebhookUrlSync("http://[fe80::1]/hook").valid, "SSRF blocks IPv6 link-local [fe80::1]");
+  assert(!validateWebhookUrlSync("http://[fc00::1]/hook").valid, "SSRF blocks IPv6 unique local [fc00::1]");
+  assert(!validateWebhookUrlSync("ftp://example.com/hook").valid, "SSRF blocks non-http(s) protocols (ftp)");
+  assert(validateWebhookUrlSync("https://api.example.com/webhook").valid, "SSRF allows public HTTPS webhooks");
+
+  // Test 13: Standardized API Response Shape
   const standardResponse = { success: true, data: { items: [1, 2, 3] } };
   assert(
     standardResponse.success === true && Array.isArray(standardResponse.data.items),

@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { createMessageSchema } from "@/lib/validation/messages";
 import { MessageService } from "@/lib/services/message-service";
 import { MessageStatus } from "@prisma/client";
+import { prisma } from "@/lib/prisma";
 
 export async function POST(req: NextRequest) {
   let bodyJson: unknown;
@@ -32,8 +33,32 @@ export async function POST(req: NextRequest) {
     );
   }
 
+  // Resolve clientId (explicit or default active client)
+  const bodyObj = bodyJson as Record<string, unknown>;
+  let clientId = typeof bodyObj?.clientId === "string" ? bodyObj.clientId.trim() : undefined;
+
+  if (!clientId) {
+    const defaultClient = await prisma.apiClient.findFirst({
+      where: { active: true },
+      orderBy: { createdAt: "asc" },
+    });
+    if (!defaultClient) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: {
+            code: "NO_ACTIVE_CLIENT",
+            message: "No active API client found to associate message with.",
+          },
+        },
+        { status: 400 }
+      );
+    }
+    clientId = defaultClient.id;
+  }
+
   try {
-    const result = await MessageService.send(parseResult.data);
+    const result = await MessageService.send(parseResult.data, { clientId });
     const statusCode = result.status === MessageStatus.FAILED ? 502 : 200;
 
     const messageData = {

@@ -7,7 +7,7 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const auth = await authenticateApiKey(req);
-  if (!auth.authenticated) return auth.errorResponse!;
+  if (!auth.authenticated || !auth.clientId) return auth.errorResponse!;
 
   const { id } = await params;
 
@@ -22,7 +22,7 @@ export async function GET(
   }
 
   try {
-    const message = await MessageService.getById(id);
+    const message = await MessageService.getById(id, auth.clientId);
 
     if (!message) {
       return NextResponse.json(

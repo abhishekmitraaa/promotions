@@ -7,7 +7,7 @@ import { checkRateLimit } from "@/lib/rate-limit";
 
 export async function POST(req: NextRequest) {
   const auth = await authenticateApiKey(req);
-  if (!auth.authenticated) return auth.errorResponse!;
+  if (!auth.authenticated || !auth.clientId) return auth.errorResponse!;
 
   // In-memory rate limiting per API key (60 messages per minute)
   const rateLimit = checkRateLimit(`msg_key_${auth.keyId || "anon"}`, 60, 60000);
@@ -60,7 +60,10 @@ export async function POST(req: NextRequest) {
   const idempotencyKey = req.headers.get("idempotency-key") || undefined;
 
   try {
-    const result = await MessageService.send(parseResult.data, { idempotencyKey });
+    const result = await MessageService.send(parseResult.data, {
+      idempotencyKey,
+      clientId: auth.clientId,
+    });
     const statusCode = result.status === MessageStatus.FAILED ? 502 : 200;
 
     const messageData = {
@@ -95,7 +98,7 @@ export async function POST(req: NextRequest) {
 
 export async function GET(req: NextRequest) {
   const auth = await authenticateApiKey(req);
-  if (!auth.authenticated) return auth.errorResponse!;
+  if (!auth.authenticated || !auth.clientId) return auth.errorResponse!;
 
   const { searchParams } = new URL(req.url);
 
@@ -116,6 +119,7 @@ export async function GET(req: NextRequest) {
 
   try {
     const result = await MessageService.getMessages({
+      clientId: auth.clientId,
       direction,
       status,
       search,

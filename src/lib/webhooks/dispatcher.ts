@@ -3,6 +3,8 @@ import { signWebhookPayload } from "./signature";
 import { logger } from "../logger";
 import { env } from "../env";
 import { DeliveryStatus } from "@prisma/client";
+import { decryptWebhookSecret } from "../crypto";
+import { validateWebhookUrlSync, validateWebhookUrlForDelivery } from "./ssrf";
 
 export interface WebhookEventPayload {
   eventId: string;
@@ -12,44 +14,22 @@ export interface WebhookEventPayload {
 }
 
 /**
- * Validate outgoing webhook URL to mitigate basic SSRF risks.
- */
-function isValidWebhookUrl(urlString: string): boolean {
-  try {
-    const parsed = new URL(urlString);
-    if (!["http:", "https:"].includes(parsed.protocol)) {
-      return false;
-    }
-    // In production mode, block local IP addresses
-    if (env.NODE_ENV === "production") {
-      const hostname = parsed.hostname.toLowerCase();
-      if (
-        hostname === "localhost" ||
-        hostname === "127.0.0.1" ||
-        hostname === "::1" ||
-        hostname.startsWith("192.168.") ||
-        hostname.startsWith("10.") ||
-        hostname.startsWith("172.16.")
-      ) {
-        return false;
-      }
-    }
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
  * Dispatch an event to all active WebhookEndpoints registered for that event type.
+ * When clientId is provided, only endpoints belonging to that clientId are dispatched.
  */
 export async function dispatchOutgoingWebhooks(
   eventType: string,
-  data: Record<string, unknown>
+  data: Record<string, unknown>,
+  clientId?: string
 ): Promise<void> {
   try {
+    const whereClause: { active: boolean; clientId?: string } = { active: true };
+    if (clientId) {
+      whereClause.clientId = clientId;
+    }
+
     const endpoints = await prisma.webhookEndpoint.findMany({
-      where: { active: true },
+      where: whereClause,
     });
 
     if (endpoints.length === 0) return;
@@ -77,15 +57,27 @@ export async function dispatchOutgoingWebhooks(
         continue;
       }
 
-      if (!isValidWebhookUrl(endpoint.url)) {
-        logger.warn(`Skipping invalid or unsafe webhook URL: ${endpoint.url}`);
+      // Static URL validation
+      const staticCheck = validateWebhookUrlSync(endpoint.url);
+      if (!staticCheck.valid) {
+        logger.warn(`Skipping invalid or unsafe webhook URL: ${endpoint.url} - ${staticCheck.reason}`);
         continue;
       }
 
-      // Create PENDING delivery record
+      // Decrypt stored webhook signing secret
+      let signingSecret: string;
+      try {
+        signingSecret = decryptWebhookSecret(endpoint.encryptedSecret);
+      } catch (decryptErr) {
+        logger.error(`Failed to decrypt webhook secret for endpoint ${endpoint.id}:`, decryptErr);
+        continue;
+      }
+
+      // Create PENDING delivery record with tenant clientId
       const delivery = await prisma.webhookDelivery.create({
         data: {
           endpointId: endpoint.id,
+          clientId: endpoint.clientId,
           eventId,
           eventType,
           payload: rawPayload,
@@ -95,7 +87,7 @@ export async function dispatchOutgoingWebhooks(
       });
 
       // Deliver asynchronously
-      deliverWebhookPayload(delivery.id, endpoint.url, endpoint.secretHash, rawPayload, eventType).catch((err) => {
+      deliverWebhookPayload(delivery.id, endpoint.url, signingSecret, rawPayload, eventType).catch((err) => {
         logger.error(`Webhook delivery execution error for delivery ${delivery.id}:`, err);
       });
     }
@@ -105,18 +97,40 @@ export async function dispatchOutgoingWebhooks(
 }
 
 /**
- * Deliver payload over HTTP POST with retries.
+ * Deliver payload over HTTP POST with SSRF revalidation and retries.
  */
 export async function deliverWebhookPayload(
   deliveryId: string,
   url: string,
-  secretHash: string,
+  signingSecret: string,
   rawPayload: string,
   eventType: string
 ): Promise<boolean> {
   const timeoutMs = env.OUTBOUND_WEBHOOK_TIMEOUT_MS;
   const maxRetries = env.OUTBOUND_WEBHOOK_MAX_RETRIES;
-  const signature = signWebhookPayload(rawPayload, secretHash);
+
+  // SSRF Revalidation at delivery time (DNS resolution check)
+  const ssrfCheck = await validateWebhookUrlForDelivery(url);
+  if (!ssrfCheck.safe) {
+    const reason = `SSRF protection blocked webhook delivery: ${ssrfCheck.reason}`;
+    logger.error(`[SSRF Blocked] Delivery ${deliveryId} to ${url}: ${reason}`);
+
+    await prisma.webhookDelivery
+      .update({
+        where: { id: deliveryId },
+        data: {
+          status: DeliveryStatus.FAILED,
+          attemptCount: 1,
+          lastAttemptAt: new Date(),
+          errorMessage: reason,
+        },
+      })
+      .catch(() => {});
+
+    return false;
+  }
+
+  const signature = signWebhookPayload(rawPayload, signingSecret);
 
   let attempt = 0;
   let success = false;

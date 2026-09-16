@@ -14,6 +14,7 @@
     "setup": "tsx scripts/setup.ts",
     "pretest": "prisma generate",
     "test": "tsx scripts/verify-service.ts",
+    "test:security": "tsx scripts/verify-phase1-security.ts",
     "test:e2e": "tsx scripts/e2e-live-test.ts",
     "test:live": "tsx scripts/test-live-features.ts",
     "db:migrate-data": "tsx scripts/migrate-sqlite-to-postgres.ts",

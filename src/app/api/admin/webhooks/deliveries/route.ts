@@ -1,13 +1,18 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { deliverWebhookPayload } from "@/lib/webhooks/dispatcher";
+import { decryptWebhookSecret } from "@/lib/crypto";
 
-export async function GET() {
+export async function GET(req: NextRequest) {
   try {
+    const { searchParams } = new URL(req.url);
+    const clientId = searchParams.get("clientId") || undefined;
+
     const deliveries = await prisma.webhookDelivery.findMany({
+      where: clientId ? { clientId } : undefined,
       include: {
         endpoint: {
-          select: { name: true, url: true },
+          select: { id: true, clientId: true, name: true, url: true },
         },
       },
       orderBy: { createdAt: "desc" },
@@ -39,11 +44,22 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ success: false, error: "Delivery or endpoint not found" }, { status: 404 });
     }
 
+    // Decrypt signing secret from endpoint
+    let signingSecret: string;
+    try {
+      signingSecret = decryptWebhookSecret(delivery.endpoint.encryptedSecret);
+    } catch {
+      return NextResponse.json(
+        { success: false, error: "Failed to decrypt webhook signing secret for endpoint" },
+        { status: 500 }
+      );
+    }
+
     // Trigger async retry
     deliverWebhookPayload(
       delivery.id,
       delivery.endpoint.url,
-      delivery.endpoint.secretHash,
+      signingSecret,
       delivery.payload,
       delivery.eventType
     ).catch(() => {});

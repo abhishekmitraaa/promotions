@@ -5,6 +5,7 @@ dotenv.config({ path: ".env.local" });
 dotenv.config({ path: ".env" });
 
 import { prisma } from "../src/lib/prisma";
+import { encryptWebhookSecret } from "../src/lib/crypto";
 
 async function main() {
   console.log("\n==================================================================");
@@ -71,17 +72,21 @@ async function main() {
   }
   console.log(`✅ Upserted ${clients.length} ApiClient(s)`);
 
+  const defaultClientId = clients[0]?.id || "76a6a294-629c-4b5f-9c4d-f2f26fce4b22";
+
   // 2. Migrate WebhookEndpoints
   console.log("\n2. Migrating WebhookEndpoints...");
   const webhooks = exportData.webhooks || [];
   for (const ep of webhooks) {
+    const encryptedSecret = ep.encryptedSecret || encryptWebhookSecret(ep.secretHash || "default_secret");
     await prisma.webhookEndpoint.upsert({
       where: { id: ep.id },
       create: {
         id: ep.id,
+        clientId: ep.clientId || defaultClientId,
         name: ep.name,
         url: ep.url,
-        secretHash: ep.secretHash,
+        encryptedSecret,
         active: ep.active,
         subscribedEvents: ep.subscribedEvents,
         createdAt: new Date(ep.createdAt),
@@ -105,6 +110,7 @@ async function main() {
       where: { id: msg.id },
       create: {
         id: msg.id,
+        clientId: msg.clientId || defaultClientId,
         providerMessageId: msg.providerMessageId || null,
         direction: msg.direction,
         type: msg.type,
@@ -140,24 +146,26 @@ async function main() {
   // 4. Migrate MessageEvents
   console.log("\n4. Migrating MessageEvents...");
   const events = exportData.events || [];
-  for (const evt of events) {
+  for (const ev of events) {
     await prisma.messageEvent.upsert({
-      where: { id: evt.id },
+      where: { id: ev.id },
       create: {
-        id: evt.id,
-        providerEventId: evt.providerEventId || null,
-        providerMessageId: evt.providerMessageId,
-        eventType: evt.eventType,
-        payload: evt.payload,
-        processingStatus: evt.processingStatus,
-        errorMessage: evt.errorMessage,
-        receivedAt: new Date(evt.receivedAt),
-        processedAt: evt.processedAt ? new Date(evt.processedAt) : null,
-        createdAt: new Date(evt.createdAt),
+        id: ev.id,
+        clientId: ev.clientId || defaultClientId,
+        providerEventId: ev.providerEventId || null,
+        providerMessageId: ev.providerMessageId || null,
+        eventType: ev.eventType,
+        payload: ev.payload,
+        processingStatus: ev.processingStatus,
+        errorMessage: ev.errorMessage,
+        receivedAt: new Date(ev.receivedAt),
+        processedAt: ev.processedAt ? new Date(ev.processedAt) : null,
+        createdAt: new Date(ev.createdAt),
       },
       update: {
-        processingStatus: evt.processingStatus,
-        processedAt: evt.processedAt ? new Date(evt.processedAt) : null,
+        processingStatus: ev.processingStatus,
+        errorMessage: ev.errorMessage,
+        processedAt: ev.processedAt ? new Date(ev.processedAt) : null,
       },
     });
   }
@@ -171,6 +179,7 @@ async function main() {
       where: { id: del.id },
       create: {
         id: del.id,
+        clientId: del.clientId || defaultClientId,
         endpointId: del.endpointId,
         eventId: del.eventId,
         messageEventId: del.messageEventId,
@@ -203,6 +212,7 @@ async function main() {
       where: { id: otp.id },
       create: {
         id: otp.id,
+        clientId: otp.clientId || defaultClientId,
         destination: otp.destination,
         purpose: otp.purpose,
         codeHash: otp.codeHash,

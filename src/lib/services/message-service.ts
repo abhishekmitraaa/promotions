@@ -9,6 +9,7 @@ import { dispatchOutgoingWebhooks } from "../webhooks/dispatcher";
 
 export interface SendMessageOptions {
   idempotencyKey?: string;
+  clientId: string;
 }
 
 export interface SendMessageResult {
@@ -48,20 +49,25 @@ export function formatTemplateComponents(
 
 export class MessageService {
   /**
-   * Dispatch an outbound WhatsApp message (Text or Template)
+   * Dispatch an outbound WhatsApp message (Text or Template) scoped to an ApiClient.
    */
   static async send(
     input: CreateMessageInput,
-    options?: SendMessageOptions
+    options: SendMessageOptions
   ): Promise<SendMessageResult> {
+    const clientId = options.clientId;
+    if (!clientId) {
+      throw new Error("clientId is required to dispatch an outbound message");
+    }
+
     const normalizedTo = normalizePhoneNumber(input.to);
     const typeEnum = input.type.toUpperCase() as MessageType;
-    const idempotencyKey = options?.idempotencyKey?.trim();
+    const idempotencyKey = options?.idempotencyKey?.trim() || null;
 
-    // 1. Idempotency Check
+    // 1. Idempotency Check (Scoped to ApiClient)
     if (idempotencyKey) {
-      const existing = await prisma.message.findUnique({
-        where: { idempotencyKey },
+      const existing = await prisma.message.findFirst({
+        where: { clientId, idempotencyKey },
       });
 
       if (existing) {
@@ -76,24 +82,52 @@ export class MessageService {
       }
     }
 
-    // 2. Create QUEUED Record in DB
-    const messageRecord = await prisma.message.create({
-      data: {
-        direction: MessageDirection.OUTBOUND,
-        type: typeEnum,
-        status: MessageStatus.QUEUED,
-        from: "system",
-        to: normalizedTo,
-        body: input.body,
-        templateName: input.templateName,
-        templateLanguage: input.templateLanguage,
-        templateParameters: input.templateParameters
-          ? JSON.stringify(input.templateParameters)
-          : null,
-        metadata: input.metadata ? JSON.stringify(input.metadata) : null,
-        idempotencyKey: idempotencyKey || null,
-      },
-    });
+    // 2. Create QUEUED Record in DB (Handling concurrent idempotency race conditions)
+    let messageRecord;
+    try {
+      messageRecord = await prisma.message.create({
+        data: {
+          clientId,
+          direction: MessageDirection.OUTBOUND,
+          type: typeEnum,
+          status: MessageStatus.QUEUED,
+          from: "system",
+          to: normalizedTo,
+          body: input.body,
+          templateName: input.templateName,
+          templateLanguage: input.templateLanguage,
+          templateParameters: input.templateParameters
+            ? JSON.stringify(input.templateParameters)
+            : null,
+          metadata: input.metadata ? JSON.stringify(input.metadata) : null,
+          idempotencyKey,
+        },
+      });
+    } catch (createErr: unknown) {
+      // Safe handling of concurrent duplicate request race on (clientId, idempotencyKey)
+      if (
+        typeof createErr === "object" &&
+        createErr !== null &&
+        "code" in createErr &&
+        (createErr as { code: string }).code === "P2002" &&
+        idempotencyKey
+      ) {
+        const raceWinner = await prisma.message.findFirst({
+          where: { clientId, idempotencyKey },
+        });
+        if (raceWinner) {
+          return {
+            id: raceWinner.id,
+            providerMessageId: raceWinner.providerMessageId,
+            status: raceWinner.status,
+            to: raceWinner.to,
+            type: raceWinner.type,
+            sentAt: raceWinner.sentAt,
+          };
+        }
+      }
+      throw createErr;
+    }
 
     // 3. Construct Meta API Payload
     let metaPayload: MetaOutboundPayload;
@@ -141,14 +175,18 @@ export class MessageService {
         },
       });
 
-      // Fire outgoing webhooks asynchronously
-      dispatchOutgoingWebhooks("message.sent", {
-        messageId: updatedMessage.id,
-        providerMessageId: providerId,
-        to: updatedMessage.to,
-        status: "SENT",
-        sentAt: updatedMessage.sentAt,
-      }).catch(() => {});
+      // Fire outgoing webhooks asynchronously (scoped to client)
+      dispatchOutgoingWebhooks(
+        "message.sent",
+        {
+          messageId: updatedMessage.id,
+          providerMessageId: providerId,
+          to: updatedMessage.to,
+          status: "SENT",
+          sentAt: updatedMessage.sentAt,
+        },
+        clientId
+      ).catch(() => {});
 
       return {
         id: updatedMessage.id,
@@ -159,8 +197,14 @@ export class MessageService {
         sentAt: updatedMessage.sentAt,
       };
     } catch (err) {
-      const errorCode = err instanceof WhatsAppApiError ? String(err.errorCode || err.statusCode) : "SEND_FAILED";
-      const errorMessage = err instanceof Error ? err.message : "Failed to send message via Meta WhatsApp API";
+      const errorCode =
+        err instanceof WhatsAppApiError
+          ? String(err.errorCode || err.statusCode)
+          : "SEND_FAILED";
+      const errorMessage =
+        err instanceof Error
+          ? err.message
+          : "Failed to send message via Meta WhatsApp API";
 
       const failedRecord = await prisma.message.update({
         where: { id: messageRecord.id },
@@ -172,13 +216,17 @@ export class MessageService {
         },
       });
 
-      dispatchOutgoingWebhooks("message.failed", {
-        messageId: failedRecord.id,
-        to: failedRecord.to,
-        status: "FAILED",
-        errorCode,
-        errorMessage,
-      }).catch(() => {});
+      dispatchOutgoingWebhooks(
+        "message.failed",
+        {
+          messageId: failedRecord.id,
+          to: failedRecord.to,
+          status: "FAILED",
+          errorCode,
+          errorMessage,
+        },
+        clientId
+      ).catch(() => {});
 
       return {
         id: failedRecord.id,
@@ -195,20 +243,32 @@ export class MessageService {
   }
 
   /**
-   * Retrieve message by internal ID or providerMessageId.
+   * Retrieve message by internal ID or providerMessageId, scoped to clientId if provided.
    */
-  static async getById(id: string) {
+  static async getById(id: string, clientId?: string) {
+    const orConditions = [{ id }, { providerMessageId: id }];
+
+    if (clientId) {
+      return prisma.message.findFirst({
+        where: {
+          clientId,
+          OR: orConditions,
+        },
+      });
+    }
+
     return prisma.message.findFirst({
       where: {
-        OR: [{ id }, { providerMessageId: id }],
+        OR: orConditions,
       },
     });
   }
 
   /**
-   * Query list of messages with filtering and pagination.
+   * Query list of messages with filtering, pagination, and tenant isolation.
    */
   static async getMessages(params: {
+    clientId?: string;
     direction?: MessageDirection;
     status?: MessageStatus;
     search?: string;
@@ -221,6 +281,7 @@ export class MessageService {
 
     const whereClause: Record<string, unknown> = {};
 
+    if (params.clientId) whereClause.clientId = params.clientId;
     if (params.direction) whereClause.direction = params.direction;
     if (params.status) whereClause.status = params.status;
     if (params.search) {
@@ -255,10 +316,11 @@ export class MessageService {
   }
 
   /**
-   * Group conversations by recipient phone number.
+   * Group conversations by recipient phone number, scoped to clientId if provided.
    */
-  static async getConversations() {
+  static async getConversations(clientId?: string) {
     const allMessages = await prisma.message.findMany({
+      where: clientId ? { clientId } : undefined,
       orderBy: { createdAt: "desc" },
     });
 
@@ -273,19 +335,27 @@ export class MessageService {
     >();
 
     for (const msg of allMessages) {
-      const participant = msg.direction === MessageDirection.OUTBOUND ? msg.to : msg.from;
+      const participant =
+        msg.direction === MessageDirection.OUTBOUND ? msg.to : msg.from;
 
       if (!conversationMap.has(participant)) {
         conversationMap.set(participant, {
           phoneNumber: participant,
           latestMessage: msg,
           messageCount: 1,
-          unreadCount: msg.direction === MessageDirection.INBOUND && msg.status === MessageStatus.RECEIVED ? 1 : 0,
+          unreadCount:
+            msg.direction === MessageDirection.INBOUND &&
+            msg.status === MessageStatus.RECEIVED
+              ? 1
+              : 0,
         });
       } else {
         const existing = conversationMap.get(participant)!;
         existing.messageCount += 1;
-        if (msg.direction === MessageDirection.INBOUND && msg.status === MessageStatus.RECEIVED) {
+        if (
+          msg.direction === MessageDirection.INBOUND &&
+          msg.status === MessageStatus.RECEIVED
+        ) {
           existing.unreadCount += 1;
         }
       }

@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import crypto from "crypto";
+import { encryptWebhookSecret } from "@/lib/crypto";
 
 export async function POST(
   req: NextRequest,
@@ -21,12 +22,14 @@ export async function POST(
     }
 
     const newSigningSecret = crypto.randomBytes(24).toString("hex");
+    const encryptedSecret = encryptWebhookSecret(newSigningSecret);
 
     const updated = await prisma.webhookEndpoint.update({
       where: { id },
-      data: { secretHash: newSigningSecret },
+      data: { encryptedSecret },
       select: {
         id: true,
+        clientId: true,
         name: true,
         url: true,
         active: true,

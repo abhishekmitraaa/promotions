@@ -93,3 +93,68 @@ export function normalizePhoneNumber(phone: string): string {
   digits = digits.replace(/^0+/, "");
   return digits;
 }
+
+/**
+ * Derive a 32-byte key buffer for AES-256-GCM.
+ */
+function getEncryptionKeyBuffer(customKey?: string): Buffer {
+  const rawKey =
+    customKey ||
+    process.env.WEBHOOK_SECRET_ENCRYPTION_KEY ||
+    (env && env.WEBHOOK_SECRET_ENCRYPTION_KEY) ||
+    "default_dev_secret_encryption_key_32bytes_min_len!!";
+
+  if (/^[0-9a-fA-F]{64}$/.test(rawKey)) {
+    return Buffer.from(rawKey, "hex");
+  }
+  return crypto.createHash("sha256").update(rawKey).digest();
+}
+
+/**
+ * Encrypt a plaintext webhook signing secret using AES-256-GCM.
+ * Stored format: `iv:authTag:ciphertext` in hex.
+ */
+export function encryptWebhookSecret(secret: string, customKey?: string): string {
+  if (!secret) throw new Error("Secret to encrypt cannot be empty");
+
+  const key = getEncryptionKeyBuffer(customKey);
+  const iv = crypto.randomBytes(12); // standard 96-bit IV for GCM
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+
+  const ciphertext = Buffer.concat([
+    cipher.update(secret, "utf8"),
+    cipher.final(),
+  ]);
+  const authTag = cipher.getAuthTag();
+
+  return `${iv.toString("hex")}:${authTag.toString("hex")}:${ciphertext.toString("hex")}`;
+}
+
+/**
+ * Decrypt an AES-256-GCM encrypted webhook signing secret.
+ */
+export function decryptWebhookSecret(encryptedString: string, customKey?: string): string {
+  if (!encryptedString) throw new Error("Encrypted secret cannot be empty");
+
+  const parts = encryptedString.split(":");
+  if (parts.length !== 3) {
+    throw new Error("Invalid encrypted secret format. Expected iv:authTag:ciphertext");
+  }
+
+  const [ivHex, tagHex, cipherHex] = parts;
+  const iv = Buffer.from(ivHex, "hex");
+  const authTag = Buffer.from(tagHex, "hex");
+  const ciphertext = Buffer.from(cipherHex, "hex");
+
+  const key = getEncryptionKeyBuffer(customKey);
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+  decipher.setAuthTag(authTag);
+
+  const decrypted = Buffer.concat([
+    decipher.update(ciphertext),
+    decipher.final(),
+  ]);
+
+  return decrypted.toString("utf8");
+}
+

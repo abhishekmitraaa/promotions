@@ -8,6 +8,20 @@ import { dispatchOutgoingWebhooks } from "../webhooks/dispatcher";
 
 export class WebhookService {
   /**
+   * Helper to retrieve active default ApiClient ID for inbound webhook processing.
+   */
+  private static async getDefaultClientId(): Promise<string> {
+    const client = await prisma.apiClient.findFirst({
+      where: { active: true },
+      orderBy: { createdAt: "asc" },
+    });
+    if (!client) {
+      throw new Error("No active ApiClient found to associate with inbound webhook");
+    }
+    return client.id;
+  }
+
+  /**
    * Verify GET Meta Webhook Challenge.
    */
   static verifyChallenge(
@@ -105,14 +119,14 @@ export class WebhookService {
   }
 
   /**
-   * Handle status updates (sent, delivered, read, failed).
+   * Handle status updates (sent, delivered, read, failed) with concurrency race deduplication.
    */
   private static async handleStatusUpdate(statusObj: WebhookStatus, value: unknown): Promise<void> {
     const providerMessageId = statusObj.id;
     const statusType = statusObj.status; // 'sent' | 'delivered' | 'read' | 'failed'
     const eventId = `status_${providerMessageId}_${statusType}_${statusObj.timestamp}`;
 
-    // Deduplication check
+    // 1. Deduplication check
     const existingEvent = await prisma.messageEvent.findUnique({
       where: { providerEventId: eventId },
     });
@@ -121,22 +135,40 @@ export class WebhookService {
       return;
     }
 
-    // Record raw event
-    const eventRecord = await prisma.messageEvent.create({
-      data: {
-        providerEventId: eventId,
-        providerMessageId,
-        eventType: `status.${statusType}`,
-        payload: JSON.stringify(value),
-        processingStatus: ProcessingStatus.PENDING,
-      },
+    // Locate related message to inherit clientId
+    const message = await prisma.message.findUnique({
+      where: { providerMessageId },
     });
 
-    try {
-      const message = await prisma.message.findUnique({
-        where: { providerMessageId },
-      });
+    const clientId = message?.clientId || null;
 
+    // 2. Record raw event with safe handling of concurrent insertion race (P2002)
+    let eventRecord;
+    try {
+      eventRecord = await prisma.messageEvent.create({
+        data: {
+          clientId,
+          providerEventId: eventId,
+          providerMessageId,
+          eventType: `status.${statusType}`,
+          payload: JSON.stringify(value),
+          processingStatus: ProcessingStatus.PENDING,
+        },
+      });
+    } catch (err: unknown) {
+      if (
+        typeof err === "object" &&
+        err !== null &&
+        "code" in err &&
+        (err as { code: string }).code === "P2002"
+      ) {
+        logger.info(`Concurrent duplicate status event ${eventId} caught via unique constraint (P2002); handled idempotently.`);
+        return;
+      }
+      throw err;
+    }
+
+    try {
       if (!message) {
         logger.warn(`No message record found for providerMessageId: ${providerMessageId}`);
         await prisma.messageEvent.update({
@@ -199,15 +231,19 @@ export class WebhookService {
           });
         }
 
-        // Trigger outgoing webhooks
-        dispatchOutgoingWebhooks(`message.${statusType}`, {
-          messageId: message.id,
-          providerMessageId,
-          to: message.to,
-          status: newStatus,
-          timestamp: timestamp.toISOString(),
-          error: statusObj.errors?.[0],
-        }).catch(() => {});
+        // Trigger outgoing webhooks (scoped to tenant client)
+        dispatchOutgoingWebhooks(
+          `message.${statusType}`,
+          {
+            messageId: message.id,
+            providerMessageId,
+            to: message.to,
+            status: newStatus,
+            timestamp: timestamp.toISOString(),
+            error: statusObj.errors?.[0],
+          },
+          message.clientId
+        ).catch(() => {});
       }
 
       await prisma.messageEvent.update({
@@ -225,7 +261,7 @@ export class WebhookService {
   }
 
   /**
-   * Handle incoming inbound messages from Meta WhatsApp webhook.
+   * Handle incoming inbound messages from Meta WhatsApp webhook with concurrency deduplication.
    */
   private static async handleIncomingMessage(
     messageObj: WebhookIncomingMessage,
@@ -234,7 +270,7 @@ export class WebhookService {
     const providerMessageId = messageObj.id;
     const eventId = `inbound_${providerMessageId}`;
 
-    // Deduplication check
+    // 1. Deduplication check
     const existingMessage = await prisma.message.findUnique({
       where: { providerMessageId },
     });
@@ -243,16 +279,33 @@ export class WebhookService {
       return;
     }
 
-    // Record raw event
-    const eventRecord = await prisma.messageEvent.create({
-      data: {
-        providerEventId: eventId,
-        providerMessageId,
-        eventType: "message.received",
-        payload: JSON.stringify(value),
-        processingStatus: ProcessingStatus.PENDING,
-      },
-    });
+    const clientId = await this.getDefaultClientId();
+
+    // 2. Record raw event with safe handling of concurrent race (P2002)
+    let eventRecord;
+    try {
+      eventRecord = await prisma.messageEvent.create({
+        data: {
+          clientId,
+          providerEventId: eventId,
+          providerMessageId,
+          eventType: "message.received",
+          payload: JSON.stringify(value),
+          processingStatus: ProcessingStatus.PENDING,
+        },
+      });
+    } catch (err: unknown) {
+      if (
+        typeof err === "object" &&
+        err !== null &&
+        "code" in err &&
+        (err as { code: string }).code === "P2002"
+      ) {
+        logger.info(`Concurrent duplicate inbound event ${eventId} caught via unique constraint (P2002); handled idempotently.`);
+        return;
+      }
+      throw err;
+    }
 
     try {
       const fromNumber = normalizePhoneNumber(messageObj.from);
@@ -278,33 +331,56 @@ export class WebhookService {
         bodyText = `[${messageObj.type.toUpperCase()} Message]`;
       }
 
-      const createdMessage = await prisma.message.create({
-        data: {
-          providerMessageId,
-          direction: MessageDirection.INBOUND,
-          type: msgTypeEnum,
-          status: MessageStatus.RECEIVED,
-          from: fromNumber,
-          to: "system",
-          body: bodyText,
-          metadata: JSON.stringify(messageObj),
-        },
-      });
+      let createdMessage;
+      try {
+        createdMessage = await prisma.message.create({
+          data: {
+            clientId,
+            providerMessageId,
+            direction: MessageDirection.INBOUND,
+            type: msgTypeEnum,
+            status: MessageStatus.RECEIVED,
+            from: fromNumber,
+            to: "system",
+            body: bodyText,
+            metadata: JSON.stringify(messageObj),
+          },
+        });
+      } catch (createMsgErr: unknown) {
+        if (
+          typeof createMsgErr === "object" &&
+          createMsgErr !== null &&
+          "code" in createMsgErr &&
+          (createMsgErr as { code: string }).code === "P2002"
+        ) {
+          logger.info(`Inbound message ${providerMessageId} already created by concurrent worker; handled idempotently.`);
+          await prisma.messageEvent.update({
+            where: { id: eventRecord.id },
+            data: { processingStatus: ProcessingStatus.PROCESSED, processedAt: new Date() },
+          });
+          return;
+        }
+        throw createMsgErr;
+      }
 
       await prisma.messageEvent.update({
         where: { id: eventRecord.id },
         data: { processingStatus: ProcessingStatus.PROCESSED, processedAt: new Date() },
       });
 
-      // Dispatch outgoing webhook event for incoming message
-      dispatchOutgoingWebhooks("message.received", {
-        messageId: createdMessage.id,
-        providerMessageId: createdMessage.providerMessageId,
-        from: createdMessage.from,
-        body: createdMessage.body,
-        type: createdMessage.type,
-        createdAt: createdMessage.createdAt.toISOString(),
-      }).catch(() => {});
+      // Dispatch outgoing webhook event for incoming message (scoped to client)
+      dispatchOutgoingWebhooks(
+        "message.received",
+        {
+          messageId: createdMessage.id,
+          providerMessageId: createdMessage.providerMessageId,
+          from: createdMessage.from,
+          body: createdMessage.body,
+          type: createdMessage.type,
+          createdAt: createdMessage.createdAt.toISOString(),
+        },
+        clientId
+      ).catch(() => {});
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : "Error processing incoming message";
       logger.error("Failed to process incoming message:", err);

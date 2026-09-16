@@ -53,6 +53,7 @@ enum OtpStatus {
 
 model Message {
   id                 String           @id @default(uuid())
+  clientId           String
   providerMessageId  String?          @unique
   direction          MessageDirection
   type               MessageType      @default(TEXT)
@@ -68,7 +69,7 @@ model Message {
   errorCode          String?
   errorMessage       String?
   metadata           String?
-  idempotencyKey     String?          @unique
+  idempotencyKey     String?
   sentAt             DateTime?
   deliveredAt        DateTime?
   readAt             DateTime?
@@ -76,6 +77,10 @@ model Message {
   createdAt          DateTime         @default(now())
   updatedAt          DateTime         @updatedAt
 
+  client ApiClient @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@unique([clientId, idempotencyKey])
+  @@index([clientId])
   @@index([providerMessageId])
   @@index([to])
   @@index([from])
@@ -86,6 +91,7 @@ model Message {
 
 model MessageEvent {
   id                String           @id @default(uuid())
+  clientId          String?
   providerEventId   String?          @unique
   providerMessageId String?
   eventType         String
@@ -96,19 +102,27 @@ model MessageEvent {
   processedAt       DateTime?
   createdAt         DateTime         @default(now())
 
+  client ApiClient? @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@index([clientId])
   @@index([providerEventId])
   @@index([providerMessageId])
   @@index([eventType])
 }
 
 model ApiClient {
-  id          String   @id @default(uuid())
+  id          String            @id @default(uuid())
   name        String
   description String?
-  active      Boolean  @default(true)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  active      Boolean           @default(true)
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
   keys        ApiKey[]
+  messages    Message[]
+  events      MessageEvent[]
+  webhooks    WebhookEndpoint[]
+  deliveries  WebhookDelivery[]
+  otps        OtpVerification[]
 }
 
 model ApiKey {
@@ -131,18 +145,24 @@ model ApiKey {
 
 model WebhookEndpoint {
   id               String            @id @default(uuid())
+  clientId         String
   name             String
   url              String
-  secretHash       String
+  encryptedSecret  String
   active           Boolean           @default(true)
   subscribedEvents String
   createdAt        DateTime          @default(now())
   updatedAt        DateTime          @updatedAt
   deliveries       WebhookDelivery[]
+
+  client ApiClient @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@index([clientId])
 }
 
 model WebhookDelivery {
   id             String         @id @default(uuid())
+  clientId       String?
   endpointId     String
   eventId        String?
   messageEventId String?
@@ -159,7 +179,9 @@ model WebhookDelivery {
   updatedAt      DateTime       @updatedAt
 
   endpoint WebhookEndpoint @relation(fields: [endpointId], references: [id], onDelete: Cascade)
+  client   ApiClient?      @relation(fields: [clientId], references: [id], onDelete: Cascade)
 
+  @@index([clientId])
   @@index([endpointId])
   @@index([status])
   @@index([createdAt])
@@ -167,6 +189,7 @@ model WebhookDelivery {
 
 model OtpVerification {
   id          String    @id @default(uuid())
+  clientId    String
   destination String
   purpose     String
   codeHash    String
@@ -177,6 +200,9 @@ model OtpVerification {
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
 
+  client ApiClient @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@index([clientId])
   @@index([destination])
   @@index([purpose])
   @@index([status])

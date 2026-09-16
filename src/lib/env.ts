@@ -42,6 +42,9 @@ export const envSchema = z
     LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
     OUTBOUND_WEBHOOK_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
     OUTBOUND_WEBHOOK_MAX_RETRIES: z.coerce.number().int().nonnegative().default(5),
+    WEBHOOK_SECRET_ENCRYPTION_KEY: z
+      .string()
+      .default("default_dev_secret_encryption_key_32bytes_min_len!!"),
 
     // Development overrides - STRICTLY false in production
     DEV_ALLOW_UNCONFIGURED_META: z
@@ -106,6 +109,21 @@ export const envSchema = z
           message:
             "Production requires an explicit, strong ADMIN_PASSWORD (minimum 12 characters). The default password 'admin' is strictly forbidden.",
           path: ["ADMIN_PASSWORD"],
+        });
+      }
+
+      // 4. Enforce strong WEBHOOK_SECRET_ENCRYPTION_KEY in production
+      if (
+        !data.WEBHOOK_SECRET_ENCRYPTION_KEY ||
+        data.WEBHOOK_SECRET_ENCRYPTION_KEY.length < 32 ||
+        data.WEBHOOK_SECRET_ENCRYPTION_KEY.includes("default_dev_secret_encryption_key") ||
+        data.WEBHOOK_SECRET_ENCRYPTION_KEY.includes("replace_with_")
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            "Production requires a strong WEBHOOK_SECRET_ENCRYPTION_KEY (at least 32 characters). Default or placeholder encryption keys are forbidden.",
+          path: ["WEBHOOK_SECRET_ENCRYPTION_KEY"],
         });
       }
     }

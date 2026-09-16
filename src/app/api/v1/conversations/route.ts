@@ -4,10 +4,10 @@ import { MessageService } from "@/lib/services/message-service";
 
 export async function GET(req: NextRequest) {
   const auth = await authenticateApiKey(req);
-  if (!auth.authenticated) return auth.errorResponse!;
+  if (!auth.authenticated || !auth.clientId) return auth.errorResponse!;
 
   try {
-    const conversations = await MessageService.getConversations();
+    const conversations = await MessageService.getConversations(auth.clientId);
 
     return NextResponse.json({
       success: true,
