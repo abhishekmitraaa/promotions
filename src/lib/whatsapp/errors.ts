@@ -4,6 +4,7 @@ export class WhatsAppApiError extends Error {
   public readonly errorSubcode?: number;
   public readonly fbTraceId?: string;
   public readonly errorData?: unknown;
+  public readonly isTransient: boolean;
 
   constructor(
     message: string,
@@ -11,7 +12,8 @@ export class WhatsAppApiError extends Error {
     errorCode?: number,
     errorSubcode?: number,
     fbTraceId?: string,
-    errorData?: unknown
+    errorData?: unknown,
+    isTransient?: boolean
   ) {
     super(message);
     this.name = "WhatsAppApiError";
@@ -20,5 +22,6 @@ export class WhatsAppApiError extends Error {
     this.errorSubcode = errorSubcode;
     this.fbTraceId = fbTraceId;
     this.errorData = errorData;
+    this.isTransient = isTransient !== undefined ? isTransient : statusCode >= 500 || statusCode === 408;
   }
 }

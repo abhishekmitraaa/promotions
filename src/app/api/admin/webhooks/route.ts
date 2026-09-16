@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import crypto from "crypto";
 import { encryptWebhookSecret } from "@/lib/crypto";
-import { validateWebhookUrlSync } from "@/lib/webhooks/ssrf";
+import { validateAdminWebhookUrl, validateSubscribedEvents } from "@/lib/webhooks/validation";
 
 export async function GET(req: NextRequest) {
   try {
@@ -43,21 +43,32 @@ export async function POST(req: NextRequest) {
     const events = body.subscribedEvents || ["*"];
     let clientId = body.clientId?.trim();
 
-    if (!name || !url) {
+    if (!name) {
       return NextResponse.json(
-        { success: false, error: "Name and URL are required" },
+        { success: false, error: "Name is required" },
         { status: 400 }
       );
     }
 
-    // SSRF URL validation
-    const urlCheck = validateWebhookUrlSync(url);
-    if (!urlCheck.valid) {
+    // Strong URL validation (syntax, length, control chars, SSRF)
+    const urlValidation = validateAdminWebhookUrl(url);
+    if (!urlValidation.valid || !urlValidation.value) {
       return NextResponse.json(
-        { success: false, error: `Invalid or disallowed webhook URL: ${urlCheck.reason}` },
+        { success: false, error: urlValidation.reason || "Invalid webhook URL" },
         { status: 400 }
       );
     }
+    const validatedUrl = urlValidation.value;
+
+    // Subscribed events catalog validation
+    const eventsValidation = validateSubscribedEvents(events);
+    if (!eventsValidation.valid || !eventsValidation.value) {
+      return NextResponse.json(
+        { success: false, error: eventsValidation.reason || "Invalid subscribedEvents" },
+        { status: 400 }
+      );
+    }
+    const validatedEvents = eventsValidation.value;
 
     // Resolve clientId if not explicitly provided
     if (!clientId) {
@@ -84,6 +95,25 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    // Duplicate check: Prevent registering identical active URL for the same client
+    const existingActive = await prisma.webhookEndpoint.findFirst({
+      where: {
+        clientId,
+        url: validatedUrl,
+        active: true,
+      },
+    });
+
+    if (existingActive) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: `An active webhook endpoint with this URL already exists for this client (id: ${existingActive.id})`,
+        },
+        { status: 409 }
+      );
+    }
+
     // Generate random 48-char hex signing secret
     const signingSecret = crypto.randomBytes(24).toString("hex");
     const encryptedSecret = encryptWebhookSecret(signingSecret);
@@ -92,9 +122,9 @@ export async function POST(req: NextRequest) {
       data: {
         clientId,
         name,
-        url,
+        url: validatedUrl,
         encryptedSecret,
-        subscribedEvents: JSON.stringify(events),
+        subscribedEvents: JSON.stringify(validatedEvents),
         active: true,
       },
       select: {

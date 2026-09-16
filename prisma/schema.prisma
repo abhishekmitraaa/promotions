@@ -40,6 +40,7 @@ enum ProcessingStatus {
 
 enum DeliveryStatus {
   PENDING
+  PROCESSING
   SUCCESS
   FAILED
 }
@@ -81,10 +82,10 @@ model Message {
 
   @@unique([clientId, idempotencyKey])
   @@index([clientId])
-  @@index([providerMessageId])
-  @@index([to])
-  @@index([from])
   @@index([status])
+  @@index([from])
+  @@index([to])
+  @@index([providerMessageId])
   @@index([direction])
   @@index([createdAt])
 }
@@ -101,6 +102,7 @@ model MessageEvent {
   receivedAt        DateTime         @default(now())
   processedAt       DateTime?
   createdAt         DateTime         @default(now())
+  deliveries        WebhookDelivery[]
 
   client ApiClient? @relation(fields: [clientId], references: [id], onDelete: Cascade)
 
@@ -172,19 +174,23 @@ model WebhookDelivery {
   attemptCount   Int            @default(0)
   nextAttemptAt  DateTime?
   lastAttemptAt  DateTime?
+  lockedAt       DateTime?
   responseStatus Int?
   responseBody   String?
   errorMessage   String?
   createdAt      DateTime       @default(now())
   updatedAt      DateTime       @updatedAt
 
-  endpoint WebhookEndpoint @relation(fields: [endpointId], references: [id], onDelete: Cascade)
-  client   ApiClient?      @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  endpoint     WebhookEndpoint @relation(fields: [endpointId], references: [id], onDelete: Cascade)
+  client       ApiClient?      @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  messageEvent MessageEvent?   @relation(fields: [messageEventId], references: [id], onDelete: SetNull)
 
   @@index([clientId])
   @@index([endpointId])
   @@index([status])
   @@index([createdAt])
+  @@index([status, nextAttemptAt])
+  @@index([messageEventId])
 }
 
 model OtpVerification {
@@ -206,4 +212,14 @@ model OtpVerification {
   @@index([destination])
   @@index([purpose])
   @@index([status])
+}
+
+model RateLimit {
+  key       String   @id
+  count     Int      @default(1)
+  resetAt   DateTime
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([resetAt])
 }

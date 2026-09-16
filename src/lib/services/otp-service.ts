@@ -4,6 +4,7 @@ import { generateSecureOtp, hashOtp, normalizePhoneNumber } from "../crypto";
 import { OtpStatus } from "@prisma/client";
 import { MessageService } from "./message-service";
 import { dispatchOutgoingWebhooks } from "../webhooks/dispatcher";
+import { logger } from "../logger";
 
 export class OtpService {
   /**
@@ -51,29 +52,74 @@ export class OtpService {
     const templateName = env.OTP_TEMPLATE_NAME;
     const templateLanguage = env.OTP_TEMPLATE_LANGUAGE;
 
-    const dispatchResult = await MessageService.send(
-      {
-        to: normalizedTo,
-        type: "template",
-        templateName,
-        templateLanguage,
-        templateParameters: [
-          {
-            type: "body",
-            parameters: [{ type: "text", text: rawOtpCode }],
-          },
-          {
-            type: "button",
-            sub_type: "url",
-            index: "0",
-            parameters: [{ type: "text", text: rawOtpCode }],
-          },
-        ],
-      },
-      { clientId }
-    );
+    let dispatchResult;
+    try {
+      dispatchResult = await MessageService.send(
+        {
+          to: normalizedTo,
+          type: "template",
+          templateName,
+          templateLanguage,
+          templateParameters: [
+            {
+              type: "body",
+              parameters: [{ type: "text", text: rawOtpCode }],
+            },
+            {
+              type: "button",
+              sub_type: "url",
+              index: "0",
+              parameters: [{ type: "text", text: rawOtpCode }],
+            },
+          ],
+        },
+        { clientId }
+      );
+    } catch (sendErr) {
+      // Mark OTP as FAILED if dispatch throws
+      await prisma.otpVerification
+        .update({
+          where: { id: otpRecord.id },
+          data: { status: OtpStatus.FAILED },
+        })
+        .catch(() => {});
 
-    dispatchOutgoingWebhooks(
+      logger.error("Failed to send OTP message via WhatsApp Cloud API:", sendErr);
+      return {
+        success: false,
+        status: 502,
+        error: {
+          code: "OTP_DELIVERY_FAILED",
+          message:
+            sendErr instanceof Error
+              ? sendErr.message
+              : "Failed to dispatch OTP message via WhatsApp Cloud API",
+        },
+      };
+    }
+
+    if (dispatchResult.status === "FAILED") {
+      // Mark OTP as FAILED if dispatch result is FAILED
+      await prisma.otpVerification
+        .update({
+          where: { id: otpRecord.id },
+          data: { status: OtpStatus.FAILED },
+        })
+        .catch(() => {});
+
+      logger.warn(`OTP dispatch failed for destination ${normalizedTo}: ${dispatchResult.errorMessage}`);
+      return {
+        success: false,
+        status: 502,
+        error: {
+          code: "OTP_DELIVERY_FAILED",
+          message: dispatchResult.errorMessage || "WhatsApp OTP delivery could not be initiated",
+        },
+      };
+    }
+
+    // Await durable webhook dispatch
+    await dispatchOutgoingWebhooks(
       "otp.requested",
       {
         otpId: otpRecord.id,
@@ -82,7 +128,9 @@ export class OtpService {
         expiresAt: expiresAt.toISOString(),
       },
       clientId
-    ).catch(() => {});
+    ).catch((err) => {
+      logger.error("Failed to dispatch otp.requested webhook:", err);
+    });
 
     // Only return devCode when NODE_ENV !== "production" and simulated Meta mode is active
     const isSimulatedDevMode =
@@ -232,7 +280,7 @@ export class OtpService {
       };
     }
 
-    dispatchOutgoingWebhooks(
+    await dispatchOutgoingWebhooks(
       "otp.verified",
       {
         otpId: otpRecord.id,
@@ -241,7 +289,9 @@ export class OtpService {
         verifiedAt: now.toISOString(),
       },
       clientId
-    ).catch(() => {});
+    ).catch((err) => {
+      logger.error("Failed to dispatch otp.verified webhook:", err);
+    });
 
     return {
       success: true,

@@ -37,23 +37,63 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // Rate limit: max 5 OTP requests per normalized phone number per minute
+  // Layered distributed rate limiting:
+  // 1. Per normalized destination phone (5 req / 60s)
   const normalizedPhone = normalizePhoneNumber(parseResult.data.to);
-  const rateLimit = checkRateLimit(`otp_req_${normalizedPhone}`, 5, 60000);
-  if (!rateLimit.success) {
+  const phoneRateLimit = await checkRateLimit(`otp_req_phone_${normalizedPhone}`, 5, 60000);
+  if (!phoneRateLimit.success) {
     return NextResponse.json(
       {
         success: false,
         error: {
           code: "RATE_LIMITED",
-          message: `Too many OTP requests for this phone number. Please wait ${rateLimit.resetSeconds} seconds.`,
+          message: `Too many OTP requests for this phone number. Please wait ${phoneRateLimit.resetSeconds} seconds.`,
         },
       },
       {
         status: 429,
-        headers: { "Retry-After": String(rateLimit.resetSeconds) },
+        headers: { "Retry-After": String(phoneRateLimit.resetSeconds) },
       }
     );
+  }
+
+  // 2. Per API Client tenant (100 req / 60s)
+  const clientRateLimit = await checkRateLimit(`otp_req_client_${auth.clientId}`, 100, 60000);
+  if (!clientRateLimit.success) {
+    return NextResponse.json(
+      {
+        success: false,
+        error: {
+          code: "RATE_LIMITED",
+          message: `Client OTP request limit reached. Please wait ${clientRateLimit.resetSeconds} seconds.`,
+        },
+      },
+      {
+        status: 429,
+        headers: { "Retry-After": String(clientRateLimit.resetSeconds) },
+      }
+    );
+  }
+
+  // 3. Per caller IP if present (20 req / 60s)
+  const clientIp = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || req.headers.get("x-real-ip");
+  if (clientIp) {
+    const ipRateLimit = await checkRateLimit(`otp_req_ip_${clientIp}`, 20, 60000);
+    if (!ipRateLimit.success) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: {
+            code: "RATE_LIMITED",
+            message: `Too many requests from your IP. Please wait ${ipRateLimit.resetSeconds} seconds.`,
+          },
+        },
+        {
+          status: 429,
+          headers: { "Retry-After": String(ipRateLimit.resetSeconds) },
+        }
+      );
+    }
   }
 
   try {

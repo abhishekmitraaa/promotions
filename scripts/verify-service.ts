@@ -52,9 +52,9 @@ async function runVerification() {
 
   // Test 5: Rate Limiter
   const rateKey = `test_rate_key_${Date.now()}`;
-  const res1 = checkRateLimit(rateKey, 2, 60000);
-  const res2 = checkRateLimit(rateKey, 2, 60000);
-  const res3 = checkRateLimit(rateKey, 2, 60000);
+  const res1 = await checkRateLimit(rateKey, 2, 60000);
+  const res2 = await checkRateLimit(rateKey, 2, 60000);
+  const res3 = await checkRateLimit(rateKey, 2, 60000);
   assert(res1.success && res2.success, "Rate limiter permits requests within limit");
   assert(!res3.success, "Rate limiter blocks requests exceeding configured limit");
 

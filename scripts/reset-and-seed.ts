@@ -2,6 +2,10 @@ import { prisma } from "../src/lib/prisma";
 import { generateApiKey } from "../src/lib/crypto";
 
 async function resetAndSeed() {
+  if (process.env.NODE_ENV === "production" || process.env.ALLOW_DATABASE_RESET !== "true") {
+    console.error("❌ FATAL: reset-and-seed is locked. Running reset-and-seed against production or without ALLOW_DATABASE_RESET=true is strictly forbidden.");
+    process.exit(1);
+  }
   console.log("\n=======================================================");
   console.log("🧹 1. PURGING ALL EXISTING DATA FROM SQLITE DATABASE");
   console.log("=======================================================\n");

@@ -1,20 +1,18 @@
 # Setup & Local Developer Guide
 
-This guide walks through configuring, installing, and running the WhatsApp Hub infrastructure service locally.
+This guide walks through configuring, installing, running, and deploying the WhatsApp Hub infrastructure service.
 
 ---
 
 ## 1. System Requirements
 
-- **Node.js**: v20.x or higher
+- **Node.js**: v20.x or v22.x (Standardized across Netlify runtime and local environments)
 - **npm**: v10.x or higher
-- **Database**: SQLite (managed automatically via Prisma ORM)
+- **Database**: Supabase PostgreSQL (Managed, serverless-ready, pooled via Supavisor)
 
 ---
 
 ## 2. Automated Initialization
-
-The easiest way to bootstrap the project is using the automated setup script:
 
 ```bash
 # Clone the repository
@@ -31,14 +29,14 @@ npm run setup
 ### What `npm run setup` Does:
 1. Verifies existing environment files; if `.env.local` is missing, it clones `.env.example`.
 2. Checks if `API_KEY_PEPPER` is set or default; if missing, it automatically generates a 64-character cryptographically secure random string.
-3. Automatically executes `npx prisma db push` to synchronize the PostgreSQL database schema.
+3. Generates the Prisma client types (`npx prisma generate`).
 4. Ensures environment files remain untracked by Git.
 
 ---
 
 ## 3. Environment Variables Reference
 
-All configurations are defined in `.env.local`:
+All configurations are defined in `.env.local` for local development, or configured in Netlify Environment Variables for production:
 
 | Variable | Type | Default | Description |
 |---|---|---|---|
@@ -48,6 +46,7 @@ All configurations are defined in `.env.local`:
 | `ADMIN_USERNAME` | String | `hub_admin` | HTTP Basic Auth username for `/dashboard/*` and `/api/admin/*`. In production, explicit non-default value is required. |
 | `ADMIN_PASSWORD` | String | Auto-generated | HTTP Basic Auth password for `/dashboard/*` and `/api/admin/*`. In production, must be at least 12 characters; "admin" is forbidden. |
 | `API_KEY_PEPPER` | String | Auto-generated | Secret pepper used for HMAC-SHA256 hashing of API keys. Min 32 chars in production. |
+| `WEBHOOK_SECRET_ENCRYPTION_KEY` | String | Min 32 chars | Secret key for AES-256-GCM encryption of webhook signing secrets at rest. |
 | `META_GRAPH_API_VERSION` | String | `v22.0` | Meta Graph API version. |
 | `META_ACCESS_TOKEN` | String | `""` | Meta Permanent System User Access Token. |
 | `META_PHONE_NUMBER_ID` | String | `""` | Sender WhatsApp Business Phone Number ID. |
@@ -57,29 +56,31 @@ All configurations are defined in `.env.local`:
 | `DEV_ALLOW_UNCONFIGURED_META` | Boolean | `true` | Allows local dev simulation. Strictly forced to `false` in production. |
 | `OTP_EXPIRY_SECONDS` | Number | `300` | OTP validity window in seconds (default 5 minutes). |
 | `OTP_MAX_ATTEMPTS` | Number | `5` | Maximum failed verification attempts before invalidation. |
-| `OUTGOING_WEBHOOK_TIMEOUT_MS`| Number | `5000` | Timeout in ms for outgoing webhook delivery dispatches. |
+| `OUTBOUND_WEBHOOK_TIMEOUT_MS`| Number | `10000` | Timeout in ms for outbound webhook delivery dispatches. |
+| `OUTBOUND_WEBHOOK_MAX_RETRIES`| Number | `5` | Maximum delivery attempts for retryable 5xx/network errors. |
 
 ---
 
-## 4. Database Architecture (Supabase PostgreSQL)
+## 4. Database Architecture & Reproducible Migrations
 
-- **Managed Cloud PostgreSQL**: The application connects to hosted PostgreSQL on Supabase.
-- **Connection Pooling**: Use the Supavisor pooled connection on port 6543 (`?pgbouncer=true`) for application runtime, and the direct connection on port 5432 (`DIRECT_URL`) for Prisma schema migrations.
-- **Data Migration & Verification**:
-  - `npm run db:migrate-data`: Migrates historical records from SQLite exports to PostgreSQL.
-  - `npm run db:verify`: Compares source SQLite row counts against target PostgreSQL row counts.
+- **Managed Cloud PostgreSQL**: The application connects to hosted PostgreSQL on Supabase (`peqynzeioiauynfpdsdv`).
+- **Connection Pooling**: Use the Supavisor pooled connection on port 6543 (`?pgbouncer=true`) for application runtime, and the direct connection on port 5432 (`DIRECT_URL`) for Prisma migrations.
+- **Committed Migrations History**:
+  - Migrations are committed in `prisma/migrations/`.
+  - To apply forward migrations safely in production/staging without data loss:
+    ```bash
+    npx prisma migrate deploy
+    ```
 
 ---
 
----
-
-## 4. Local Development vs Live Production Mode
+## 5. Local Development vs Live Production Mode
 
 ### Local Simulation Mode (`NODE_ENV !== "production"`)
 If `META_ACCESS_TOKEN` or `META_PHONE_NUMBER_ID` are omitted in development:
 - The service **does not fail**.
 - It records messages into the local database as `SENT`.
-- It generates a simulated provider ID (`sim_msg_<uuid>`).
+- It generates a simulated provider ID (`wamid.dev_mock_...`).
 - It outputs simulation debug logs in your console.
 - The web dashboard will display amber diagnostic cards indicating that Meta credentials are unconfigured.
 
@@ -91,18 +92,21 @@ When deployed or running with live credentials:
 
 ---
 
-## 5. Running the Service
+## 6. Verification Test Suites
 
 ```bash
-# Start Next.js development server
-npm run dev
-
-# Run automated verification suite (22 checks)
+# Core service verification suite (45 checks)
 npm test
 
-# Check codebase formatting and linting
+# Multi-tenant isolation, RLS, and security verification suite (32 checks)
+npm run test:security
+
+# Phase 2 reliability, durable queue, and rate limiting suite (26 checks)
+npm run test:phase2
+
+# Codebase linting
 npm run lint
 
-# Build production bundle
+# Production build
 npm run build
 ```

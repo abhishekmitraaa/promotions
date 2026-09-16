@@ -63,12 +63,41 @@ export async function sendWhatsAppMessage(
 
     clearTimeout(timer);
 
-    const json = await response.json();
+    let rawText = "";
+    try {
+      rawText = await response.text();
+    } catch {
+      throw new WhatsAppApiError(
+        "Failed to read response body from Meta WhatsApp API",
+        response.status,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        true
+      );
+    }
+
+    let json: unknown;
+    try {
+      json = JSON.parse(rawText);
+    } catch {
+      const sanitizedText = rawText.substring(0, 250);
+      throw new WhatsAppApiError(
+        `Meta API returned non-JSON response (HTTP ${response.status}): ${sanitizedText}`,
+        response.status,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        response.status >= 500
+      );
+    }
 
     if (!response.ok) {
       const errResponse = json as MetaErrorResponse;
       const metaErr = errResponse.error || {};
-      logger.error(`Meta API returned HTTP ${response.status}:`, metaErr);
+      logger.error(`Meta API returned HTTP ${response.status} (code ${metaErr.code || "unknown"}):`, metaErr.message);
 
       throw new WhatsAppApiError(
         metaErr.message || `Meta Graph API request failed with status ${response.status}`,
@@ -76,7 +105,8 @@ export async function sendWhatsAppMessage(
         metaErr.code,
         metaErr.error_subcode,
         metaErr.fbtrace_id,
-        metaErr.error_data
+        metaErr.error_data,
+        response.status >= 500 || response.status === 408
       );
     }
 
@@ -91,12 +121,17 @@ export async function sendWhatsAppMessage(
     if ((error as { name?: string }).name === "AbortError") {
       throw new WhatsAppApiError(
         `Meta WhatsApp Cloud API request timed out after ${timeoutMs}ms`,
-        504
+        504,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        true
       );
     }
 
     const message = error instanceof Error ? error.message : "Unknown Meta API client error";
-    logger.error("Meta API Client error:", message);
-    throw new WhatsAppApiError(message, 500);
+    logger.error("Meta API Client network/runtime error:", message);
+    throw new WhatsAppApiError(message, 500, undefined, undefined, undefined, undefined, true);
   }
 }

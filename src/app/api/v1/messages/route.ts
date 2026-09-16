@@ -9,8 +9,8 @@ export async function POST(req: NextRequest) {
   const auth = await authenticateApiKey(req);
   if (!auth.authenticated || !auth.clientId) return auth.errorResponse!;
 
-  // In-memory rate limiting per API key (60 messages per minute)
-  const rateLimit = checkRateLimit(`msg_key_${auth.keyId || "anon"}`, 60, 60000);
+  // Distributed rate limiting per API key (60 messages per minute)
+  const rateLimit = await checkRateLimit(`msg_key_${auth.keyId || "anon"}`, 60, 60000);
   if (!rateLimit.success) {
     return NextResponse.json(
       {

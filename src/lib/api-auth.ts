@@ -122,13 +122,23 @@ export async function authenticateApiKey(req: NextRequest): Promise<AuthResult> 
       };
     }
 
-    // Fire & forget update of lastUsedAt timestamp
-    prisma.apiKey
-      .update({
-        where: { id: apiKeyRecord.id },
-        data: { lastUsedAt: new Date() },
-      })
-      .catch(() => {});
+    // Reliable update of lastUsedAt timestamp (throttled to at most once every 60s per key to prevent DB write contention)
+    const now = Date.now();
+    const shouldUpdateLastUsed =
+      !apiKeyRecord.lastUsedAt ||
+      now - new Date(apiKeyRecord.lastUsedAt).getTime() > 60_000;
+
+    if (shouldUpdateLastUsed) {
+      await prisma.apiKey
+        .update({
+          where: { id: apiKeyRecord.id },
+          data: { lastUsedAt: new Date(now) },
+        })
+        .catch((updateErr) => {
+          // Log but do not fail the authenticated request
+          console.warn(`Failed to update lastUsedAt for key ${apiKeyRecord.id}:`, updateErr);
+        });
+    }
 
     return {
       authenticated: true,

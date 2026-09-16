@@ -15,10 +15,14 @@
     "pretest": "prisma generate",
     "test": "tsx scripts/verify-service.ts",
     "test:security": "tsx scripts/verify-phase1-security.ts",
+    "test:phase2": "tsx scripts/verify-phase2-reliability.ts",
     "test:e2e": "tsx scripts/e2e-live-test.ts",
     "test:live": "tsx scripts/test-live-features.ts",
     "db:migrate-data": "tsx scripts/migrate-sqlite-to-postgres.ts",
     "db:verify": "tsx scripts/verify-postgres-migration.ts"
+  },
+  "engines": {
+    "node": ">=20.0.0"
   },
   "overrides": {
     "deepmerge-ts": "^8.0.2",

@@ -23,6 +23,8 @@ export interface SendMessageResult {
     code?: string | null;
     message?: string | null;
   };
+  errorCode?: string;
+  errorMessage?: string;
 }
 
 export function formatTemplateComponents(
@@ -176,7 +178,7 @@ export class MessageService {
       });
 
       // Fire outgoing webhooks asynchronously (scoped to client)
-      dispatchOutgoingWebhooks(
+      await dispatchOutgoingWebhooks(
         "message.sent",
         {
           messageId: updatedMessage.id,
@@ -186,7 +188,7 @@ export class MessageService {
           sentAt: updatedMessage.sentAt,
         },
         clientId
-      ).catch(() => {});
+      );
 
       return {
         id: updatedMessage.id,
@@ -216,7 +218,7 @@ export class MessageService {
         },
       });
 
-      dispatchOutgoingWebhooks(
+      await dispatchOutgoingWebhooks(
         "message.failed",
         {
           messageId: failedRecord.id,
@@ -226,7 +228,7 @@ export class MessageService {
           errorMessage,
         },
         clientId
-      ).catch(() => {});
+      );
 
       return {
         id: failedRecord.id,
@@ -265,32 +267,32 @@ export class MessageService {
   }
 
   /**
-   * Query list of messages with filtering, pagination, and tenant isolation.
+   * List messages with pagination, optionally filtered by status, direction, and clientId.
    */
-  static async getMessages(params: {
-    clientId?: string;
-    direction?: MessageDirection;
-    status?: MessageStatus;
-    search?: string;
+  static async getMessages(options: {
     page?: number;
     limit?: number;
+    status?: MessageStatus;
+    direction?: MessageDirection;
+    clientId?: string;
+    search?: string;
   }) {
-    const page = Math.max(1, params.page || 1);
-    const limit = Math.min(100, Math.max(1, params.limit || 20));
+    const page = Math.max(1, options.page || 1);
+    const limit = Math.min(Math.max(1, options.limit || 20), 100);
     const skip = (page - 1) * limit;
 
     const whereClause: Record<string, unknown> = {};
 
-    if (params.clientId) whereClause.clientId = params.clientId;
-    if (params.direction) whereClause.direction = params.direction;
-    if (params.status) whereClause.status = params.status;
-    if (params.search) {
+    if (options.status) whereClause.status = options.status;
+    if (options.direction) whereClause.direction = options.direction;
+    if (options.clientId) whereClause.clientId = options.clientId;
+    if (options.search) {
       whereClause.OR = [
-        { to: { contains: params.search } },
-        { from: { contains: params.search } },
-        { body: { contains: params.search } },
-        { providerMessageId: { contains: params.search } },
-        { id: { contains: params.search } },
+        { to: { contains: options.search } },
+        { from: { contains: options.search } },
+        { body: { contains: options.search } },
+        { providerMessageId: { contains: options.search } },
+        { id: { contains: options.search } },
       ];
     }
 
@@ -316,51 +318,104 @@ export class MessageService {
   }
 
   /**
-   * Group conversations by recipient phone number, scoped to clientId if provided.
+   * Group conversations by participant phone number using scalable PostgreSQL window aggregation.
+   * Eliminates full-table in-memory loading.
    */
-  static async getConversations(clientId?: string) {
-    const allMessages = await prisma.message.findMany({
-      where: clientId ? { clientId } : undefined,
-      orderBy: { createdAt: "desc" },
-    });
+  static async getConversations(
+    clientId?: string,
+    options?: { page?: number; limit?: number }
+  ) {
+    const page = Math.max(1, options?.page || 1);
+    const limit = Math.min(Math.max(1, options?.limit || 50), 200);
+    const offset = (page - 1) * limit;
 
-    const conversationMap = new Map<
-      string,
-      {
-        phoneNumber: string;
-        latestMessage: (typeof allMessages)[0];
-        messageCount: number;
-        unreadCount: number;
-      }
-    >();
+    const rows: {
+      phoneNumber: string;
+      latestMessage: unknown;
+      messageCount: bigint | number;
+      unreadCount: bigint | number;
+    }[] = await prisma.$queryRawUnsafe(`
+      WITH participants AS (
+        SELECT 
+          CASE WHEN direction = 'OUTBOUND' THEN "to" ELSE "from" END AS participant,
+          id,
+          "clientId",
+          "providerMessageId",
+          direction,
+          type,
+          status,
+          "from",
+          "to",
+          body,
+          "templateName",
+          "templateLanguage",
+          "templateParameters",
+          "mediaId",
+          "mediaUrl",
+          "errorCode",
+          "errorMessage",
+          metadata,
+          "idempotencyKey",
+          "sentAt",
+          "deliveredAt",
+          "readAt",
+          "failedAt",
+          "createdAt",
+          "updatedAt",
+          ROW_NUMBER() OVER (
+            PARTITION BY CASE WHEN direction = 'OUTBOUND' THEN "to" ELSE "from" END
+            ORDER BY "createdAt" DESC
+          ) as rn,
+          COUNT(*) OVER (
+            PARTITION BY CASE WHEN direction = 'OUTBOUND' THEN "to" ELSE "from" END
+          ) as message_count,
+          COUNT(CASE WHEN direction = 'INBOUND' AND status = 'RECEIVED' THEN 1 END) OVER (
+            PARTITION BY CASE WHEN direction = 'OUTBOUND' THEN "to" ELSE "from" END
+          ) as unread_count
+        FROM "Message"
+        ${clientId ? `WHERE "clientId" = '${clientId.replace(/'/g, "''")}'` : ""}
+      )
+      SELECT 
+        participant AS "phoneNumber",
+        json_build_object(
+          'id', id,
+          'clientId', "clientId",
+          'providerMessageId', "providerMessageId",
+          'direction', direction,
+          'type', type,
+          'status', status,
+          'from', "from",
+          'to', "to",
+          'body', body,
+          'templateName', "templateName",
+          'templateLanguage', "templateLanguage",
+          'templateParameters', "templateParameters",
+          'mediaId', "mediaId",
+          'mediaUrl', "mediaUrl",
+          'errorCode', "errorCode",
+          'errorMessage', "errorMessage",
+          'metadata', metadata,
+          'idempotencyKey', "idempotencyKey",
+          'sentAt', "sentAt",
+          'deliveredAt', "deliveredAt",
+          'readAt', "readAt",
+          'failedAt', "failedAt",
+          'createdAt', "createdAt",
+          'updatedAt', "updatedAt"
+        ) AS "latestMessage",
+        message_count AS "messageCount",
+        unread_count AS "unreadCount"
+      FROM participants
+      WHERE rn = 1
+      ORDER BY "createdAt" DESC
+      LIMIT ${limit} OFFSET ${offset};
+    `);
 
-    for (const msg of allMessages) {
-      const participant =
-        msg.direction === MessageDirection.OUTBOUND ? msg.to : msg.from;
-
-      if (!conversationMap.has(participant)) {
-        conversationMap.set(participant, {
-          phoneNumber: participant,
-          latestMessage: msg,
-          messageCount: 1,
-          unreadCount:
-            msg.direction === MessageDirection.INBOUND &&
-            msg.status === MessageStatus.RECEIVED
-              ? 1
-              : 0,
-        });
-      } else {
-        const existing = conversationMap.get(participant)!;
-        existing.messageCount += 1;
-        if (
-          msg.direction === MessageDirection.INBOUND &&
-          msg.status === MessageStatus.RECEIVED
-        ) {
-          existing.unreadCount += 1;
-        }
-      }
-    }
-
-    return Array.from(conversationMap.values());
+    return rows.map((r) => ({
+      phoneNumber: r.phoneNumber,
+      latestMessage: r.latestMessage,
+      messageCount: Number(r.messageCount),
+      unreadCount: Number(r.unreadCount),
+    }));
   }
 }

@@ -3,7 +3,11 @@ import { PrismaClient } from "@prisma/client";
 const prisma = new PrismaClient();
 
 async function clean() {
-  console.log("Cleaning all dummy data from SQLite database...");
+  if (process.env.NODE_ENV === "production" || process.env.ALLOW_DATABASE_CLEAN !== "true") {
+    console.error("❌ FATAL: clean-database is locked. Running clean-database against production or without ALLOW_DATABASE_CLEAN=true is strictly forbidden.");
+    process.exit(1);
+  }
+  console.log("Cleaning dummy data from development database...");
   const delDeliveries = await prisma.webhookDelivery.deleteMany({});
   const delEndpoints = await prisma.webhookEndpoint.deleteMany({});
   const delEvents = await prisma.messageEvent.deleteMany({});

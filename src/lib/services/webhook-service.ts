@@ -3,7 +3,7 @@ import { verifyHmacSha256, normalizePhoneNumber } from "../crypto";
 import { prisma } from "../prisma";
 import { logger } from "../logger";
 import { WebhookPayload, WebhookStatus, WebhookIncomingMessage } from "../whatsapp/types";
-import { MessageDirection, MessageStatus, MessageType, ProcessingStatus } from "@prisma/client";
+import { MessageDirection, MessageStatus, MessageType, ProcessingStatus, OtpStatus } from "@prisma/client";
 import { dispatchOutgoingWebhooks } from "../webhooks/dispatcher";
 
 export class WebhookService {
@@ -178,7 +178,8 @@ export class WebhookService {
         return;
       }
 
-      // Status ordering hierarchy: SENT < DELIVERED < READ. FAILED is terminal.
+      // Status ordering hierarchy: QUEUED (0) < SENT (1) < DELIVERED (2) < READ (3)
+      // Terminal states: READ (positive terminal), FAILED (failure terminal)
       const statusHierarchy: Record<MessageStatus, number> = {
         QUEUED: 0,
         SENT: 1,
@@ -201,19 +202,36 @@ export class WebhookService {
         const currentRank = statusHierarchy[message.status] ?? 0;
         const newRank = statusHierarchy[newStatus] ?? 0;
 
-        // Prevent status downgrade (e.g. READ -> SENT due to out of order webhook)
         const updateData: Record<string, unknown> = {};
+        const timestamp = new Date(parseInt(statusObj.timestamp, 10) * 1000 || Date.now());
 
-        if (newRank > currentRank || message.status !== MessageStatus.READ) {
+        // Strictly protect terminal states and prevent downgrades:
+        // 1. Once READ, a message cannot be downgraded or marked FAILED.
+        // 2. Once FAILED, a message cannot be downgraded to SENT or DELIVERED by an out-of-order event.
+        // 3. Status progression requires newRank > currentRank.
+        let statusShouldUpdate = false;
+
+        if (message.status === MessageStatus.READ) {
+          statusShouldUpdate = false;
+        } else if (message.status === MessageStatus.FAILED) {
+          statusShouldUpdate = false;
+        } else if (newStatus === MessageStatus.FAILED) {
+          statusShouldUpdate = true;
+        } else if (newRank > currentRank) {
+          statusShouldUpdate = true;
+        }
+
+        if (statusShouldUpdate) {
           updateData.status = newStatus;
         }
 
-        const timestamp = new Date(parseInt(statusObj.timestamp, 10) * 1000 || Date.now());
-
-        if (statusType === "delivered" && !message.deliveredAt) {
+        // Maintain consistent timestamps
+        if (statusType === "sent" && !message.sentAt) {
+          updateData.sentAt = timestamp;
+        } else if (statusType === "delivered" && !message.deliveredAt) {
           updateData.deliveredAt = timestamp;
         } else if (statusType === "read") {
-          updateData.readAt = timestamp;
+          if (!message.readAt) updateData.readAt = timestamp;
           if (!message.deliveredAt) updateData.deliveredAt = timestamp;
         } else if (statusType === "failed") {
           updateData.failedAt = timestamp;
@@ -222,6 +240,19 @@ export class WebhookService {
             updateData.errorCode = String(firstErr.code);
             updateData.errorMessage = firstErr.message || firstErr.title;
           }
+
+          // If this was an OTP message, mark pending OTP verification as FAILED
+          await prisma.otpVerification
+            .updateMany({
+              where: {
+                destination: message.to,
+                status: OtpStatus.PENDING,
+              },
+              data: {
+                status: OtpStatus.FAILED,
+              },
+            })
+            .catch(() => {});
         }
 
         if (Object.keys(updateData).length > 0) {
@@ -231,19 +262,24 @@ export class WebhookService {
           });
         }
 
-        // Trigger outgoing webhooks (scoped to tenant client)
-        dispatchOutgoingWebhooks(
+        // Trigger outgoing webhooks (scoped to tenant client, linked to messageEventId)
+        await dispatchOutgoingWebhooks(
           `message.${statusType}`,
           {
             messageId: message.id,
             providerMessageId,
             to: message.to,
-            status: newStatus,
+            status: statusShouldUpdate ? newStatus : message.status,
             timestamp: timestamp.toISOString(),
             error: statusObj.errors?.[0],
           },
-          message.clientId
-        ).catch(() => {});
+          {
+            clientId: message.clientId,
+            messageEventId: eventRecord.id,
+          }
+        ).catch((dispatchErr) => {
+          logger.error("Failed to dispatch outgoing webhook for message status:", dispatchErr);
+        });
       }
 
       await prisma.messageEvent.update({
@@ -368,8 +404,8 @@ export class WebhookService {
         data: { processingStatus: ProcessingStatus.PROCESSED, processedAt: new Date() },
       });
 
-      // Dispatch outgoing webhook event for incoming message (scoped to client)
-      dispatchOutgoingWebhooks(
+      // Dispatch outgoing webhook event for incoming message (scoped to client, linked to messageEventId)
+      await dispatchOutgoingWebhooks(
         "message.received",
         {
           messageId: createdMessage.id,
@@ -379,8 +415,13 @@ export class WebhookService {
           type: createdMessage.type,
           createdAt: createdMessage.createdAt.toISOString(),
         },
-        clientId
-      ).catch(() => {});
+        {
+          clientId,
+          messageEventId: eventRecord.id,
+        }
+      ).catch((dispatchErr) => {
+        logger.error("Failed to dispatch outgoing webhook for incoming message:", dispatchErr);
+      });
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : "Error processing incoming message";
       logger.error("Failed to process incoming message:", err);
