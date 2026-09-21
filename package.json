@@ -19,7 +19,8 @@
     "test:e2e": "tsx scripts/e2e-live-test.ts",
     "test:live": "tsx scripts/test-live-features.ts",
     "db:migrate-data": "tsx scripts/migrate-sqlite-to-postgres.ts",
-    "db:verify": "tsx scripts/verify-postgres-migration.ts"
+    "db:verify": "tsx scripts/verify-postgres-migration.ts",
+    "auth:seed-admin": "tsx scripts/seed-admin.ts"
   },
   "engines": {
     "node": ">=20.0.0"
