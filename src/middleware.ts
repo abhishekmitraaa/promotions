@@ -1,110 +1,54 @@
 import { NextRequest, NextResponse } from "next/server";
+import crypto from "crypto";
+
+const SESSION_COOKIE = "whatsapp_hub_session";
+
+function verifyToken(token: string) {
+  const secret = process.env.AUTH_SESSION_SECRET;
+  if (!secret || secret.length < 32) return null;
+  const [encoded, signature] = token.split(".");
+  if (!encoded || !signature) return null;
+  try {
+    const payload = Buffer.from(encoded, "base64url").toString("utf8");
+    const expected = crypto.createHmac("sha256", secret).update(payload).digest("base64url");
+    if (signature !== expected) return null;
+    const [id, email, role, expiresText] = payload.split(".");
+    const expiresAt = Number(expiresText);
+    if (!id || !email || !["ADMIN","VIEWER"].includes(role) || !Number.isFinite(expiresAt) || expiresAt <= Date.now()) return null;
+    return { id, email, role };
+  } catch { return null; }
+}
 
 export function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl;
-
-  // Protect /dashboard and /api/admin routes
   const isDashboardRoute = pathname.startsWith("/dashboard");
   const isAdminApiRoute = pathname.startsWith("/api/admin");
+  const isAuthRoute = pathname.startsWith("/api/auth") || pathname === "/login";
+
+  if (isAuthRoute) return NextResponse.next();
 
   if (isDashboardRoute || isAdminApiRoute) {
-    const isProduction = process.env.NODE_ENV === "production";
-    const rawUsername = process.env.ADMIN_USERNAME;
-    const rawPassword = process.env.ADMIN_PASSWORD;
+    const token = req.cookies.get(SESSION_COOKIE)?.value;
+    const session = token ? verifyToken(token) : null;
 
-    // In production, strictly reject if admin credentials are missing or default "admin"
-    if (isProduction) {
-      const isMissingOrUnsafe =
-        !rawUsername ||
-        !rawPassword ||
-        rawUsername.trim().length === 0 ||
-        rawUsername.toLowerCase() === "admin" ||
-        rawPassword.toLowerCase() === "admin" ||
-        rawPassword.length < 12;
-
-      if (isMissingOrUnsafe) {
-        return NextResponse.json(
-          {
-            success: false,
-            error: {
-              code: "MISCONFIGURED_ADMIN_AUTH",
-              message:
-                "Production server admin credentials are misconfigured. Explicit non-default ADMIN_USERNAME and strong ADMIN_PASSWORD (min 12 chars) are required.",
-            },
-          },
-          { status: 500 }
-        );
-      }
+    if (!session) {
+      if (isAdminApiRoute) return NextResponse.json({ success:false, error:{code:"UNAUTHORIZED",message:"Authentication required"} }, { status:401 });
+      return NextResponse.redirect(new URL("/login", req.url));
     }
 
-    const expectedUsername = rawUsername || "admin";
-    const expectedPassword = rawPassword || "admin";
-
-    const authHeader = req.headers.get("authorization");
-    const workerSecretHeader = req.headers.get("x-worker-secret");
-    let isAuthenticated = false;
-
-    // Allow internal worker secret for queue processing endpoint
-    if (
-      isAdminApiRoute &&
-      pathname.endsWith("/process-queue") &&
-      workerSecretHeader &&
-      (workerSecretHeader === process.env.INTERNAL_WORKER_SECRET ||
-        workerSecretHeader === expectedPassword)
-    ) {
-      isAuthenticated = true;
+    if (isAdminApiRoute && req.method !== "GET" && session.role !== "ADMIN") {
+      return NextResponse.json({ success:false, error:{code:"FORBIDDEN",message:"Admin role required"} }, { status:403 });
     }
 
-    if (!isAuthenticated && authHeader && authHeader.startsWith("Basic ")) {
-      try {
-        const base64Credentials = authHeader.slice(6).trim();
-        const credentials = atob(base64Credentials);
-        const separatorIndex = credentials.indexOf(":");
-
-        if (separatorIndex !== -1) {
-          const username = credentials.substring(0, separatorIndex);
-          const password = credentials.substring(separatorIndex + 1);
-
-          if (username === expectedUsername && password === expectedPassword) {
-            isAuthenticated = true;
-          }
-        }
-      } catch {
-        isAuthenticated = false;
-      }
-    }
-
-    if (!isAuthenticated) {
-      if (isAdminApiRoute) {
-        return NextResponse.json(
-          {
-            success: false,
-            error: {
-              code: "UNAUTHORIZED",
-              message: "Admin authentication required. Provide valid HTTP Basic Auth credentials.",
-            },
-          },
-          {
-            status: 401,
-            headers: {
-              "WWW-Authenticate": 'Basic realm="WhatsApp Hub Admin API"',
-            },
-          }
-        );
-      }
-
-      return new NextResponse("Authentication required", {
-        status: 401,
-        headers: {
-          "WWW-Authenticate": 'Basic realm="WhatsApp Hub Admin Dashboard"',
-        },
-      });
-    }
+    const response = NextResponse.next();
+    response.headers.set("x-auth-user-id", session.id);
+    response.headers.set("x-auth-role", session.role);
+    return response;
   }
 
   return NextResponse.next();
 }
 
 export const config = {
-  matcher: ["/dashboard/:path*", "/api/admin/:path*"],
+  matcher: ["/dashboard/:path*", "/api/admin/:path*", "/api/auth/:path*", "/login"],
 };
