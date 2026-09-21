@@ -32,8 +32,6 @@ export const envSchema = z
       .string()
       .default("default_dev_session_secret_32_chars_minimum_len!!"),
     INTERNAL_WORKER_SECRET: z.string().optional(),
-    ADMIN_USERNAME: z.string().optional().default("admin"),
-    ADMIN_PASSWORD: z.string().optional().default("admin"),
 
     // OTP Configuration
     OTP_CODE_LENGTH: z.coerce.number().int().min(4).max(10).default(6),
@@ -94,7 +92,9 @@ export const envSchema = z
         data.AUTH_SESSION_SECRET.length < 32 ||
         data.AUTH_SESSION_SECRET.includes("default_dev_session_secret") ||
         data.AUTH_SESSION_SECRET.includes("replace_with_") ||
-        data.AUTH_SESSION_SECRET.includes("change_in_production")
+        data.AUTH_SESSION_SECRET.includes("change_this") ||
+        data.AUTH_SESSION_SECRET.includes("change_in_production") ||
+        data.AUTH_SESSION_SECRET.includes("placeholder")
       ) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,

@@ -46,6 +46,7 @@ async function main() {
   let apiKeyId = "";
   let webhookId = "";
   let secondaryAdminId = "";
+  let adminId = "";
 
   const request = (url: string, method = "GET", body?: unknown, cookie = "", ip = "") =>
     new NextRequest(`http://localhost:3000${url}`, {
@@ -93,6 +94,7 @@ async function main() {
     const admin = await prisma.user.create({
       data: { email: adminEmail, passwordHash, role: "ADMIN", active: true },
     });
+    adminId = admin.id;
     const storedAdmin = await prisma.user.findUnique({ where: { id: admin.id } });
     assert.ok(storedAdmin);
     assert.equal(storedAdmin?.passwordHash, passwordHash);
@@ -382,24 +384,60 @@ async function main() {
     `);
     assert.equal((broadGrants as unknown[]).length, 0);
 
-    console.log("22. Cleanup test artifacts");
-    if (webhookId) await prisma.webhookEndpoint.deleteMany({ where: { id: webhookId } });
-    if (apiClientId) await prisma.webhookDelivery.deleteMany({ where: { clientId: apiClientId } });
-    if (apiClientId) await prisma.webhookEndpoint.deleteMany({ where: { clientId: apiClientId } });
-    if (apiClientId) await prisma.messageEvent.deleteMany({ where: { clientId: apiClientId } });
-    if (apiClientId) await prisma.message.deleteMany({ where: { clientId: apiClientId } });
-    if (apiClientId) await prisma.apiKey.deleteMany({ where: { clientId: apiClientId } });
-    if (apiClientId) await prisma.apiClient.deleteMany({ where: { id: apiClientId } });
-    if (secondaryAdminId) await prisma.userSession.deleteMany({ where: { userId: secondaryAdminId } });
-    if (secondaryAdminId) await prisma.user.deleteMany({ where: { id: secondaryAdminId } });
-    await prisma.userSession.deleteMany({ where: { userId: admin.id } });
-    await prisma.user.deleteMany({ where: { id: admin.id } });
-
     console.log("\n✅ RBAC TEST SUITE PASSED: authentication, sessions, roles, user lifecycle, admin/read-only separation, existing admin APIs, invalidation, RLS, and rate limiting.");
   } finally {
-    await prisma.$disconnect();
+    try {
+      console.log("Cleaning up RBAC test artifacts...");
+      if (webhookId) await prisma.webhookEndpoint.deleteMany({ where: { id: webhookId } });
+      if (apiClientId) {
+        await prisma.webhookDelivery.deleteMany({ where: { clientId: apiClientId } });
+        await prisma.webhookEndpoint.deleteMany({ where: { clientId: apiClientId } });
+        await prisma.messageEvent.deleteMany({ where: { clientId: apiClientId } });
+        await prisma.message.deleteMany({ where: { clientId: apiClientId } });
+        await prisma.apiKey.deleteMany({ where: { clientId: apiClientId } });
+        await prisma.apiClient.deleteMany({ where: { id: apiClientId } });
+      }
+      if (adminId) await prisma.userSession.deleteMany({ where: { userId: adminId } });
+      if (secondaryAdminId) await prisma.userSession.deleteMany({ where: { userId: secondaryAdminId } });
+      // Delete any test sessions for rbac test users
+      await prisma.userSession.deleteMany({
+        where: {
+          user: {
+            email: {
+              startsWith: "rbac-",
+              endsWith: "@example.test",
+            },
+          },
+        },
+      });
+      // Delete all test users created by rbac verification
+      await prisma.user.deleteMany({
+        where: {
+          email: {
+            startsWith: "rbac-",
+            endsWith: "@example.test",
+          },
+        },
+      });
+      // Verify no leftover test users remain in database
+      const leftoverCount = await prisma.user.count({
+        where: {
+          email: {
+            startsWith: "rbac-",
+            endsWith: "@example.test",
+          },
+        },
+      });
+      if (leftoverCount > 0) {
+        throw new Error(`Leftover test users detected in database: ${leftoverCount} rows remain!`);
+      }
+      console.log("RBAC test cleanup verified: 0 test users remain.");
+    } finally {
+      await prisma.$disconnect();
+    }
   }
 }
+
 
 main().catch((error) => {
   console.error("\n❌ RBAC TEST SUITE FAILED");

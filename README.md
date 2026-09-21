@@ -230,7 +230,7 @@ Response:
 
 ## 🧪 Automated Testing & Verification
 
-Run the test suite verifying crypto operations, template parameters mapping, rate limiters, Basic Auth security, and Zod validators:
+Run the test suite verifying crypto operations, template parameters mapping, rate limiters, authentication & session security, and Zod validators:
 
 ```bash
 npm test

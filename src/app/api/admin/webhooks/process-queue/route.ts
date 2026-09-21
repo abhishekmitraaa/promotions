@@ -3,10 +3,17 @@ import { processWebhookDeliveryQueue } from "@/lib/webhooks/dispatcher";
 import { logger } from "@/lib/logger";
 import { requireUser } from "@/lib/auth";
 
+import crypto from "crypto";
+
 export async function POST(req: NextRequest) {
   const workerSecret = req.headers.get("x-worker-secret");
-  const isWorkerAuthorized =
-    Boolean(workerSecret && process.env.INTERNAL_WORKER_SECRET && workerSecret === process.env.INTERNAL_WORKER_SECRET);
+  const configuredWorkerSecret = process.env.INTERNAL_WORKER_SECRET;
+  const isWorkerAuthorized = Boolean(
+    workerSecret &&
+    configuredWorkerSecret &&
+    workerSecret.length === configuredWorkerSecret.length &&
+    crypto.timingSafeEqual(Buffer.from(workerSecret), Buffer.from(configuredWorkerSecret))
+  );
 
   if (!isWorkerAuthorized) {
     const auth = await requireUser(req, "ADMIN");
