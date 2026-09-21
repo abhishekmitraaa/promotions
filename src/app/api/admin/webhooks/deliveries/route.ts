@@ -1,9 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
+import { requireUser } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { deliverWebhookPayload } from "@/lib/webhooks/dispatcher";
 import { decryptWebhookSecret } from "@/lib/crypto";
 
 export async function GET(req: NextRequest) {
+  const auth = await requireUser(req);
+  if (auth.response) return auth.response;
   try {
     const { searchParams } = new URL(req.url);
     const clientId = searchParams.get("clientId") || undefined;
@@ -27,6 +30,8 @@ export async function GET(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
+  const auth = await requireUser(req, "ADMIN");
+  if (auth.response) return auth.response;
   try {
     const body = await req.json();
     const deliveryId = body.deliveryId;
