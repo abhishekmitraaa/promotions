@@ -45,3 +45,12 @@ VALUES (
   CURRENT_TIMESTAMP
 )
 ON CONFLICT ("email") DO NOTHING;
+
+ALTER TABLE "User" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "UserSession" ENABLE ROW LEVEL SECURITY;
+
+REVOKE ALL ON TABLE "User" FROM anon, authenticated;
+REVOKE ALL ON TABLE "UserSession" FROM anon, authenticated;
+
+CREATE POLICY "whatsapp_hub_user_all" ON "User" FOR ALL TO whatsapp_hub USING (true) WITH CHECK (true);
+CREATE POLICY "whatsapp_hub_usersession_all" ON "UserSession" FOR ALL TO whatsapp_hub USING (true) WITH CHECK (true);
