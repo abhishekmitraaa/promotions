@@ -1,8 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
+import { requireUser } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { generateApiKey } from "@/lib/crypto";
 
-export async function GET() {
+export async function GET(req: NextRequest) {
+  const auth = await requireUser(req);
+  if (auth.response) return auth.response;
   try {
     const clients = await prisma.apiClient.findMany({
       include: {
@@ -30,6 +33,8 @@ export async function GET() {
 }
 
 export async function POST(req: NextRequest) {
+  const auth = await requireUser(req, "ADMIN");
+  if (auth.response) return auth.response;
   try {
     const body = await req.json();
     const clientName = body.clientName?.trim();
