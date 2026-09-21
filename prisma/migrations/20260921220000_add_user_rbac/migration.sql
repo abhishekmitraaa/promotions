@@ -32,20 +32,7 @@ CREATE INDEX "UserSession_expiresAt_idx" ON "UserSession"("expiresAt");
 
 ALTER TABLE "UserSession" ADD CONSTRAINT "UserSession_userId_fkey"
   FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;
-
--- Demo administrator requested for initial access.
--- Password is stored as an scrypt hash, never plaintext.
-INSERT INTO "User" ("id","email","passwordHash","role","active","updatedAt")
-VALUES (
-  '9f9d8a7e-8b0d-4b63-a2f8-4e3c6f7a1001',
-  'cosora.demo@gmail.com',
-  'scrypt$16384$8$1$pzQ-q1sUI80yPxEVx91itg$FpDkMTfBs-ygedgCfk3YRRuZoCS4V7RTnR9iDzk8_DMjZBUT1Ctl-ATEKBsSxo1IKKQD26DDyV92FB8BSXQzoQ',
-  'ADMIN',
-  true,
-  CURRENT_TIMESTAMP
-)
-ON CONFLICT ("email") DO NOTHING;
-
+\n
 ALTER TABLE "User" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "UserSession" ENABLE ROW LEVEL SECURITY;
 
