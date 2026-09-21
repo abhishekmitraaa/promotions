@@ -20,7 +20,8 @@
     "test:live": "tsx scripts/test-live-features.ts",
     "db:migrate-data": "tsx scripts/migrate-sqlite-to-postgres.ts",
     "db:verify": "tsx scripts/verify-postgres-migration.ts",
-    "auth:seed-admin": "tsx scripts/seed-admin.ts"
+    "auth:seed-admin": "tsx scripts/seed-admin.ts",
+    "test:rbac": "tsx scripts/verify-rbac.ts"
   },
   "engines": {
     "node": ">=22.12.0"
