@@ -52,6 +52,39 @@ enum OtpStatus {
   FAILED
 }
 
+
+enum UserRole {
+  ADMIN
+  VIEWER
+}
+
+model User {
+  id           String        @id @default(uuid())
+  email        String        @unique
+  passwordHash  String
+  role         UserRole      @default(VIEWER)
+  active       Boolean       @default(true)
+  lastLoginAt  DateTime?
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  sessions     UserSession[]
+
+  @@index([role])
+  @@index([active])
+}
+
+model UserSession {
+  id         String   @id @default(uuid())
+  userId     String
+  tokenHash  String   @unique
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
 model Message {
   id                 String           @id @default(uuid())
   clientId           String
