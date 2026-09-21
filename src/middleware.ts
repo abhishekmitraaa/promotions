@@ -18,10 +18,9 @@ async function verifyToken(token: string) {
     const sigBytes = Uint8Array.from(decodeBase64Url(signature), c => c.charCodeAt(0));
     const valid = await crypto.subtle.verify("HMAC", key, sigBytes, new TextEncoder().encode(payload));
     if (!valid) return null;
-    const [id, email, role, expiresText] = payload.split(".");
-    const expiresAt = Number(expiresText);
-    if (!id || !email || !["ADMIN","VIEWER"].includes(role) || !Number.isFinite(expiresAt) || expiresAt <= Date.now()) return null;
-    return { id, email, role };
+    const parsed = JSON.parse(payload) as { id?: string; email?: string; role?: string; expiresAt?: number };
+    if (!parsed.id || !parsed.email || !["ADMIN", "VIEWER"].includes(parsed.role || "") || !Number.isFinite(parsed.expiresAt) || parsed.expiresAt <= Date.now()) return null;
+    return { id: parsed.id, email: parsed.email, role: parsed.role };
   } catch { return null; }
 }
 
