@@ -1,0 +1,59 @@
+name: RBAC Test Suite
+
+on:
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  rbac:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: whatsapp_hub
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d whatsapp_hub"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      NODE_ENV: test
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/whatsapp_hub
+      DIRECT_URL: postgresql://postgres:postgres@localhost:5432/whatsapp_hub
+      AUTH_SESSION_SECRET: rbac-ci-session-secret-32-characters-minimum
+      API_KEY_PEPPER: rbac-ci-api-key-pepper-32-characters-min
+      WEBHOOK_SECRET_ENCRYPTION_KEY: rbac-ci-webhook-key-32-characters-min
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.12.0
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Apply migrations
+        run: npx prisma migrate deploy
+
+      - name: Run RBAC integration suite
+        run: npm run test:rbac
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Production build
+        run: npm run build
+
+      - name: Dependency audit
+        run: npm audit --audit-level=high
