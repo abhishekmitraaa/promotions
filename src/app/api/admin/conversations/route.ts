@@ -1,7 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
+import { requireUser } from "@/lib/auth";
 import { MessageService } from "@/lib/services/message-service";
 
 export async function GET(req: NextRequest) {
+  const auth = await requireUser(req);
+  if (auth.response) return auth.response;
   const { searchParams } = new URL(req.url);
   const clientId = searchParams.get("clientId") || undefined;
   const page = parseInt(searchParams.get("page") || "1", 10);
