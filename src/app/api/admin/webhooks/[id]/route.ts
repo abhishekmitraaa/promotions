@@ -7,8 +7,8 @@ export async function GET(
   req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const auth = await requireUser(req, "VIEWER");
-  if (auth.response && auth.response.status !== 403) return auth.response;
+  const auth = await requireUser(req);
+  if (auth.response) return auth.response;
   const { id } = await params;
 
   try {
