@@ -1,17 +1,23 @@
 import { NextRequest, NextResponse } from "next/server";
-import crypto from "crypto";
 
 const SESSION_COOKIE = "whatsapp_hub_session";
 
-function verifyToken(token: string) {
+function decodeBase64Url(value: string) {
+  const normalized = value.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(value.length / 4) * 4, "=");
+  return atob(normalized);
+}
+
+async function verifyToken(token: string) {
   const secret = process.env.AUTH_SESSION_SECRET;
   if (!secret || secret.length < 32) return null;
   const [encoded, signature] = token.split(".");
   if (!encoded || !signature) return null;
   try {
-    const payload = Buffer.from(encoded, "base64url").toString("utf8");
-    const expected = crypto.createHmac("sha256", secret).update(payload).digest("base64url");
-    if (signature !== expected) return null;
+    const payload = decodeBase64Url(encoded);
+    const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
+    const sigBytes = Uint8Array.from(decodeBase64Url(signature), c => c.charCodeAt(0));
+    const valid = await crypto.subtle.verify("HMAC", key, sigBytes, new TextEncoder().encode(payload));
+    if (!valid) return null;
     const [id, email, role, expiresText] = payload.split(".");
     const expiresAt = Number(expiresText);
     if (!id || !email || !["ADMIN","VIEWER"].includes(role) || !Number.isFinite(expiresAt) || expiresAt <= Date.now()) return null;
@@ -19,7 +25,7 @@ function verifyToken(token: string) {
   } catch { return null; }
 }
 
-export function middleware(req: NextRequest) {
+export async function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl;
   const isDashboardRoute = pathname.startsWith("/dashboard");
   const isAdminApiRoute = pathname.startsWith("/api/admin");
@@ -29,7 +35,7 @@ export function middleware(req: NextRequest) {
 
   if (isDashboardRoute || isAdminApiRoute) {
     const token = req.cookies.get(SESSION_COOKIE)?.value;
-    const session = token ? verifyToken(token) : null;
+    const session = token ? await verifyToken(token) : null;
 
     if (!session) {
       if (isAdminApiRoute) return NextResponse.json({ success:false, error:{code:"UNAUTHORIZED",message:"Authentication required"} }, { status:401 });
@@ -40,10 +46,7 @@ export function middleware(req: NextRequest) {
       return NextResponse.json({ success:false, error:{code:"FORBIDDEN",message:"Admin role required"} }, { status:403 });
     }
 
-    const response = NextResponse.next();
-    response.headers.set("x-auth-user-id", session.id);
-    response.headers.set("x-auth-role", session.role);
-    return response;
+    return NextResponse.next();
   }
 
   return NextResponse.next();
