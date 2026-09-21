@@ -278,6 +278,7 @@ async function main() {
     assertStatus(await me(request("/api/auth/me", "GET", undefined, adminCookie)), 401, "Session after logout");
 
     console.log("20. Login rate limiting");
+    await prisma.rateLimit.deleteMany({ where: { key: "login:unknown" } });
     const rateIp = `rbac-rate-${suffix}`;
     for (let i = 0; i < 10; i++) {
       const bad = await loginAs(adminEmail, "definitely-wrong", rateIp);
