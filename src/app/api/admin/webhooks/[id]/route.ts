@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { requireUser } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { validateAdminWebhookUrl, validateSubscribedEvents } from "@/lib/webhooks/validation";
 
@@ -6,6 +7,8 @@ export async function GET(
   req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
+  const auth = await requireUser(req, "VIEWER");
+  if (auth.response && auth.response.status !== 403) return auth.response;
   const { id } = await params;
 
   try {
@@ -45,6 +48,8 @@ export async function PATCH(
   req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
+  const auth = await requireUser(req, "ADMIN");
+  if (auth.response) return auth.response;
   const { id } = await params;
 
   try {
