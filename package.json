@@ -23,7 +23,7 @@
     "auth:seed-admin": "tsx scripts/seed-admin.ts"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.12.0"
   },
   "overrides": {
     "deepmerge-ts": "^8.0.2",
