@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import { normalizePhoneNumber, generateApiKey, hashApiKey, generateSecureOtp, hashOtp, verifyHmacSha256, signHmacSha256, encryptWebhookSecret, decryptWebhookSecret } from "../src/lib/crypto";
 import { checkRateLimit } from "../src/lib/rate-limit";
 import { createMessageSchema } from "../src/lib/validation/messages";
@@ -80,11 +81,15 @@ async function runVerification() {
   assert(validOtpVer.success, "Zod accepts valid OTP verify payload");
   assert(!invalidOtpVer.success, "Zod rejects non-numeric code in OTP verify");
 
-  // Test 8: Admin Basic Auth Header Format
-  const validHeader = "Basic " + Buffer.from("admin:secret123").toString("base64");
-  const decoded = Buffer.from(validHeader.slice(6), "base64").toString("utf-8");
-  const [user, pass] = decoded.split(":");
-  assert(user === "admin" && pass === "secret123", "Basic auth header decodes credentials accurately");
+  // Test 8: Session Token Generation and Integrity
+  const testPayload = { id: "user_test_123", email: "admin@example.com", role: "ADMIN", expiresAt: Date.now() + 86400000 };
+  const encodedPayload = Buffer.from(JSON.stringify(testPayload)).toString("base64url");
+  const testSecret = "test_secret_key_minimum_32_characters_long_12345";
+  const sessionSignature = crypto.createHmac("sha256", testSecret).update(encodedPayload).digest("base64url");
+  const sessionToken = `${encodedPayload}.${sessionSignature}`;
+  const [enc, sig] = sessionToken.split(".");
+  const expectedSig = crypto.createHmac("sha256", testSecret).update(enc).digest("base64url");
+  assert(crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expectedSig)), "Session token HMAC signature validates accurately");
 
   // Test 9: Template Parameter Mapping & Validation
   const validSimpleParams = createMessageSchema.safeParse({
@@ -128,25 +133,22 @@ async function runVerification() {
   // Test 10: Production Environment Safety Rules
   const unsafeProdEnv1 = envSchema.safeParse({
     NODE_ENV: "production",
-    ADMIN_USERNAME: "admin",
-    ADMIN_PASSWORD: "admin",
+    AUTH_SESSION_SECRET: "default_dev_session_secret_32_chars_minimum_len!!",
     API_KEY_PEPPER: "default_local_dev_pepper_change_in_production_12345",
   });
-  assert(!unsafeProdEnv1.success, "Production envSchema rejects default 'admin' credentials and default pepper");
+  assert(!unsafeProdEnv1.success, "Production envSchema rejects default session secret and default pepper");
 
   const unsafeProdEnv2 = envSchema.safeParse({
     NODE_ENV: "production",
-    ADMIN_USERNAME: "hub_admin",
-    ADMIN_PASSWORD: "short",
+    AUTH_SESSION_SECRET: "too_short_secret",
     API_KEY_PEPPER: "too_short_pepper",
   });
-  assert(!unsafeProdEnv2.success, "Production envSchema rejects short admin password (<12 chars) and short pepper (<32 chars)");
+  assert(!unsafeProdEnv2.success, "Production envSchema rejects short session secret (<32 chars) and short pepper (<32 chars)");
 
   const safeProdEnv = envSchema.safeParse({
     NODE_ENV: "production",
     DATABASE_URL: "postgresql://postgres.sample_ref:super_secret_pw@aws-0-ap-south-1.pooler.supabase.com:6543/postgres?pgbouncer=true",
-    ADMIN_USERNAME: "ops_admin",
-    ADMIN_PASSWORD: "super_secure_admin_password_1234",
+    AUTH_SESSION_SECRET: "super_secure_session_secret_32_characters_minimum",
     API_KEY_PEPPER: "0123456789abcdef0123456789abcdef",
     WEBHOOK_SECRET_ENCRYPTION_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     DEV_ALLOW_UNCONFIGURED_META: "true",
@@ -159,8 +161,7 @@ async function runVerification() {
   const unsafeProdEncryptionKey = envSchema.safeParse({
     NODE_ENV: "production",
     DATABASE_URL: "postgresql://postgres.sample_ref:super_secret_pw@aws-0-ap-south-1.pooler.supabase.com:6543/postgres?pgbouncer=true",
-    ADMIN_USERNAME: "ops_admin",
-    ADMIN_PASSWORD: "super_secure_admin_password_1234",
+    AUTH_SESSION_SECRET: "super_secure_session_secret_32_characters_minimum",
     API_KEY_PEPPER: "0123456789abcdef0123456789abcdef",
     WEBHOOK_SECRET_ENCRYPTION_KEY: "default_dev_secret_encryption_key_32bytes_min_len!!",
   });

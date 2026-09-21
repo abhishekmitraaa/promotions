@@ -241,7 +241,7 @@ Validates a user-submitted OTP against the stored digest. Increments attempt cou
 > ⚠️ **SAFETY WARNING**: This endpoint is strictly for local development and test resetting. It is **permanently disabled in production environments** (returns HTTP 403 Forbidden).
 
 ### Headers
-- `Authorization: Basic <base64(ADMIN_USERNAME:ADMIN_PASSWORD)>`
+- `Cookie: whatsapp_hub_session=<token>` (Admin session cookie required)
 - `Content-Type: application/json`
 
 ### Required Request Payload

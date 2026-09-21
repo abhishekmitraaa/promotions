@@ -4,6 +4,12 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'whatsapp_hub') THEN
     CREATE ROLE whatsapp_hub NOLOGIN;
   END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+    CREATE ROLE anon NOLOGIN;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+    CREATE ROLE authenticated NOLOGIN;
+  END IF;
 END $$;
 
 -- RBAC authentication tables
@@ -40,7 +46,7 @@ CREATE INDEX "UserSession_expiresAt_idx" ON "UserSession"("expiresAt");
 
 ALTER TABLE "UserSession" ADD CONSTRAINT "UserSession_userId_fkey"
   FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;
-\n
+
 ALTER TABLE "User" ENABLE ROW LEVEL SECURITY;
 GRANT ALL ON TABLE "User", "UserSession" TO whatsapp_hub;
 ALTER TABLE "UserSession" ENABLE ROW LEVEL SECURITY;

@@ -19,7 +19,7 @@ async function verifyToken(token: string) {
     const valid = await crypto.subtle.verify("HMAC", key, sigBytes, new TextEncoder().encode(payload));
     if (!valid) return null;
     const parsed = JSON.parse(payload) as { id?: string; email?: string; role?: string; expiresAt?: number };
-    if (!parsed.id || !parsed.email || !["ADMIN", "VIEWER"].includes(parsed.role || "") || !Number.isFinite(parsed.expiresAt) || parsed.expiresAt <= Date.now()) return null;
+    if (!parsed.id || !parsed.email || !["ADMIN", "VIEWER"].includes(parsed.role || "") || typeof parsed.expiresAt !== "number" || !Number.isFinite(parsed.expiresAt) || parsed.expiresAt <= Date.now()) return null;
     return { id: parsed.id, email: parsed.email, role: parsed.role };
   } catch { return null; }
 }
@@ -33,6 +33,17 @@ export async function middleware(req: NextRequest) {
   if (isAuthRoute) return NextResponse.next();
 
   if (isDashboardRoute || isAdminApiRoute) {
+    const workerSecretHeader = req.headers.get("x-worker-secret");
+    if (
+      isAdminApiRoute &&
+      pathname === "/api/admin/webhooks/process-queue" &&
+      workerSecretHeader &&
+      process.env.INTERNAL_WORKER_SECRET &&
+      workerSecretHeader === process.env.INTERNAL_WORKER_SECRET
+    ) {
+      return NextResponse.next();
+    }
+
     const token = req.cookies.get(SESSION_COOKIE)?.value;
     const session = token ? await verifyToken(token) : null;
 

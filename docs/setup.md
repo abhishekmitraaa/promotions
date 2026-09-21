@@ -43,8 +43,8 @@ All configurations are defined in `.env.local` for local development, or configu
 | `DATABASE_URL` | String | Required | Supabase PostgreSQL pooled connection URL (port 6543, `?pgbouncer=true`). |
 | `DIRECT_URL` | String | Optional | Supabase PostgreSQL direct connection URL (port 5432) for migrations. |
 | `APP_URL` | String | `http://localhost:3000` | Base public URL of your service. |
-| `ADMIN_USERNAME` | String | `hub_admin` | HTTP Basic Auth username for `/dashboard/*` and `/api/admin/*`. In production, explicit non-default value is required. |
-| `ADMIN_PASSWORD` | String | Auto-generated | HTTP Basic Auth password for `/dashboard/*` and `/api/admin/*`. In production, must be at least 12 characters; "admin" is forbidden. |
+| `AUTH_SESSION_SECRET` | String | Min 32 chars | Cryptographic secret for signing HttpOnly session cookies. Required in production. |
+| `INTERNAL_WORKER_SECRET` | String | Optional | Secret key for authorizing external scheduled workers (`x-worker-secret` header). |
 | `API_KEY_PEPPER` | String | Auto-generated | Secret pepper used for HMAC-SHA256 hashing of API keys. Min 32 chars in production. |
 | `WEBHOOK_SECRET_ENCRYPTION_KEY` | String | Min 32 chars | Secret key for AES-256-GCM encryption of webhook signing secrets at rest. |
 | `META_GRAPH_API_VERSION` | String | `v22.0` | Meta Graph API version. |

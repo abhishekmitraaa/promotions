@@ -1,8 +1,18 @@
 import { NextRequest, NextResponse } from "next/server";
 import { processWebhookDeliveryQueue } from "@/lib/webhooks/dispatcher";
 import { logger } from "@/lib/logger";
+import { requireUser } from "@/lib/auth";
 
 export async function POST(req: NextRequest) {
+  const workerSecret = req.headers.get("x-worker-secret");
+  const isWorkerAuthorized =
+    Boolean(workerSecret && process.env.INTERNAL_WORKER_SECRET && workerSecret === process.env.INTERNAL_WORKER_SECRET);
+
+  if (!isWorkerAuthorized) {
+    const auth = await requireUser(req, "ADMIN");
+    if (auth.response) return auth.response;
+  }
+
   try {
     const { searchParams } = new URL(req.url);
     const batchSize = Math.min(
@@ -24,8 +34,4 @@ export async function POST(req: NextRequest) {
       { status: 500 }
     );
   }
-}
-
-export async function GET(req: NextRequest) {
-  return POST(req);
 }

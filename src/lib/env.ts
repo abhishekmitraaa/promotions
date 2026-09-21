@@ -28,8 +28,12 @@ export const envSchema = z
 
     // Security & Admin Credentials
     API_KEY_PEPPER: z.string().default("default_local_dev_pepper_change_in_production_12345"),
-    ADMIN_USERNAME: z.string().default("admin"),
-    ADMIN_PASSWORD: z.string().default("admin"),
+    AUTH_SESSION_SECRET: z
+      .string()
+      .default("default_dev_session_secret_32_chars_minimum_len!!"),
+    INTERNAL_WORKER_SECRET: z.string().optional(),
+    ADMIN_USERNAME: z.string().optional().default("admin"),
+    ADMIN_PASSWORD: z.string().optional().default("admin"),
 
     // OTP Configuration
     OTP_CODE_LENGTH: z.coerce.number().int().min(4).max(10).default(6),
@@ -84,35 +88,23 @@ export const envSchema = z
         });
       }
 
-      // 2. Enforce explicit non-default ADMIN_USERNAME in production
+      // 2. Enforce strong, non-placeholder AUTH_SESSION_SECRET in production
       if (
-        !data.ADMIN_USERNAME ||
-        data.ADMIN_USERNAME.trim().length === 0 ||
-        data.ADMIN_USERNAME.toLowerCase() === "admin"
+        !data.AUTH_SESSION_SECRET ||
+        data.AUTH_SESSION_SECRET.length < 32 ||
+        data.AUTH_SESSION_SECRET.includes("default_dev_session_secret") ||
+        data.AUTH_SESSION_SECRET.includes("replace_with_") ||
+        data.AUTH_SESSION_SECRET.includes("change_in_production")
       ) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           message:
-            "Production requires an explicit, non-default ADMIN_USERNAME. The default username 'admin' is strictly forbidden.",
-          path: ["ADMIN_USERNAME"],
+            "Production requires a strong AUTH_SESSION_SECRET (at least 32 characters). Default or placeholder secrets are forbidden.",
+          path: ["AUTH_SESSION_SECRET"],
         });
       }
 
-      // 3. Enforce explicit strong non-default ADMIN_PASSWORD in production
-      if (
-        !data.ADMIN_PASSWORD ||
-        data.ADMIN_PASSWORD.length < 12 ||
-        data.ADMIN_PASSWORD.toLowerCase() === "admin"
-      ) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message:
-            "Production requires an explicit, strong ADMIN_PASSWORD (minimum 12 characters). The default password 'admin' is strictly forbidden.",
-          path: ["ADMIN_PASSWORD"],
-        });
-      }
-
-      // 4. Enforce strong WEBHOOK_SECRET_ENCRYPTION_KEY in production
+      // 3. Enforce strong WEBHOOK_SECRET_ENCRYPTION_KEY in production
       if (
         !data.WEBHOOK_SECRET_ENCRYPTION_KEY ||
         data.WEBHOOK_SECRET_ENCRYPTION_KEY.length < 32 ||

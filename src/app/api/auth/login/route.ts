@@ -10,8 +10,9 @@ export async function POST(req: NextRequest) {
 
   let body: unknown;
   try { body = await req.json(); } catch { return NextResponse.json({ success: false, error: { code: "BAD_REQUEST", message: "Invalid JSON body" } }, { status: 400 }); }
-  const email = typeof (body as any)?.email === "string" ? (body as any).email.trim().toLowerCase() : "";
-  const password = typeof (body as any)?.password === "string" ? (body as any).password : "";
+  const bodyObj = typeof body === "object" && body !== null ? (body as Record<string, unknown>) : {};
+  const email = typeof bodyObj.email === "string" ? bodyObj.email.trim().toLowerCase() : "";
+  const password = typeof bodyObj.password === "string" ? bodyObj.password : "";
   if (!email || !password) return NextResponse.json({ success: false, error: { code: "VALIDATION_ERROR", message: "Email and password are required" } }, { status: 400 });
 
   const user = await prisma.user.findUnique({ where: { email } });

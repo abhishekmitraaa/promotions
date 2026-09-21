@@ -60,7 +60,7 @@ export function verifySessionTokenNode(token: string) {
     const expected = crypto.createHmac("sha256", secret).update(payload).digest("base64url");
     if (signature.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) return null;
     const parsed = JSON.parse(payload) as { id?: string; email?: string; role?: string; expiresAt?: number };
-    if (!parsed.id || !parsed.email || (parsed.role !== "ADMIN" && parsed.role !== "VIEWER") || !Number.isFinite(parsed.expiresAt) || parsed.expiresAt <= Date.now()) return null;
+    if (!parsed.id || !parsed.email || (parsed.role !== "ADMIN" && parsed.role !== "VIEWER") || typeof parsed.expiresAt !== "number" || !Number.isFinite(parsed.expiresAt) || parsed.expiresAt <= Date.now()) return null;
     return { id: parsed.id, email: parsed.email, role: parsed.role as UserRole, expiresAt: parsed.expiresAt };
   } catch {
     return null;

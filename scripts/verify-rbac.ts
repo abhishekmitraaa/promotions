@@ -5,6 +5,7 @@ process.env.NODE_ENV = process.env.NODE_ENV || "test";
 process.env.AUTH_SESSION_SECRET ||= "rbac-test-session-secret-32-characters-minimum";
 process.env.API_KEY_PEPPER ||= "rbac-test-api-key-pepper-32-characters-min";
 process.env.WEBHOOK_SECRET_ENCRYPTION_KEY ||= "rbac-test-webhook-key-32-characters-min";
+process.env.INTERNAL_WORKER_SECRET ||= "rbac-test-worker-secret-32-chars-min";
 
 type AnyResponse = Response & { cookies?: { get(name: string): { value: string } | undefined } };
 
@@ -23,6 +24,7 @@ async function main() {
   const revokeApiKey = (await import("../src/app/api/admin/api-keys/[id]/revoke/route")).POST;
   const webhooks = await import("../src/app/api/admin/webhooks/route");
   const webhookItem = await import("../src/app/api/admin/webhooks/[id]/route");
+  const regenWebhookSecret = (await import("../src/app/api/admin/webhooks/[id]/regenerate-secret/route")).POST;
   const webhookDeliveries = await import("../src/app/api/admin/webhooks/deliveries/route");
   const sendMessage = (await import("../src/app/api/admin/messages/send/route")).POST;
   const cleanup = (await import("../src/app/api/admin/clean-data/route")).POST;
@@ -45,12 +47,13 @@ async function main() {
   let webhookId = "";
   let secondaryAdminId = "";
 
-  const request = (url: string, method = "GET", body?: unknown, cookie = "") =>
+  const request = (url: string, method = "GET", body?: unknown, cookie = "", ip = "") =>
     new NextRequest(`http://localhost:3000${url}`, {
       method,
       headers: {
         ...(body === undefined ? {} : { "content-type": "application/json" }),
         ...(cookie ? { cookie: `${SESSION_COOKIE}=${encodeURIComponent(cookie)}` } : {}),
+        ...(ip ? { "x-forwarded-for": ip } : {}),
       },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
@@ -61,7 +64,7 @@ async function main() {
   };
 
   const loginAs = async (email: string, password: string, ip = crypto.randomBytes(4).toString("hex")) => {
-    const res = await login(request("/api/auth/login", "POST", { email, password, ip }));
+    const res = await login(request("/api/auth/login", "POST", { email, password }, "", ip));
     const cookie = res.cookies?.get(SESSION_COOKIE)?.value || "";
     return { res, cookie };
   };
@@ -111,7 +114,7 @@ async function main() {
     console.log("5. Admin creates viewer through real API");
     const createViewer = await users.POST(request("/api/admin/users", "POST", {
       email: viewerEmail, password: viewerPassword, role: "VIEWER"
-    }));
+    }, adminCookie));
     assertStatus(createViewer, 201, "Create viewer");
     const viewerRecord = await prisma.user.findUnique({ where: { email: viewerEmail } });
     assert.ok(viewerRecord);
@@ -120,21 +123,33 @@ async function main() {
 
     const createAdmin = await users.POST(request("/api/admin/users", "POST", {
       email: secondaryAdminEmail, password: secondaryAdminPassword, role: "ADMIN"
-    }));
+    }, adminCookie));
     assertStatus(createAdmin, 201, "Create second admin");
     const secondaryAdmin = await prisma.user.findUnique({ where: { email: secondaryAdminEmail } });
     assert.ok(secondaryAdmin);
     secondaryAdminId = secondaryAdmin!.id;
     assert.equal(secondaryAdmin?.role, "ADMIN");
 
-    console.log("6. Validation: weak password and duplicate email");
+    console.log("6. Validation: weak password, invalid email, and duplicate email");
     const weak = await users.POST(request("/api/admin/users", "POST", {
       email: `weak-${suffix}@example.test`, password: "short", role: "VIEWER"
-    }));
+    }, adminCookie));
     assertStatus(weak, 400, "Weak password");
+    const invalidEmail = await users.POST(request("/api/admin/users", "POST", {
+      email: "not-an-email", password: viewerPassword, role: "VIEWER"
+    }, adminCookie));
+    assertStatus(invalidEmail, 400, "Invalid email format");
+    const emptyEmail = await users.POST(request("/api/admin/users", "POST", {
+      email: "", password: viewerPassword, role: "VIEWER"
+    }, adminCookie));
+    assertStatus(emptyEmail, 400, "Empty email");
+    const invalidRole = await users.POST(request("/api/admin/users", "POST", {
+      email: `role-${suffix}@example.test`, password: viewerPassword, role: "SUPERMAN"
+    }, adminCookie));
+    assertStatus(invalidRole, 400, "Invalid role");
     const duplicate = await users.POST(request("/api/admin/users", "POST", {
       email: viewerEmail, password: viewerPassword, role: "VIEWER"
-    }));
+    }, adminCookie));
     assertStatus(duplicate, 409, "Duplicate email");
 
     console.log("7. Viewer login and read access");
@@ -163,14 +178,27 @@ async function main() {
     console.log("8. Viewer mutation denial matrix");
     const denied: Array<[string, Promise<Response>]> = [
       ["create user", users.POST(request("/api/admin/users", "POST", { email: `blocked-${suffix}@example.test`, password: viewerPassword, role: "ADMIN" }, viewerCookie))],
+      ["patch user", users.PATCH(request("/api/admin/users", "PATCH", { id: "dummy-id", role: "ADMIN" }, viewerCookie))],
+      ["delete user", users.DELETE(request("/api/admin/users?id=dummy-id", "DELETE", undefined, viewerCookie))],
       ["create api key", apiKeys.POST(request("/api/admin/api-keys", "POST", { clientName: `blocked-${suffix}` }, viewerCookie))],
+      ["revoke api key", revokeApiKey(request("/api/admin/api-keys/dummy-id/revoke", "POST", {}, viewerCookie), { params: Promise.resolve({ id: "dummy-id" }) })],
       ["send message", sendMessage(request("/api/admin/messages/send", "POST", { to: "919876543210", type: "text", body: "blocked" }, viewerCookie))],
       ["create webhook", webhooks.POST(request("/api/admin/webhooks", "POST", { name: "blocked", url: "https://example.com/hook", subscribedEvents: ["*"] }, viewerCookie))],
+      ["patch webhook", webhookItem.PATCH(request("/api/admin/webhooks/dummy-id", "PATCH", { name: "blocked" }, viewerCookie), { params: Promise.resolve({ id: "dummy-id" }) })],
+      ["delete webhook", webhookItem.DELETE(request("/api/admin/webhooks/dummy-id", "DELETE", undefined, viewerCookie), { params: Promise.resolve({ id: "dummy-id" }) })],
+      ["regenerate webhook secret", regenWebhookSecret(request("/api/admin/webhooks/dummy-id/regenerate-secret", "POST", undefined, viewerCookie), { params: Promise.resolve({ id: "dummy-id" }) })],
       ["retry delivery", webhookDeliveries.POST(request("/api/admin/webhooks/deliveries", "POST", { deliveryId: "missing" }, viewerCookie))],
       ["cleanup", cleanup(request("/api/admin/clean-data", "POST", { confirm: "NO" }, viewerCookie))],
       ["process queue", queue(request("/api/admin/webhooks/process-queue", "POST", undefined, viewerCookie))],
     ];
     for (const [label, p] of denied) assertStatus(await p, 403, `Viewer ${label}`);
+
+    // Verify authorized worker can trigger queue processing via x-worker-secret
+    const workerQueueRes = await queue(new NextRequest("http://localhost:3000/api/admin/webhooks/process-queue", {
+      method: "POST",
+      headers: { "x-worker-secret": process.env.INTERNAL_WORKER_SECRET! },
+    }));
+    assertStatus(workerQueueRes, 200, "Worker secret queue processing");
 
     console.log("9. Middleware unauthenticated redirect and viewer mutation block");
     const unauthDashboard = await middleware(request("/dashboard"));
@@ -197,7 +225,7 @@ async function main() {
     assert.equal(send.status !== 401 && send.status !== 403, true, `Admin send must pass authorization, got ${send.status}`);
     assert.equal((await messages(request("/api/admin/messages", "GET", undefined, viewerCookie))).status, 200);
 
-    console.log("12. Admin webhook create/read/update/delete");
+    console.log("12. Admin webhook create/read/update/delete/regenerate-secret");
     const webhookCreate = await webhooks.POST(request("/api/admin/webhooks", "POST", {
       name: `rbac-hook-${suffix}`, url: "https://example.com/rbac-hook", subscribedEvents: ["message.sent"]
     }, adminCookie));
@@ -218,6 +246,19 @@ async function main() {
       { params: Promise.resolve({ id: webhookId }) }
     );
     assertStatus(webhookPatch, 200, "Admin patch webhook");
+
+    const regenDenied = await regenWebhookSecret(
+      request(`/api/admin/webhooks/${webhookId}/regenerate-secret`, "POST", undefined, viewerCookie),
+      { params: Promise.resolve({ id: webhookId }) }
+    );
+    assertStatus(regenDenied, 403, "Viewer regenerate webhook secret");
+    const regenAllowed = await regenWebhookSecret(
+      request(`/api/admin/webhooks/${webhookId}/regenerate-secret`, "POST", undefined, adminCookie),
+      { params: Promise.resolve({ id: webhookId }) }
+    );
+    assertStatus(regenAllowed, 200, "Admin regenerate webhook secret");
+    assert.ok((await json(regenAllowed)).data.signingSecret, "New signing secret returned");
+
     const webhookDeleteDenied = await webhookItem.DELETE(
       request(`/api/admin/webhooks/${webhookId}`, "DELETE", undefined, viewerCookie),
       { params: Promise.resolve({ id: webhookId }) }
@@ -275,7 +316,7 @@ async function main() {
     const deletedLogin = await loginAs(viewerEmail, resetPassword);
     assertStatus(deletedLogin.res, 401, "Deleted account login");
 
-    console.log("18. Self lockout protection");
+    console.log("18. Self lockout protection & Last admin protection");
     for (const patch of [
       { id: admin.id, role: "VIEWER" },
       { id: admin.id, active: false },
@@ -283,6 +324,32 @@ async function main() {
       assertStatus(await users.PATCH(request("/api/admin/users", "PATCH", patch, adminCookie)), 400, "Self lockout patch");
     }
     assertStatus(await users.DELETE(request(`/api/admin/users?id=${admin.id}`, "DELETE", undefined, adminCookie)), 400, "Self delete");
+
+    // Last admin protection:
+    // Create a 3rd temporary admin:
+    const tempAdminEmail = `rbac-admin3-${suffix}@example.test`;
+    const tempAdminRes = await users.POST(request("/api/admin/users", "POST", { email: tempAdminEmail, password: adminPassword, role: "ADMIN" }, adminCookie));
+    assertStatus(tempAdminRes, 201, "Create 3rd admin");
+    const tempAdminId = (await json(tempAdminRes)).data.id;
+
+    // Demoting secondary admin when other admins exist succeeds:
+    const demoteSecondary = await users.PATCH(request("/api/admin/users", "PATCH", { id: secondaryAdminId, role: "VIEWER" }, adminCookie));
+    assertStatus(demoteSecondary, 200, "Demote secondary admin when multiple admins exist");
+
+    // Deleting temp admin leaves only 1 active admin (`admin`):
+    const delTemp = await users.DELETE(request(`/api/admin/users?id=${tempAdminId}`, "DELETE", undefined, adminCookie));
+    assertStatus(delTemp, 200, "Delete temp admin when multiple admins exist");
+
+    // Now `admin` is the sole active ADMIN in the database!
+    // Sole admin cannot be demoted, disabled, or deleted:
+    const demoteSole = await users.PATCH(request("/api/admin/users", "PATCH", { id: admin.id, role: "VIEWER" }, adminCookie));
+    assertStatus(demoteSole, 400, "Sole admin cannot be demoted");
+
+    const disableSole = await users.PATCH(request("/api/admin/users", "PATCH", { id: admin.id, active: false }, adminCookie));
+    assertStatus(disableSole, 400, "Sole admin cannot be disabled");
+
+    const deleteSole = await users.DELETE(request(`/api/admin/users?id=${admin.id}`, "DELETE", undefined, adminCookie));
+    assertStatus(deleteSole, 400, "Sole admin cannot be deleted");
 
     console.log("19. Logout invalidates session");
     const logoutRes = await logout(request("/api/auth/logout", "POST", undefined, adminCookie));

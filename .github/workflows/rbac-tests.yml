@@ -31,6 +31,7 @@ jobs:
       AUTH_SESSION_SECRET: rbac-ci-session-secret-32-characters-minimum
       API_KEY_PEPPER: rbac-ci-api-key-pepper-32-characters-min
       WEBHOOK_SECRET_ENCRYPTION_KEY: rbac-ci-webhook-key-32-characters-min
+      INTERNAL_WORKER_SECRET: rbac-ci-worker-secret-32-characters-min
 
     steps:
       - uses: actions/checkout@v4

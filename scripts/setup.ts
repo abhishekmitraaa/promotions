@@ -20,8 +20,6 @@ async function main() {
   const envPath = path.join(rootDir, ".env");
 
   let createdLocalEnv = false;
-  let adminUsername = "hub_admin";
-  let adminPassword = "";
   let activePepper = "";
 
   // Step 1: Ensure .env.local or .env exists
@@ -29,9 +27,9 @@ async function main() {
     console.log("📄 No .env.local found. Generating fresh configuration from .env.example...");
     let content = fs.readFileSync(envExamplePath, "utf-8");
 
-    // Generate cryptographically random pepper & admin credentials
+    // Generate cryptographically random pepper & session secret
     const generatedPepper = crypto.randomBytes(32).toString("hex");
-    adminPassword = crypto.randomBytes(12).toString("base64url");
+    const generatedSessionSecret = crypto.randomBytes(32).toString("hex");
     activePepper = generatedPepper;
 
     content = content.replace(
@@ -39,26 +37,18 @@ async function main() {
       `API_KEY_PEPPER="${generatedPepper}"`
     );
     content = content.replace(
-      /ADMIN_USERNAME="[^"]*"/,
-      `ADMIN_USERNAME="${adminUsername}"`
-    );
-    content = content.replace(
-      /ADMIN_PASSWORD="[^"]*"/,
-      `ADMIN_PASSWORD="${adminPassword}"`
+      /AUTH_SESSION_SECRET="[^"]*"/,
+      `AUTH_SESSION_SECRET="${generatedSessionSecret}"`
     );
 
     fs.writeFileSync(envLocalPath, content, "utf-8");
     createdLocalEnv = true;
-    console.log("✅ Created .env.local with random API pepper and secure admin credentials");
+    console.log("✅ Created .env.local with random API pepper and session secret");
   } else {
     console.log("✅ Environment configuration file present");
     const targetFile = fs.existsSync(envLocalPath) ? envLocalPath : envPath;
     const existingContent = fs.readFileSync(targetFile, "utf-8");
-    const userMatch = existingContent.match(/ADMIN_USERNAME="([^"]+)"/);
-    const passMatch = existingContent.match(/ADMIN_PASSWORD="([^"]+)"/);
     const pepperMatch = existingContent.match(/API_KEY_PEPPER="([^"]+)"/);
-    if (userMatch) adminUsername = userMatch[1];
-    if (passMatch) adminPassword = passMatch[1];
     if (pepperMatch) activePepper = pepperMatch[1];
   }
 
@@ -120,12 +110,9 @@ async function main() {
   console.log("\nQuick Start Guide:");
   console.log("  1. Start dev server:      npm run dev");
   console.log("  2. Open Dashboard:        http://localhost:3000/dashboard");
-  console.log(`     Admin Credentials:     Username: ${adminUsername} | Password: ${adminPassword || "(as configured in .env.local)"}`);
-  if (createdLocalEnv) {
-    console.log(`     ⚠️  Notice: The admin password above was randomly generated and saved to .env.local`);
-  }
-  console.log("  3. Check Health API:      http://localhost:3000/api/health");
-  console.log("  4. Run Test Suite:        npm test\n");
+  console.log("  3. Provision Admin:       DEMO_ADMIN_PASSWORD=your_password npm run auth:seed-admin");
+  console.log("  4. Check Health API:      http://localhost:3000/api/health");
+  console.log("  5. Run Test Suite:        npm test\n");
 }
 
 main()

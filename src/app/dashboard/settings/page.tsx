@@ -97,11 +97,11 @@ export default function DashboardSettingsPage() {
 
           <div className="p-4 rounded-xl bg-zinc-950/80 border border-zinc-800/80 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div>
-              <div className="font-mono text-zinc-200 font-semibold">ADMIN_USERNAME &amp; ADMIN_PASSWORD</div>
-              <div className="text-xs text-zinc-500">HTTP Basic Auth protection for /dashboard and /api/admin/*</div>
+              <div className="font-mono text-zinc-200 font-semibold">AUTH_SESSION_SECRET</div>
+              <div className="text-xs text-zinc-500">Database session cookie signing &amp; ADMIN / VIEWER RBAC</div>
             </div>
             <span className="px-3 py-1 rounded-full text-xs font-mono bg-emerald-950 text-emerald-400 border border-emerald-800 font-semibold">
-              Active (HTTP Basic Auth)
+              Active (Session RBAC)
             </span>
           </div>
 

@@ -138,6 +138,8 @@ export async function DELETE(
   req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
+  const auth = await requireUser(req, "ADMIN");
+  if (auth.response) return auth.response;
   const { id } = await params;
 
   try {
