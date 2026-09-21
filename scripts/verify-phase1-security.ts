@@ -1,4 +1,5 @@
 import { prisma } from "../src/lib/prisma";
+import { assertDestructiveTestAllowed } from "./test-db-guard";
 import { MessageService } from "../src/lib/services/message-service";
 import { OtpService } from "../src/lib/services/otp-service";
 import { WebhookService } from "../src/lib/services/webhook-service";
@@ -14,6 +15,7 @@ import { validateWebhookUrlSync, validateWebhookUrlForDelivery } from "../src/li
 import { dispatchOutgoingWebhooks } from "../src/lib/webhooks/dispatcher";
 
 async function runPhase1SecurityTests() {
+  assertDestructiveTestAllowed("verify-phase1-security");
   console.log("==================================================================");
   console.log("🛡️  RUNNING PHASE 1 SECURITY & MULTI-TENANT ISOLATION TEST SUITE");
   console.log("==================================================================\n");

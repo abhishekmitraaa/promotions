@@ -1,4 +1,5 @@
 import { prisma } from "../src/lib/prisma";
+import { assertDestructiveTestAllowed } from "./test-db-guard";
 import { signHmacSha256 } from "../src/lib/crypto";
 import { env } from "../src/lib/env";
 
@@ -32,6 +33,7 @@ function recordTest(name: string, passed: boolean, details?: string) {
 }
 
 async function runTests() {
+  assertDestructiveTestAllowed("test-live-features");
   console.log("\n=======================================================");
   console.log("🧪 RUNNING COMPREHENSIVE LIVE HTTP FEATURE TEST SUITE");
   console.log(`🎯 Target Server: ${BASE_URL}`);

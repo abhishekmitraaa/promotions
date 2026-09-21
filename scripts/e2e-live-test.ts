@@ -1,4 +1,5 @@
 import { prisma } from "../src/lib/prisma";
+import { assertDestructiveTestAllowed } from "./test-db-guard";
 import { generateApiKey, encryptWebhookSecret } from "../src/lib/crypto";
 import { MessageService } from "../src/lib/services/message-service";
 import { OtpService } from "../src/lib/services/otp-service";
@@ -7,6 +8,7 @@ import { WebhookPayload } from "../src/lib/whatsapp/types";
 import { MessageDirection } from "@prisma/client";
 
 async function runFullE2ETest() {
+  assertDestructiveTestAllowed("e2e-live-test");
   console.log("\n=========================================================");
   console.log("🚀 STARTING COMPLETE END-TO-END FEATURE SIMULATION TEST");
   console.log("=========================================================\n");

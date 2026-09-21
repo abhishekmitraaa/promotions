@@ -37,6 +37,7 @@ export async function middleware(req: NextRequest) {
     if (
       isAdminApiRoute &&
       pathname === "/api/admin/webhooks/process-queue" &&
+      req.method === "POST" &&
       workerSecretHeader &&
       process.env.INTERNAL_WORKER_SECRET &&
       workerSecretHeader === process.env.INTERNAL_WORKER_SECRET

@@ -1,4 +1,5 @@
 import { prisma } from "../src/lib/prisma";
+import { assertDestructiveTestAllowed } from "./test-db-guard";
 import { checkRateLimit } from "../src/lib/rate-limit";
 import {
   dispatchOutgoingWebhooks,
@@ -30,6 +31,7 @@ function assert(condition: boolean, testName: string, detail?: string) {
 }
 
 async function runPhase2Verification() {
+  assertDestructiveTestAllowed("verify-phase2-reliability");
   console.log("\n=======================================================");
   console.log("🚀 STARTING PHASE 2 PRODUCTION HARDENING & RELIABILITY TESTS");
   console.log("=======================================================\n");

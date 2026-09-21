@@ -32,6 +32,7 @@ jobs:
       API_KEY_PEPPER: rbac-ci-api-key-pepper-32-characters-min
       WEBHOOK_SECRET_ENCRYPTION_KEY: rbac-ci-webhook-key-32-characters-min
       INTERNAL_WORKER_SECRET: rbac-ci-worker-secret-32-characters-min
+      ALLOW_DESTRUCTIVE_TESTS: "true"
 
     steps:
       - uses: actions/checkout@v4

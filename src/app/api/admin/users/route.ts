@@ -43,33 +43,34 @@ export async function PATCH(req: NextRequest) {
   if (!targetUser) return NextResponse.json({ success: false, error: { code: "NOT_FOUND", message: "User not found" } }, { status: 404 });
 
   if (targetUser.role === "ADMIN" && targetUser.active && (active === false || role === "VIEWER")) {
-    const result = await prisma.$transaction(async (tx) => {
-      try {
+    try {
+      const result = await prisma.$transaction(async (tx) => {
         await tx.$executeRaw`SELECT pg_advisory_xact_lock(987654321)`;
-      } catch {
-        // Fallback for non-postgres if any
-      }
-      const activeAdminCount = await tx.user.count({ where: { role: "ADMIN", active: true } });
-      if (activeAdminCount <= 1) {
-        return { error: "LAST_ADMIN_PROTECTION" as const };
-      }
-      const updated = await tx.user.update({
-        where: { id },
-        data: {
-          ...(role ? { role } : {}),
-          ...(active !== undefined ? { active } : {}),
-          ...(password !== undefined ? { passwordHash: await hashPasswordForStorage(password) } : {}),
-        },
-        select: { id: true, email: true, role: true, active: true, lastLoginAt: true, createdAt: true, updatedAt: true },
+        const activeAdminCount = await tx.user.count({ where: { role: "ADMIN", active: true } });
+        if (activeAdminCount <= 1) {
+          return { error: "LAST_ADMIN_PROTECTION" as const };
+        }
+        const updated = await tx.user.update({
+          where: { id },
+          data: {
+            ...(role ? { role } : {}),
+            ...(active !== undefined ? { active } : {}),
+            ...(password !== undefined ? { passwordHash: await hashPasswordForStorage(password) } : {}),
+          },
+          select: { id: true, email: true, role: true, active: true, lastLoginAt: true, createdAt: true, updatedAt: true },
+        });
+        await tx.userSession.deleteMany({ where: { userId: id } });
+        return { user: updated };
       });
-      await tx.userSession.deleteMany({ where: { userId: id } });
-      return { user: updated };
-    });
 
-    if ("error" in result) {
-      return NextResponse.json({ success: false, error: { code: "LAST_ADMIN_PROTECTION", message: "Cannot demote or deactivate the last active administrator" } }, { status: 400 });
+      if ("error" in result) {
+        return NextResponse.json({ success: false, error: { code: "LAST_ADMIN_PROTECTION", message: "Cannot demote or deactivate the last active administrator" } }, { status: 400 });
+      }
+      return NextResponse.json({ success: true, data: result.user });
+    } catch (err) {
+      console.error("Last-admin protection transaction failed:", err);
+      return NextResponse.json({ success: false, error: { code: "INTERNAL_ERROR", message: "Security check failed during admin update" } }, { status: 500 });
     }
-    return NextResponse.json({ success: true, data: result.user });
   }
 
   const user = await prisma.user.update({ where: { id }, data: { ...(role ? { role } : {}), ...(active !== undefined ? { active } : {}), ...(password !== undefined ? { passwordHash: await hashPasswordForStorage(password) } : {}) }, select: { id: true, email: true, role: true, active: true, lastLoginAt: true, createdAt: true, updatedAt: true } });
@@ -88,27 +89,29 @@ export async function DELETE(req: NextRequest) {
   if (!targetUser) return NextResponse.json({ success: false, error: { code: "NOT_FOUND", message: "User not found" } }, { status: 404 });
 
   if (targetUser.role === "ADMIN" && targetUser.active) {
-    const result = await prisma.$transaction(async (tx) => {
-      try {
+    try {
+      const result = await prisma.$transaction(async (tx) => {
         await tx.$executeRaw`SELECT pg_advisory_xact_lock(987654321)`;
-      } catch {
-        // Fallback for non-postgres if any
-      }
-      const activeAdminCount = await tx.user.count({ where: { role: "ADMIN", active: true } });
-      if (activeAdminCount <= 1) {
-        return { error: "LAST_ADMIN_PROTECTION" as const };
-      }
-      await tx.user.delete({ where: { id } });
-      return { deleted: true };
-    });
+        const activeAdminCount = await tx.user.count({ where: { role: "ADMIN", active: true } });
+        if (activeAdminCount <= 1) {
+          return { error: "LAST_ADMIN_PROTECTION" as const };
+        }
+        await tx.user.delete({ where: { id } });
+        return { deleted: true };
+      });
 
-    if ("error" in result) {
-      return NextResponse.json({ success: false, error: { code: "LAST_ADMIN_PROTECTION", message: "Cannot delete the last active administrator" } }, { status: 400 });
+      if ("error" in result) {
+        return NextResponse.json({ success: false, error: { code: "LAST_ADMIN_PROTECTION", message: "Cannot delete the last active administrator" } }, { status: 400 });
+      }
+      return NextResponse.json({ success: true, data: { id, deleted: true } });
+    } catch (err) {
+      console.error("Last-admin protection transaction failed:", err);
+      return NextResponse.json({ success: false, error: { code: "INTERNAL_ERROR", message: "Security check failed during admin deletion" } }, { status: 500 });
     }
-    return NextResponse.json({ success: true, data: { id, deleted: true } });
   }
 
   await prisma.user.delete({ where: { id } });
   return NextResponse.json({ success: true, data: { id, deleted: true } });
 }
+
 

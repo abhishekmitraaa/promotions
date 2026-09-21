@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
+import { assertDestructiveTestAllowed } from "./test-db-guard";
 
 process.env.NODE_ENV = process.env.NODE_ENV || "test";
 process.env.AUTH_SESSION_SECRET ||= "rbac-test-session-secret-32-characters-minimum";
@@ -10,6 +11,8 @@ process.env.INTERNAL_WORKER_SECRET ||= "rbac-test-worker-secret-32-chars-min";
 type AnyResponse = Response & { cookies?: { get(name: string): { value: string } | undefined } };
 
 async function main() {
+  assertDestructiveTestAllowed("verify-rbac");
+
   const { NextRequest } = await import("next/server");
   const { prisma } = await import("../src/lib/prisma");
   const { hashPasswordForStorage, verifyPassword, createSessionToken, verifySessionTokenNode, SESSION_COOKIE } = await import("../src/lib/auth");
@@ -82,13 +85,44 @@ async function main() {
     assert.equal(await verifyPassword(adminPassword, passwordHash), true);
     assert.equal(await verifyPassword("wrong-password", passwordHash), false);
 
-    console.log("2. Session token integrity, dotted emails, tampering");
+    console.log("2. Session token integrity, dotted emails, tampering & robustness");
     const tokenInfo = createSessionToken({ id: "u-test", email: adminEmail, role: "ADMIN" });
     assert.equal(verifySessionTokenNode(tokenInfo.token)?.email, adminEmail);
     assert.equal(verifySessionTokenNode(tokenInfo.token)?.role, "ADMIN");
     const [encoded, signature] = tokenInfo.token.split(".");
     const tampered = `${encoded}.${signature.slice(0, -1)}x`;
     assert.equal(verifySessionTokenNode(tampered), null);
+
+    // Malformed session token robustness checks
+    assert.equal(verifySessionTokenNode(""), null, "empty token");
+    assert.equal(verifySessionTokenNode("   "), null, "whitespace token");
+    assert.equal(verifySessionTokenNode("not.valid.base64"), null, "invalid base64");
+    assert.equal(verifySessionTokenNode(`${encoded}.invalid_sig`), null, "invalid signature");
+
+    // Expired token
+    const expiredPayload = Buffer.from(JSON.stringify({ id: "u-test", email: adminEmail, role: "ADMIN", expiresAt: Date.now() - 1000 })).toString("base64url");
+    const expiredSig = crypto.createHmac("sha256", process.env.AUTH_SESSION_SECRET!).update(Buffer.from(expiredPayload, "base64url").toString("utf8")).digest("base64url");
+    assert.equal(verifySessionTokenNode(`${expiredPayload}.${expiredSig}`), null, "expired token");
+
+    // Invalid role
+    const badRolePayload = Buffer.from(JSON.stringify({ id: "u-test", email: adminEmail, role: "SUPERUSER", expiresAt: Date.now() + 10000 })).toString("base64url");
+    const badRoleSig = crypto.createHmac("sha256", process.env.AUTH_SESSION_SECRET!).update(Buffer.from(badRolePayload, "base64url").toString("utf8")).digest("base64url");
+    assert.equal(verifySessionTokenNode(`${badRolePayload}.${badRoleSig}`), null, "invalid role");
+
+    // Missing id
+    const missingIdPayload = Buffer.from(JSON.stringify({ email: adminEmail, role: "ADMIN", expiresAt: Date.now() + 10000 })).toString("base64url");
+    const missingIdSig = crypto.createHmac("sha256", process.env.AUTH_SESSION_SECRET!).update(Buffer.from(missingIdPayload, "base64url").toString("utf8")).digest("base64url");
+    assert.equal(verifySessionTokenNode(`${missingIdPayload}.${missingIdSig}`), null, "missing id");
+
+    // Missing email
+    const missingEmailPayload = Buffer.from(JSON.stringify({ id: "u-test", role: "ADMIN", expiresAt: Date.now() + 10000 })).toString("base64url");
+    const missingEmailSig = crypto.createHmac("sha256", process.env.AUTH_SESSION_SECRET!).update(Buffer.from(missingEmailPayload, "base64url").toString("utf8")).digest("base64url");
+    assert.equal(verifySessionTokenNode(`${missingEmailPayload}.${missingEmailSig}`), null, "missing email");
+
+    // Missing expiresAt
+    const missingExpiresPayload = Buffer.from(JSON.stringify({ id: "u-test", email: adminEmail, role: "ADMIN" })).toString("base64url");
+    const missingExpiresSig = crypto.createHmac("sha256", process.env.AUTH_SESSION_SECRET!).update(Buffer.from(missingExpiresPayload, "base64url").toString("utf8")).digest("base64url");
+    assert.equal(verifySessionTokenNode(`${missingExpiresPayload}.${missingExpiresSig}`), null, "missing expiresAt");
 
     console.log("3. Database user creation stores only password hash");
     const admin = await prisma.user.create({
@@ -352,6 +386,43 @@ async function main() {
 
     const deleteSole = await users.DELETE(request(`/api/admin/users?id=${admin.id}`, "DELETE", undefined, adminCookie));
     assertStatus(deleteSole, 400, "Sole admin cannot be deleted");
+
+    console.log("18b. Last-Admin Concurrency: Parallel destructive operations");
+    const concAdminAEmail = `rbac-concA-${suffix}@example.test`;
+    const concAdminBEmail = `rbac-concB-${suffix}@example.test`;
+    const resConcA = await users.POST(request("/api/admin/users", "POST", { email: concAdminAEmail, password: adminPassword, role: "ADMIN" }, adminCookie));
+    assertStatus(resConcA, 201, "Create ConcAdmin A");
+    const concAdminAId = (await json(resConcA)).data.id;
+
+    const resConcB = await users.POST(request("/api/admin/users", "POST", { email: concAdminBEmail, password: adminPassword, role: "ADMIN" }, adminCookie));
+    assertStatus(resConcB, 201, "Create ConcAdmin B");
+    const concAdminBId = (await json(resConcB)).data.id;
+
+    // Launch concurrent deletions of both admins
+    const [delA, delB] = await Promise.all([
+      users.DELETE(request(`/api/admin/users?id=${concAdminAId}`, "DELETE", undefined, adminCookie)),
+      users.DELETE(request(`/api/admin/users?id=${concAdminBId}`, "DELETE", undefined, adminCookie)),
+    ]);
+    const activeAdminCountAfterDelete = await prisma.user.count({ where: { role: "ADMIN", active: true } });
+    assert.ok(activeAdminCountAfterDelete >= 1, `Expected >=1 active admin after concurrent delete, got ${activeAdminCountAfterDelete}`);
+
+    // Test concurrent demote and disable
+    const concAdminCEmail = `rbac-concC-${suffix}@example.test`;
+    const resConcC = await users.POST(request("/api/admin/users", "POST", { email: concAdminCEmail, password: adminPassword, role: "ADMIN" }, adminCookie));
+    assertStatus(resConcC, 201, "Create ConcAdmin C");
+    const concAdminCId = (await json(resConcC)).data.id;
+
+    const concAdminDEmail = `rbac-concD-${suffix}@example.test`;
+    const resConcD = await users.POST(request("/api/admin/users", "POST", { email: concAdminDEmail, password: adminPassword, role: "ADMIN" }, adminCookie));
+    assertStatus(resConcD, 201, "Create ConcAdmin D");
+    const concAdminDId = (await json(resConcD)).data.id;
+
+    const [demoteC, disableD] = await Promise.all([
+      users.PATCH(request("/api/admin/users", "PATCH", { id: concAdminCId, role: "VIEWER" }, adminCookie)),
+      users.PATCH(request("/api/admin/users", "PATCH", { id: concAdminDId, active: false }, adminCookie)),
+    ]);
+    const activeAdminCountAfterMutations = await prisma.user.count({ where: { role: "ADMIN", active: true } });
+    assert.ok(activeAdminCountAfterMutations >= 1, `Expected >=1 active admin after concurrent mutations, got ${activeAdminCountAfterMutations}`);
 
     console.log("19. Logout invalidates session");
     const logoutRes = await logout(request("/api/auth/logout", "POST", undefined, adminCookie));
