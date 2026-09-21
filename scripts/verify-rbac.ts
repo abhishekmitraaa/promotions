@@ -32,8 +32,10 @@ async function main() {
   const suffix = crypto.randomBytes(5).toString("hex");
   const adminEmail = `rbac-admin-${suffix}@example.test`;
   const viewerEmail = `rbac-viewer-${suffix}@example.test`;
+  const secondaryAdminEmail = `rbac-admin2-${suffix}@example.test`;
   const adminPassword = `Admin!${crypto.randomBytes(12).toString("hex")}`;
   const viewerPassword = `Viewer!${crypto.randomBytes(12).toString("hex")}`;
+  const secondaryAdminPassword = `Admin2!${crypto.randomBytes(12).toString("hex")}`;
   const resetPassword = `Reset!${crypto.randomBytes(12).toString("hex")}`;
 
   let adminCookie = "";
@@ -41,6 +43,7 @@ async function main() {
   let apiClientId = "";
   let apiKeyId = "";
   let webhookId = "";
+  let secondaryAdminId = "";
 
   const request = (url: string, method = "GET", body?: unknown, cookie = "") =>
     new NextRequest(`http://localhost:3000${url}`, {
@@ -114,6 +117,15 @@ async function main() {
     assert.ok(viewerRecord);
     assert.equal(viewerRecord?.role, "VIEWER");
     assert.equal(viewerRecord?.passwordHash === viewerPassword, false);
+
+    const createAdmin = await users.POST(request("/api/admin/users", "POST", {
+      email: secondaryAdminEmail, password: secondaryAdminPassword, role: "ADMIN"
+    }));
+    assertStatus(createAdmin, 201, "Create second admin");
+    const secondaryAdmin = await prisma.user.findUnique({ where: { email: secondaryAdminEmail } });
+    assert.ok(secondaryAdmin);
+    secondaryAdminId = secondaryAdmin!.id;
+    assert.equal(secondaryAdmin?.role, "ADMIN");
 
     console.log("6. Validation: weak password and duplicate email");
     const weak = await users.POST(request("/api/admin/users", "POST", {
@@ -311,6 +323,8 @@ async function main() {
     if (apiClientId) await prisma.message.deleteMany({ where: { clientId: apiClientId } });
     if (apiClientId) await prisma.apiKey.deleteMany({ where: { clientId: apiClientId } });
     if (apiClientId) await prisma.apiClient.deleteMany({ where: { id: apiClientId } });
+    if (secondaryAdminId) await prisma.userSession.deleteMany({ where: { userId: secondaryAdminId } });
+    if (secondaryAdminId) await prisma.user.deleteMany({ where: { id: secondaryAdminId } });
     await prisma.userSession.deleteMany({ where: { userId: admin.id } });
     await prisma.user.deleteMany({ where: { id: admin.id } });
 
