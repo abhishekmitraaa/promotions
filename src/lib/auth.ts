@@ -45,7 +45,7 @@ export function createSessionToken(user: { id: string; email: string; role: User
   const secret = process.env.AUTH_SESSION_SECRET;
   if (!secret || secret.length < 32) throw new Error("AUTH_SESSION_SECRET must be configured with at least 32 characters");
   const expiresAt = Date.now() + SESSION_TTL_MS;
-  const payload = `${user.id}.${user.email}.${user.role}.${expiresAt}`;
+  const payload = JSON.stringify({ id: user.id, email: user.email, role: user.role, expiresAt });
   const signature = crypto.createHmac("sha256", secret).update(payload).digest("base64url");
   return { token: `${base64url(payload)}.${signature}`, expiresAt };
 }
@@ -59,10 +59,9 @@ export function verifySessionTokenNode(token: string) {
     const payload = Buffer.from(encoded, "base64url").toString("utf8");
     const expected = crypto.createHmac("sha256", secret).update(payload).digest("base64url");
     if (signature.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) return null;
-    const [id, email, role, expiresText] = payload.split(".");
-    const expiresAt = Number(expiresText);
-    if (!id || !email || (role !== "ADMIN" && role !== "VIEWER") || !Number.isFinite(expiresAt) || expiresAt <= Date.now()) return null;
-    return { id, email, role: role as UserRole, expiresAt };
+    const parsed = JSON.parse(payload) as { id?: string; email?: string; role?: string; expiresAt?: number };
+    if (!parsed.id || !parsed.email || (parsed.role !== "ADMIN" && parsed.role !== "VIEWER") || !Number.isFinite(parsed.expiresAt) || parsed.expiresAt <= Date.now()) return null;
+    return { id: parsed.id, email: parsed.email, role: parsed.role as UserRole, expiresAt: parsed.expiresAt };
   } catch {
     return null;
   }
