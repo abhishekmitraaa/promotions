@@ -1,8 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
+import { requireUser } from "@/lib/auth";
 import { MessageService } from "@/lib/services/message-service";
 import { MessageDirection, MessageStatus } from "@prisma/client";
 
 export async function GET(req: NextRequest) {
+  const auth = await requireUser(req);
+  if (auth.response) return auth.response;
   const { searchParams } = new URL(req.url);
 
   const directionParam = searchParams.get("direction");
