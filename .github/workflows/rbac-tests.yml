@@ -1,6 +1,8 @@
 name: RBAC Test Suite
 
 on:
+  push:
+    branches: ["feature/email-password-rbac"]
   pull_request:
     branches: ["main"]
   workflow_dispatch:
