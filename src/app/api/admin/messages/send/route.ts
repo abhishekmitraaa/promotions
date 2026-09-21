@@ -1,10 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
+import { requireUser } from "@/lib/auth";
 import { createMessageSchema } from "@/lib/validation/messages";
 import { MessageService } from "@/lib/services/message-service";
 import { MessageStatus } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 
 export async function POST(req: NextRequest) {
+  const auth = await requireUser(req, "ADMIN");
+  if (auth.response) return auth.response;
   let bodyJson: unknown;
   try {
     bodyJson = await req.json();
