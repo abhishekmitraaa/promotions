@@ -1,3 +1,11 @@
+-- Ensure the application role exists in local/CI databases; on Supabase it already exists.
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'whatsapp_hub') THEN
+    CREATE ROLE whatsapp_hub NOLOGIN;
+  END IF;
+END $$;
+
 -- RBAC authentication tables
 CREATE TYPE "UserRole" AS ENUM ('ADMIN', 'VIEWER');
 
@@ -34,6 +42,7 @@ ALTER TABLE "UserSession" ADD CONSTRAINT "UserSession_userId_fkey"
   FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 \n
 ALTER TABLE "User" ENABLE ROW LEVEL SECURITY;
+GRANT ALL ON TABLE "User", "UserSession" TO whatsapp_hub;
 ALTER TABLE "UserSession" ENABLE ROW LEVEL SECURITY;
 
 REVOKE ALL ON TABLE "User" FROM anon, authenticated;
