@@ -2,18 +2,12 @@ import { NextRequest, NextResponse } from "next/server";
 import { processWebhookDeliveryQueue } from "@/lib/webhooks/dispatcher";
 import { logger } from "@/lib/logger";
 import { requireUser } from "@/lib/auth";
-
-import crypto from "crypto";
+import { timingSafeEqualSecret } from "@/lib/timing-safe";
 
 export async function POST(req: NextRequest) {
   const workerSecret = req.headers.get("x-worker-secret");
   const configuredWorkerSecret = process.env.INTERNAL_WORKER_SECRET;
-  const isWorkerAuthorized = Boolean(
-    workerSecret &&
-    configuredWorkerSecret &&
-    workerSecret.length === configuredWorkerSecret.length &&
-    crypto.timingSafeEqual(Buffer.from(workerSecret), Buffer.from(configuredWorkerSecret))
-  );
+  const isWorkerAuthorized = await timingSafeEqualSecret(workerSecret, configuredWorkerSecret);
 
   if (!isWorkerAuthorized) {
     const auth = await requireUser(req, "ADMIN");

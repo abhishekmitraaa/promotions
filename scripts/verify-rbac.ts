@@ -236,13 +236,51 @@ async function main() {
     }));
     assertStatus(workerQueueRes, 200, "Worker secret queue processing");
 
-    console.log("9. Middleware unauthenticated redirect and viewer mutation block");
+    console.log("9. Middleware unauthenticated redirect, viewer mutation block & worker secret verification");
     const unauthDashboard = await middleware(request("/dashboard"));
     assert.equal(unauthDashboard.status, 307);
     const viewerMutation = await middleware(request("/api/admin/users", "POST", {}, viewerCookie));
     assert.equal(viewerMutation.status, 403);
     const viewerDashboard = await middleware(request("/dashboard", "GET", undefined, viewerCookie));
     assert.equal(viewerDashboard.status, 200);
+
+    // Worker secret timing-safe comparison & method/path restriction matrix
+    const workerSecret = process.env.INTERNAL_WORKER_SECRET!;
+    const workerReq = (url: string, method = "POST", secretHeader?: string) =>
+      new NextRequest(`http://localhost:3000${url}`, {
+        method,
+        headers: {
+          ...(secretHeader !== undefined ? { "x-worker-secret": secretHeader } : {}),
+        },
+      });
+
+    // 9a. Valid worker secret + POST on /api/admin/webhooks/process-queue => ALLOWED (200 / next)
+    const validWorkerRes = await middleware(workerReq("/api/admin/webhooks/process-queue", "POST", workerSecret));
+    assert.equal(validWorkerRes.status, 200, "Valid worker secret POST must be allowed through middleware");
+
+    // 9b. Invalid worker secret + POST on /api/admin/webhooks/process-queue => 401 UNAUTHORIZED
+    const invalidWorkerRes = await middleware(workerReq("/api/admin/webhooks/process-queue", "POST", "wrong-secret-value"));
+    assert.equal(invalidWorkerRes.status, 401, "Invalid worker secret must return 401");
+
+    // 9c. Missing worker secret + POST on /api/admin/webhooks/process-queue => 401 UNAUTHORIZED
+    const missingWorkerRes = await middleware(workerReq("/api/admin/webhooks/process-queue", "POST"));
+    assert.equal(missingWorkerRes.status, 401, "Missing worker secret must return 401");
+
+    // 9d. Valid worker secret + GET on /api/admin/webhooks/process-queue => 401 (POST-only restriction)
+    const getWorkerRes = await middleware(workerReq("/api/admin/webhooks/process-queue", "GET", workerSecret));
+    assert.equal(getWorkerRes.status, 401, "GET with valid worker secret must NOT be accepted as worker bypass");
+
+    // 9e. Valid worker secret + PUT on /api/admin/webhooks/process-queue => 401 (POST-only restriction)
+    const putWorkerRes = await middleware(workerReq("/api/admin/webhooks/process-queue", "PUT", workerSecret));
+    assert.equal(putWorkerRes.status, 401, "PUT with valid worker secret must NOT be accepted as worker bypass");
+
+    // 9f. Valid worker secret + DELETE on /api/admin/webhooks/process-queue => 401 (POST-only restriction)
+    const deleteWorkerRes = await middleware(workerReq("/api/admin/webhooks/process-queue", "DELETE", workerSecret));
+    assert.equal(deleteWorkerRes.status, 401, "DELETE with valid worker secret must NOT be accepted as worker bypass");
+
+    // 9g. Valid worker secret on /api/admin/users (wrong endpoint) => 401 (exact path restriction)
+    const wrongPathWorkerRes = await middleware(workerReq("/api/admin/users", "POST", workerSecret));
+    assert.equal(wrongPathWorkerRes.status, 401, "Valid worker secret on wrong path must NOT be accepted as worker bypass");
 
     console.log("10. Admin API client + API key management");
     const apiCreate = await apiKeys.POST(request("/api/admin/api-keys", "POST", { clientName: `rbac-client-${suffix}`, keyName: "RBAC Test" }, adminCookie));
@@ -422,17 +460,38 @@ async function main() {
         data: { email: emailB, passwordHash: hashB, role: "ADMIN", active: true },
       });
 
-      // 2. Remove or demote ALL other active admins so that ONLY raceA and raceB are active in the entire DB
-      const otherAdmins = await prisma.user.findMany({
+      // 2. Safe cleanup: Verify no unexpected non-test administrators exist in the database.
+      // A test must never destroy data it cannot prove belongs to itself.
+      const unexpectedAdmins = await prisma.user.findMany({
         where: {
           role: "ADMIN",
           active: true,
+          NOT: {
+            email: {
+              startsWith: "rbac-",
+              endsWith: "@example.test",
+            },
+          },
+        },
+      });
+      if (unexpectedAdmins.length > 0) {
+        throw new Error(
+          `ABORT: Unexpected pre-existing administrator(s) found in database (${unexpectedAdmins.length} unknown admin(s)). Destructive test will not delete unknown administrators.`
+        );
+      }
+
+      // Safe cleanup of ONLY test-generated admins from previous steps/iterations:
+      const priorTestAdmins = await prisma.user.findMany({
+        where: {
+          role: "ADMIN",
+          active: true,
+          email: { startsWith: "rbac-", endsWith: "@example.test" },
           id: { notIn: [raceA.id, raceB.id] },
         },
       });
-      for (const other of otherAdmins) {
-        await prisma.userSession.deleteMany({ where: { userId: other.id } });
-        await prisma.user.delete({ where: { id: other.id } });
+      for (const prior of priorTestAdmins) {
+        await prisma.userSession.deleteMany({ where: { userId: prior.id } });
+        await prisma.user.delete({ where: { id: prior.id } });
       }
 
       // 3. ASSERT: The entire database now contains EXACTLY TWO active ADMIN users!
@@ -556,13 +615,37 @@ async function main() {
         data: { email: emailD, passwordHash: hashD, role: "ADMIN", active: true },
       });
 
-      // Clear any other active admins
-      const otherAdmins = await prisma.user.findMany({
-        where: { role: "ADMIN", active: true, id: { notIn: [raceC.id, raceD.id] } },
+      // Safe cleanup: Verify no unexpected non-test administrators exist in the database.
+      const unexpectedSecondaryAdmins = await prisma.user.findMany({
+        where: {
+          role: "ADMIN",
+          active: true,
+          NOT: {
+            email: {
+              startsWith: "rbac-",
+              endsWith: "@example.test",
+            },
+          },
+        },
       });
-      for (const other of otherAdmins) {
-        await prisma.userSession.deleteMany({ where: { userId: other.id } });
-        await prisma.user.delete({ where: { id: other.id } });
+      if (unexpectedSecondaryAdmins.length > 0) {
+        throw new Error(
+          `ABORT: Unexpected pre-existing administrator(s) found in database (${unexpectedSecondaryAdmins.length} unknown admin(s)). Destructive test will not delete unknown administrators.`
+        );
+      }
+
+      // Safe cleanup of ONLY test-generated admins from previous steps:
+      const priorSecondaryTestAdmins = await prisma.user.findMany({
+        where: {
+          role: "ADMIN",
+          active: true,
+          email: { startsWith: "rbac-", endsWith: "@example.test" },
+          id: { notIn: [raceC.id, raceD.id] },
+        },
+      });
+      for (const prior of priorSecondaryTestAdmins) {
+        await prisma.userSession.deleteMany({ where: { userId: prior.id } });
+        await prisma.user.delete({ where: { id: prior.id } });
       }
 
       const activeBeforeMutations = await prisma.user.findMany({ where: { role: "ADMIN", active: true } });

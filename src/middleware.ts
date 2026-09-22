@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { timingSafeEqualSecret } from "@/lib/timing-safe";
 
 const SESSION_COOKIE = "whatsapp_hub_session";
 
@@ -38,9 +39,7 @@ export async function middleware(req: NextRequest) {
       isAdminApiRoute &&
       pathname === "/api/admin/webhooks/process-queue" &&
       req.method === "POST" &&
-      workerSecretHeader &&
-      process.env.INTERNAL_WORKER_SECRET &&
-      workerSecretHeader === process.env.INTERNAL_WORKER_SECRET
+      (await timingSafeEqualSecret(workerSecretHeader, process.env.INTERNAL_WORKER_SECRET))
     ) {
       return NextResponse.next();
     }

@@ -6,6 +6,7 @@ import { requestOtpSchema, verifyOtpSchema } from "../src/lib/validation/otp";
 import { formatTemplateComponents } from "../src/lib/services/message-service";
 import { envSchema } from "../src/lib/env";
 import { validateWebhookUrlSync } from "../src/lib/webhooks/ssrf";
+import { timingSafeEqualSecret } from "../src/lib/timing-safe";
 
 async function runVerification() {
   console.log("=================================================");
@@ -197,6 +198,16 @@ async function runVerification() {
     standardResponse.success === true && Array.isArray(standardResponse.data.items),
     "Standardized API responses maintain { success: true, data: ... } contract"
   );
+
+  // Test 14: Timing-Safe Worker Secret Equality Verification
+  const workerTestSecret = "my_super_secret_worker_token_32chars!";
+  assert(await timingSafeEqualSecret(workerTestSecret, workerTestSecret), "timingSafeEqualSecret validates matching secrets");
+  assert(!(await timingSafeEqualSecret("wrong_secret_token_32chars!", workerTestSecret)), "timingSafeEqualSecret rejects non-matching secret of same length");
+  assert(!(await timingSafeEqualSecret("short", workerTestSecret)), "timingSafeEqualSecret rejects non-matching secret of different length");
+  assert(!(await timingSafeEqualSecret("", workerTestSecret)), "timingSafeEqualSecret rejects empty string provided secret");
+  assert(!(await timingSafeEqualSecret(null, workerTestSecret)), "timingSafeEqualSecret rejects null provided secret");
+  assert(!(await timingSafeEqualSecret(undefined, workerTestSecret)), "timingSafeEqualSecret rejects undefined provided secret");
+  assert(!(await timingSafeEqualSecret(workerTestSecret, undefined)), "timingSafeEqualSecret rejects undefined expected secret");
 
   console.log("\n-------------------------------------------------");
   console.log(`Summary: ${passed} PASSED, ${failed} FAILED`);

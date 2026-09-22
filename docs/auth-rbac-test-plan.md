@@ -36,7 +36,7 @@ This suite covers the new dashboard authentication and authorization layer witho
 - **Deny by default**: Destructive test suites (`verify-rbac`, `verify-phase1-security`, `verify-phase2-reliability`, `e2e-live-test`, `test-live-features`, `clean-database`, `reset-and-seed`) abort immediately unless the database target is positively identified as disposable.
 - **Unconditional Production Block**: Any connection targeting the production Supabase database (project ref: `peqynzeioiauynfpdsdv`) is strictly and permanently blocked. Setting `ALLOW_DESTRUCTIVE_TESTS=true`, `CI=true`, or any other override CANNOT bypass this block.
 - **Local Disposable DBs**: Local disposable databases (`localhost`, `127.0.0.1`, `::1`, `host.docker.internal`, or CI container `postgres`) require explicit opt-in via `ALLOW_DESTRUCTIVE_TESTS=true`.
-- **Remote DBs**: Arbitrary remote databases are rejected by default even if `ALLOW_DESTRUCTIVE_TESTS=true` is set. Only confirmed disposable remote databases with both `ALLOW_REMOTE_DISPOSABLE_TEST_DB=true` and `ALLOW_DESTRUCTIVE_TESTS=true` are permitted (provided they are not the production database).
+- **Remote DBs**: Destructive tests against remote databases are strictly denied by default. Only local disposable databases (localhost, 127.0.0.1, Docker/CI service container) are permitted with explicit opt-in via `ALLOW_DESTRUCTIVE_TESTS=true`. Remote overrides are not supported.
 
 ## Genuine Two-Admin Last-Admin Race Test
 - **Two-Admin Participant Model**: The concurrency test begins with exactly two active administrators (Admin A and Admin B) in the database. There is no baseline admin, no demo admin, and no third admin alive during the race.

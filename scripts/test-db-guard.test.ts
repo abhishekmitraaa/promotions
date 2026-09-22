@@ -89,7 +89,6 @@ async function runGuardTests() {
       NODE_ENV: "test",
       DATABASE_URL: PROD_POOLED_URL,
       ALLOW_DESTRUCTIVE_TESTS: "true",
-      ALLOW_REMOTE_DISPOSABLE_TEST_DB: "true",
       CI: "true",
     });
     assert.equal(res.allowed, false);
@@ -159,8 +158,8 @@ async function runGuardTests() {
     assert.equal(resBadProtocol.code, "DENIED_UNKNOWN_TARGET");
   });
 
-  // Case 9: Missing DATABASE_URL => DENY with useful error
-  testCase("Case 9: Missing DATABASE_URL is DENIED with useful error", () => {
+  // Case 9: Missing DATABASE_URL and DIRECT_URL => DENY with useful error
+  testCase("Case 9: Missing DATABASE_URL and DIRECT_URL is DENIED with useful error", () => {
     const res = evaluateDestructiveTestAllowed("test-suite", {
       NODE_ENV: "test",
       DATABASE_URL: "",
@@ -172,8 +171,8 @@ async function runGuardTests() {
     assert.match(res.reason, /DATABASE_URL is not set/);
   });
 
-  // Case 10: Production-like Supabase hostname without disposable confirmation => DENY
-  testCase("Case 10: Non-prod Supabase hostname + ALLOW_DESTRUCTIVE_TESTS=true without disposable confirmation is DENIED", () => {
+  // Case 10: Non-prod remote Supabase hostname without disposable confirmation => DENY
+  testCase("Case 10: Non-prod remote Supabase hostname + ALLOW_DESTRUCTIVE_TESTS=true is DENIED", () => {
     const res = evaluateDestructiveTestAllowed("test-suite", {
       NODE_ENV: "test",
       DATABASE_URL: REMOTE_SUPABASE_OTHER_URL,
@@ -193,37 +192,82 @@ async function runGuardTests() {
     assert.equal(res.code, "DENIED_LOCAL_MISSING_OPT_IN");
   });
 
-  // Case 12: SQLite file database + ALLOW_DESTRUCTIVE_TESTS=true => ALLOW
-  testCase("Case 12: SQLite file database + ALLOW_DESTRUCTIVE_TESTS=true => ALLOW", () => {
+  // Case 12: SQLite file: protocol is strictly rejected as unsupported target
+  testCase("Case 12: SQLite file: protocol is strictly rejected as unsupported architecture target", () => {
     const res = evaluateDestructiveTestAllowed("test-suite", {
       NODE_ENV: "test",
       DATABASE_URL: SQLITE_FILE_URL,
       ALLOW_DESTRUCTIVE_TESTS: "true",
-    });
-    assert.equal(res.allowed, true);
-    assert.equal(res.code, "ALLOWED_SQLITE_FILE");
-  });
-
-  // Case 13: SQLite file database without ALLOW_DESTRUCTIVE_TESTS=true => DENY
-  testCase("Case 13: SQLite file database without opt-in => DENY", () => {
-    const res = evaluateDestructiveTestAllowed("test-suite", {
-      NODE_ENV: "test",
-      DATABASE_URL: SQLITE_FILE_URL,
     });
     assert.equal(res.allowed, false);
-    assert.equal(res.code, "DENIED_LOCAL_MISSING_OPT_IN");
+    assert.equal(res.code, "DENIED_UNKNOWN_TARGET");
+    assert.match(res.reason, /file: protocol is unsupported/);
   });
 
-  // Case 14: Confirmed remote disposable DB => ALLOW
-  testCase("Case 14: Confirmed remote disposable DB (ALLOW_REMOTE_DISPOSABLE_TEST_DB=true AND ALLOW_DESTRUCTIVE_TESTS=true) => ALLOW", () => {
+  // Case 13: REGRESSION TEST: must never treat remote override flags as proof of disposability
+  testCase("Case 13: REGRESSION: must never treat remote override flags as proof of disposability", () => {
     const res = evaluateDestructiveTestAllowed("test-suite", {
       NODE_ENV: "test",
-      DATABASE_URL: REMOTE_SUPABASE_OTHER_URL,
+      DATABASE_URL: REMOTE_ARBITRARY_URL,
       ALLOW_DESTRUCTIVE_TESTS: "true",
-      ALLOW_REMOTE_DISPOSABLE_TEST_DB: "true",
+      // Simulating caller passing any old or hypothetical override flag:
+      ...({ ALLOW_REMOTE_DISPOSABLE_TEST_DB: "true" } as Record<string, string>),
     });
-    assert.equal(res.allowed, true);
-    assert.equal(res.code, "ALLOWED_REMOTE_DISPOSABLE");
+    assert.equal(res.allowed, false);
+    assert.equal(res.code, "DENIED_REMOTE_NOT_DISPOSABLE");
+  });
+
+  // Case 14: Dual URL evaluations (DATABASE_URL and DIRECT_URL)
+  testCase("Case 14: Dual URL checks - fail closed if either DATABASE_URL or DIRECT_URL is unsafe", () => {
+    // 14a. DATABASE_URL is local, but DIRECT_URL points to Production Supabase => DENY
+    const resProdDirect = evaluateDestructiveTestAllowed("test-suite", {
+      NODE_ENV: "test",
+      DATABASE_URL: LOCAL_PG_URL,
+      DIRECT_URL: PROD_DIRECT_URL,
+      ALLOW_DESTRUCTIVE_TESTS: "true",
+    });
+    assert.equal(resProdDirect.allowed, false);
+    assert.equal(resProdDirect.code, "DENIED_PRODUCTION_SUPABASE");
+
+    // 14b. DATABASE_URL points to Production Supabase, DIRECT_URL is local => DENY
+    const resProdDb = evaluateDestructiveTestAllowed("test-suite", {
+      NODE_ENV: "test",
+      DATABASE_URL: PROD_POOLED_URL,
+      DIRECT_URL: LOCAL_PG_URL,
+      ALLOW_DESTRUCTIVE_TESTS: "true",
+    });
+    assert.equal(resProdDb.allowed, false);
+    assert.equal(resProdDb.code, "DENIED_PRODUCTION_SUPABASE");
+
+    // 14c. DATABASE_URL is local, DIRECT_URL points to unknown remote DB => DENY
+    const resRemoteDirect = evaluateDestructiveTestAllowed("test-suite", {
+      NODE_ENV: "test",
+      DATABASE_URL: LOCAL_PG_URL,
+      DIRECT_URL: REMOTE_ARBITRARY_URL,
+      ALLOW_DESTRUCTIVE_TESTS: "true",
+    });
+    assert.equal(resRemoteDirect.allowed, false);
+    assert.equal(resRemoteDirect.code, "DENIED_REMOTE_NOT_DISPOSABLE");
+
+    // 14d. DATABASE_URL is local, DIRECT_URL is malformed => DENY
+    const resMalformedDirect = evaluateDestructiveTestAllowed("test-suite", {
+      NODE_ENV: "test",
+      DATABASE_URL: LOCAL_PG_URL,
+      DIRECT_URL: "not-a-valid-url",
+      ALLOW_DESTRUCTIVE_TESTS: "true",
+    });
+    assert.equal(resMalformedDirect.allowed, false);
+    assert.equal(resMalformedDirect.code, "DENIED_MALFORMED_URL");
+
+    // 14e. Both DATABASE_URL and DIRECT_URL are local disposable + opt-in => ALLOW
+    const resBothLocal = evaluateDestructiveTestAllowed("test-suite", {
+      NODE_ENV: "test",
+      DATABASE_URL: LOCAL_PG_URL,
+      DIRECT_URL: LOCAL_127_URL,
+      ALLOW_DESTRUCTIVE_TESTS: "true",
+    });
+    assert.equal(resBothLocal.allowed, true);
+    assert.equal(resBothLocal.code, "ALLOWED_LOCAL_DISPOSABLE");
   });
 
   // Case 15: Secret leak prevention test
