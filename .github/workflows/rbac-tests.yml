@@ -50,6 +50,9 @@ jobs:
       - name: Apply migrations
         run: npx prisma migrate deploy
 
+      - name: Run unit and guard tests
+        run: npm test
+
       - name: Run RBAC integration suite
         run: npm run test:rbac
 

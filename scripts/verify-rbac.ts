@@ -387,42 +387,225 @@ async function main() {
     const deleteSole = await users.DELETE(request(`/api/admin/users?id=${admin.id}`, "DELETE", undefined, adminCookie));
     assertStatus(deleteSole, 400, "Sole admin cannot be deleted");
 
-    console.log("18b. Last-Admin Concurrency: Parallel destructive operations");
-    const concAdminAEmail = `rbac-concA-${suffix}@example.test`;
-    const concAdminBEmail = `rbac-concB-${suffix}@example.test`;
-    const resConcA = await users.POST(request("/api/admin/users", "POST", { email: concAdminAEmail, password: adminPassword, role: "ADMIN" }, adminCookie));
-    assertStatus(resConcA, 201, "Create ConcAdmin A");
-    const concAdminAId = (await json(resConcA)).data.id;
+    console.log("18b. Last-Admin Concurrency: Genuine Two-Admin Race Test");
 
-    const resConcB = await users.POST(request("/api/admin/users", "POST", { email: concAdminBEmail, password: adminPassword, role: "ADMIN" }, adminCookie));
-    assertStatus(resConcB, 201, "Create ConcAdmin B");
-    const concAdminBId = (await json(resConcB)).data.id;
+    // Pre-race safety check: verify database is an isolated disposable test target
+    const preExistingAdmins = await prisma.user.findMany({ where: { role: "ADMIN", active: true } });
+    const unexpectedNonTestAdmins = preExistingAdmins.filter((u) => !u.email.startsWith("rbac-"));
+    if (unexpectedNonTestAdmins.length > 0) {
+      throw new Error(
+        `\n⛔ [SAFETY GATE TRIGGERED] Cannot execute two-admin race test: found ${unexpectedNonTestAdmins.length} pre-existing active non-test administrator(s).\n` +
+        `The genuine two-admin race test requires an isolated disposable database with no pre-existing real admins.\n`
+      );
+    }
 
-    // Launch concurrent deletions of both admins
-    const [delA, delB] = await Promise.all([
-      users.DELETE(request(`/api/admin/users?id=${concAdminAId}`, "DELETE", undefined, adminCookie)),
-      users.DELETE(request(`/api/admin/users?id=${concAdminBId}`, "DELETE", undefined, adminCookie)),
-    ]);
-    const activeAdminCountAfterDelete = await prisma.user.count({ where: { role: "ADMIN", active: true } });
-    assert.ok(activeAdminCountAfterDelete >= 1, `Expected >=1 active admin after concurrent delete, got ${activeAdminCountAfterDelete}`);
+    // Demote or delete any existing test admins from earlier steps (like `admin`)
+    // so we can initialize the race with EXACTLY TWO active ADMIN users.
+    // To respect sole-admin protection, we first create Race Admin A & B, then demote/delete the earlier admin.
+    const raceIterations = 3;
+    console.log(`   Running ${raceIterations} iterations of concurrent DELETE-vs-DELETE with exactly 2 active admins...`);
 
-    // Test concurrent demote and disable
-    const concAdminCEmail = `rbac-concC-${suffix}@example.test`;
-    const resConcC = await users.POST(request("/api/admin/users", "POST", { email: concAdminCEmail, password: adminPassword, role: "ADMIN" }, adminCookie));
-    assertStatus(resConcC, 201, "Create ConcAdmin C");
-    const concAdminCId = (await json(resConcC)).data.id;
+    for (let iter = 1; iter <= raceIterations; iter++) {
+      const iterRunId = crypto.randomBytes(4).toString("hex");
+      const emailA = `rbac-race-${iterRunId}-a@example.test`;
+      const emailB = `rbac-race-${iterRunId}-b@example.test`;
+      const passA = `RacePassA!${crypto.randomBytes(8).toString("hex")}`;
+      const passB = `RacePassB!${crypto.randomBytes(8).toString("hex")}`;
+      const hashA = await hashPasswordForStorage(passA);
+      const hashB = await hashPasswordForStorage(passB);
 
-    const concAdminDEmail = `rbac-concD-${suffix}@example.test`;
-    const resConcD = await users.POST(request("/api/admin/users", "POST", { email: concAdminDEmail, password: adminPassword, role: "ADMIN" }, adminCookie));
-    assertStatus(resConcD, 201, "Create ConcAdmin D");
-    const concAdminDId = (await json(resConcD)).data.id;
+      // 1. Create Race Admin A and Race Admin B
+      const raceA = await prisma.user.create({
+        data: { email: emailA, passwordHash: hashA, role: "ADMIN", active: true },
+      });
+      const raceB = await prisma.user.create({
+        data: { email: emailB, passwordHash: hashB, role: "ADMIN", active: true },
+      });
 
-    const [demoteC, disableD] = await Promise.all([
-      users.PATCH(request("/api/admin/users", "PATCH", { id: concAdminCId, role: "VIEWER" }, adminCookie)),
-      users.PATCH(request("/api/admin/users", "PATCH", { id: concAdminDId, active: false }, adminCookie)),
-    ]);
-    const activeAdminCountAfterMutations = await prisma.user.count({ where: { role: "ADMIN", active: true } });
-    assert.ok(activeAdminCountAfterMutations >= 1, `Expected >=1 active admin after concurrent mutations, got ${activeAdminCountAfterMutations}`);
+      // 2. Remove or demote ALL other active admins so that ONLY raceA and raceB are active in the entire DB
+      const otherAdmins = await prisma.user.findMany({
+        where: {
+          role: "ADMIN",
+          active: true,
+          id: { notIn: [raceA.id, raceB.id] },
+        },
+      });
+      for (const other of otherAdmins) {
+        await prisma.userSession.deleteMany({ where: { userId: other.id } });
+        await prisma.user.delete({ where: { id: other.id } });
+      }
+
+      // 3. ASSERT: The entire database now contains EXACTLY TWO active ADMIN users!
+      const activeAdminsBefore = await prisma.user.findMany({
+        where: { role: "ADMIN", active: true },
+      });
+      assert.equal(
+        activeAdminsBefore.length,
+        2,
+        `Iteration ${iter}: Active ADMIN count must be EXACTLY 2 before race. Found: ${activeAdminsBefore.length}`
+      );
+      assert.equal(
+        activeAdminsBefore.map((u) => u.id).sort().join(","),
+        [raceA.id, raceB.id].sort().join(","),
+        `Iteration ${iter}: The only 2 active admins must be race participants A and B`
+      );
+
+      // 4. Authenticate both race participants with independent authenticated sessions
+      const loginA = await loginAs(emailA, passA);
+      assertStatus(loginA.res, 200, `Iteration ${iter}: Admin A login`);
+      const cookieA = loginA.cookie;
+      assert.ok(cookieA, `Iteration ${iter}: Admin A cookie`);
+
+      const loginB = await loginAs(emailB, passB);
+      assertStatus(loginB.res, 200, `Iteration ${iter}: Admin B login`);
+      const cookieB = loginB.cookie;
+      assert.ok(cookieB, `Iteration ${iter}: Admin B cookie`);
+
+      // Verify both authenticated sessions work
+      assert.equal((await json(await me(request("/api/auth/me", "GET", undefined, cookieA)))).data.role, "ADMIN");
+      assert.equal((await json(await me(request("/api/auth/me", "GET", undefined, cookieB)))).data.role, "ADMIN");
+
+      // 5. LAUNCH THE PRIMARY RACE:
+      // Request A: Admin A attempts to DELETE Admin B
+      // Request B: Admin B attempts to DELETE Admin A
+      // Both requests are launched concurrently via Promise.all
+      const [resDelA, resDelB] = await Promise.all([
+        users.DELETE(request(`/api/admin/users?id=${raceB.id}`, "DELETE", undefined, cookieA)),
+        users.DELETE(request(`/api/admin/users?id=${raceA.id}`, "DELETE", undefined, cookieB)),
+      ]);
+
+      const aWon = resDelA.status === 200;
+      const bWon = resDelB.status === 200;
+
+      // Invariant 1: Exactly ONE succeeds. Under NO circumstances may both succeed!
+      assert.notEqual(
+        aWon && bWon,
+        true,
+        `Iteration ${iter}: CRITICAL REGRESSION: Both concurrent DELETE requests succeeded! Active admin count dropped to zero!`
+      );
+      assert.equal(
+        (aWon && !bWon) || (!aWon && bWon),
+        true,
+        `Iteration ${iter}: Exactly one DELETE must succeed. A result: ${resDelA.status}, B result: ${resDelB.status}`
+      );
+
+      // Verify the losing request was properly rejected
+      const losingRes = aWon ? resDelB : resDelA;
+      assert.ok(
+        losingRes.status === 400 || losingRes.status === 401,
+        `Iteration ${iter}: Losing request must be rejected with 400 (LAST_ADMIN_PROTECTION) or 401 (cascaded session). Got ${losingRes.status}`
+      );
+      if (losingRes.status === 400) {
+        const losingBody = await json(losingRes);
+        assert.equal(
+          losingBody.error?.code,
+          "LAST_ADMIN_PROTECTION",
+          `Iteration ${iter}: Expected error code LAST_ADMIN_PROTECTION, got ${losingBody.error?.code}`
+        );
+      }
+
+      // Invariant 2: Exactly ONE active ADMIN remains in the database. Active admin count >= 1 invariant holds!
+      const activeAdminsAfter = await prisma.user.findMany({
+        where: { role: "ADMIN", active: true },
+      });
+      assert.equal(
+        activeAdminsAfter.length,
+        1,
+        `Iteration ${iter}: CRITICAL INVARIANT: Exactly 1 active admin must remain in DB! Found: ${activeAdminsAfter.length}`
+      );
+
+      const survivingAdmin = activeAdminsAfter[0];
+      const expectedSurvivingId = aWon ? raceA.id : raceB.id;
+      assert.equal(survivingAdmin.id, expectedSurvivingId, `Iteration ${iter}: Surviving admin must match winning requester`);
+      assert.equal(survivingAdmin.active, true);
+      assert.equal(survivingAdmin.role, "ADMIN");
+
+      // Invariant 3: The surviving admin remains usable
+      const survivingCookie = aWon ? cookieA : cookieB;
+      const survivingMe = await me(request("/api/auth/me", "GET", undefined, survivingCookie));
+      assertStatus(survivingMe, 200, `Iteration ${iter}: Surviving admin session must remain valid`);
+
+      // Invariant 4: The deleted admin is completely removed and has no platform access
+      const deletedAdminId = aWon ? raceB.id : raceA.id;
+      const deletedRecord = await prisma.user.findUnique({ where: { id: deletedAdminId } });
+      assert.equal(deletedRecord, null, `Iteration ${iter}: Deleted admin row must not exist in DB`);
+      const deletedSessions = await prisma.userSession.count({ where: { userId: deletedAdminId } });
+      assert.equal(deletedSessions, 0, `Iteration ${iter}: Deleted admin sessions must be cascaded`);
+      const deletedCookie = aWon ? cookieB : cookieA;
+      const deletedMe = await me(request("/api/auth/me", "GET", undefined, deletedCookie));
+      assertStatus(deletedMe, 401, `Iteration ${iter}: Deleted admin cannot authenticate with previous session`);
+
+      console.log(`   Iteration ${iter}: PASS (Winner: ${aWon ? "Admin A" : "Admin B"}, Loser rejected with ${losingRes.status}, Surviving admins in DB: 1)`);
+    }
+
+    // Optional Secondary Race: Demote vs Disable with EXACTLY TWO active admins
+    console.log("   Testing secondary concurrent race: Demote-vs-Disable with exactly 2 active admins...");
+    {
+      const secRunId = crypto.randomBytes(4).toString("hex");
+      const emailC = `rbac-race-${secRunId}-c@example.test`;
+      const emailD = `rbac-race-${secRunId}-d@example.test`;
+      const passC = `RacePassC!${crypto.randomBytes(8).toString("hex")}`;
+      const passD = `RacePassD!${crypto.randomBytes(8).toString("hex")}`;
+      const hashC = await hashPasswordForStorage(passC);
+      const hashD = await hashPasswordForStorage(passD);
+
+      const raceC = await prisma.user.create({
+        data: { email: emailC, passwordHash: hashC, role: "ADMIN", active: true },
+      });
+      const raceD = await prisma.user.create({
+        data: { email: emailD, passwordHash: hashD, role: "ADMIN", active: true },
+      });
+
+      // Clear any other active admins
+      const otherAdmins = await prisma.user.findMany({
+        where: { role: "ADMIN", active: true, id: { notIn: [raceC.id, raceD.id] } },
+      });
+      for (const other of otherAdmins) {
+        await prisma.userSession.deleteMany({ where: { userId: other.id } });
+        await prisma.user.delete({ where: { id: other.id } });
+      }
+
+      const activeBeforeMutations = await prisma.user.findMany({ where: { role: "ADMIN", active: true } });
+      assert.equal(activeBeforeMutations.length, 2, "Must start secondary race with exactly 2 active admins");
+
+      const loginC = await loginAs(emailC, passC);
+      const cookieC = loginC.cookie;
+      const loginD = await loginAs(emailD, passD);
+      const cookieD = loginD.cookie;
+
+      // Admin C attempts to DEMOTE Admin D to VIEWER
+      // Admin D attempts to DISABLE Admin C (active: false)
+      const [resPatchC, resPatchD] = await Promise.all([
+        users.PATCH(request("/api/admin/users", "PATCH", { id: raceD.id, role: "VIEWER" }, cookieC)),
+        users.PATCH(request("/api/admin/users", "PATCH", { id: raceC.id, active: false }, cookieD)),
+      ]);
+
+      const cWon = resPatchC.status === 200;
+      const dWon = resPatchD.status === 200;
+
+      assert.notEqual(cWon && dWon, true, "CRITICAL REGRESSION: Both concurrent mutations succeeded! Active admin count dropped to zero!");
+      assert.equal((cWon && !dWon) || (!cWon && dWon), true, `Exactly one mutation must succeed. C: ${resPatchC.status}, D: ${resPatchD.status}`);
+
+      const losingPatchRes = cWon ? resPatchD : resPatchC;
+      assert.equal(losingPatchRes.status, 400, `Losing mutation must return 400, got ${losingPatchRes.status}`);
+      const losingPatchBody = await json(losingPatchRes);
+      assert.equal(losingPatchBody.error?.code, "LAST_ADMIN_PROTECTION", `Expected LAST_ADMIN_PROTECTION code`);
+
+      const activeAdminsAfterMutations = await prisma.user.count({ where: { role: "ADMIN", active: true } });
+      assert.equal(activeAdminsAfterMutations, 1, `CRITICAL INVARIANT: Exactly 1 active admin must remain in DB! Found: ${activeAdminsAfterMutations}`);
+
+      console.log(`   Secondary race: PASS (Winner: ${cWon ? "Admin C demoted D" : "Admin D disabled C"}, Loser rejected with 400 LAST_ADMIN_PROTECTION, Surviving admins in DB: 1)`);
+    }
+
+    // Recreate the standard test admin so subsequent phases (logout, rate-limit) operate normally
+    const restoredAdmin = await prisma.user.create({
+      data: { email: adminEmail, passwordHash: await hashPasswordForStorage(adminPassword), role: "ADMIN", active: true },
+    });
+    adminId = restoredAdmin.id;
+    const restoredLogin = await loginAs(adminEmail, adminPassword);
+    assertStatus(restoredLogin.res, 200, "Restore test admin login");
+    adminCookie = restoredLogin.cookie;
+
 
     console.log("19. Logout invalidates session");
     const logoutRes = await logout(request("/api/auth/logout", "POST", undefined, adminCookie));

@@ -1,8 +1,10 @@
 import { PrismaClient } from "@prisma/client";
+import { assertDestructiveTestAllowed } from "./test-db-guard";
 
 const prisma = new PrismaClient();
 
 async function clean() {
+  assertDestructiveTestAllowed("clean-database");
   if (process.env.NODE_ENV === "production" || process.env.ALLOW_DATABASE_CLEAN !== "true") {
     console.error("❌ FATAL: clean-database is locked. Running clean-database against production or without ALLOW_DATABASE_CLEAN=true is strictly forbidden.");
     process.exit(1);

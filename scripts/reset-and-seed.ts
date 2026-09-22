@@ -1,7 +1,9 @@
 import { prisma } from "../src/lib/prisma";
 import { generateApiKey } from "../src/lib/crypto";
+import { assertDestructiveTestAllowed } from "./test-db-guard";
 
 async function resetAndSeed() {
+  assertDestructiveTestAllowed("reset-and-seed");
   if (process.env.NODE_ENV === "production" || process.env.ALLOW_DATABASE_RESET !== "true") {
     console.error("❌ FATAL: reset-and-seed is locked. Running reset-and-seed against production or without ALLOW_DATABASE_RESET=true is strictly forbidden.");
     process.exit(1);

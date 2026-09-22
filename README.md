@@ -230,10 +230,21 @@ Response:
 
 ## 🧪 Automated Testing & Verification
 
-Run the test suite verifying crypto operations, template parameters mapping, rate limiters, authentication & session security, and Zod validators:
+Run the test suite verifying crypto operations, template parameters mapping, rate limiters, authentication & session security, Zod validators, and destructive-test safety guard logic:
 
 ```bash
 npm test
+```
+
+### Safety Gate & Destructive Test Policy
+Destructive test suites (including RBAC integration, phase-1 security, and phase-2 reliability) enforce a **deny-by-default safety gate** (`scripts/test-db-guard.ts`):
+- **Unconditional Production Block**: Target databases matching the production Supabase project (`peqynzeioiauynfpdsdv`) are permanently blocked. No flag (`ALLOW_DESTRUCTIVE_TESTS=true`, `CI=true`, etc.) can override this.
+- **Local Disposable Databases**: Destructive suites require an isolated local target (`localhost`, `127.0.0.1`, `::1`, `host.docker.internal`, or CI container `postgres`) with explicit confirmation: `ALLOW_DESTRUCTIVE_TESTS=true`.
+- **RBAC Concurrency & Two-Admin Race**: `npm run test:rbac` verifies the Last-Admin invariant (`active ADMIN count >= 1`) by launching concurrent mutual deletion requests between exactly two active administrators (`Admin A deletes B` vs `Admin B deletes A`), proving that exactly one survives and active admin count never drops to zero.
+
+To run the dedicated safety guard test suite:
+```bash
+npm run test:guard
 ```
 
 To run a production build check:
