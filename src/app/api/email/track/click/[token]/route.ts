@@ -52,13 +52,15 @@ export async function GET(req: NextRequest, { params }: RouteParams) {
   const ip = req.headers.get("x-forwarded-for") || req.headers.get("x-real-ip") || undefined;
   const userAgent = req.headers.get("user-agent") || undefined;
 
-  EmailTrackingService.recordClick(
-    verification.deliveryId,
-    verification.targetUrl,
-    { ip, userAgent }
-  ).catch(() => {
-    // Non-fatal
-  });
+  try {
+    await EmailTrackingService.recordClick(
+      verification.deliveryId,
+      verification.targetUrl,
+      { ip, userAgent }
+    );
+  } catch {
+    // Non-fatal, proceed with redirect
+  }
 
   // 4. Safe 302 Redirect to authenticated destination URL
   return NextResponse.redirect(verification.targetUrl, 302);

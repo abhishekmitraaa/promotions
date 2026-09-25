@@ -30,9 +30,10 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
     return NextResponse.json({ success: true, data: result });
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Failed to initiate campaign send";
-    const status = msg.includes("not found") ? 404 : 400;
+    const status = msg.includes("not found") ? 404 : (msg.includes("Failed to enqueue") ? 500 : 400);
+    const code = status === 404 ? "NOT_FOUND" : (status === 500 ? "QUEUE_ERROR" : "BAD_REQUEST");
     return NextResponse.json(
-      { success: false, error: { code: status === 404 ? "NOT_FOUND" : "BAD_REQUEST", message: msg } },
+      { success: false, error: { code, message: msg } },
       { status }
     );
   }

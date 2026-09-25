@@ -324,9 +324,14 @@ async function runPhase8Tests() {
   // 5. Rate Limiting Protection
   // -------------------------------------------------------------------------
   console.log("\n--- [5] Rate Limiting Protection ---");
-  const rlResult = await checkRateLimit("test_rate_limit_key", 5, 60000);
+  const testRateLimitKey = `test_rate_limit_p8_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+  const rlResult = await checkRateLimit(testRateLimitKey, 5, 60000);
   testAssert(rlResult.success === true, "Initial request passes rate limiter");
   testAssert(rlResult.remaining === 4, "Remaining counter decremented accurately");
+
+  const rlResult2 = await checkRateLimit(testRateLimitKey, 5, 60000);
+  testAssert(rlResult2.success === true, "Second request passes rate limiter");
+  testAssert(rlResult2.remaining === 3, "Remaining counter decremented accurately to 3");
 
   // -------------------------------------------------------------------------
   // 6. Audit Logging & Credential Redaction

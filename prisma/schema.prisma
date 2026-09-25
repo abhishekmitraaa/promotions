@@ -349,6 +349,13 @@ enum EmailSuppressionReason {
   INVALID
 }
 
+enum EmailEventProcessingStatus {
+  RECEIVED
+  PROCESSING
+  PROCESSED
+  FAILED
+}
+
 // ==============================================================================
 // Email Platform Models
 // ==============================================================================
@@ -372,6 +379,7 @@ model EmailProviderConfig {
 
   client                     ApiClient           @relation(fields: [clientId], references: [id], onDelete: Cascade)
   senderIdentities           EmailSenderIdentity[]
+  events                     EmailEvent[]
 
   @@index([clientId])
   @@index([providerType])
@@ -616,21 +624,32 @@ model EmailDelivery {
 }
 
 model EmailEvent {
-  id              String         @id @default(uuid())
-  clientId        String?
-  deliveryId      String?
-  providerEventId String?        @unique
-  eventType       EmailEventType
-  recipient       String
-  payload         String
-  occurredAt      DateTime       @default(now())
-  createdAt       DateTime       @default(now())
+  id               String                      @id @default(uuid())
+  clientId         String?
+  deliveryId       String?
+  providerConfigId String?
+  providerEventId  String?
+  eventType        EmailEventType
+  status           EmailEventProcessingStatus  @default(RECEIVED)
+  recipient        String
+  payload          String
+  attempts         Int                         @default(0)
+  lastAttemptAt    DateTime?
+  processedAt      DateTime?
+  errorMessage     String?
+  errorCode        String?
+  occurredAt       DateTime                    @default(now())
+  createdAt        DateTime                    @default(now())
 
-  client          ApiClient?     @relation(fields: [clientId], references: [id], onDelete: Cascade)
-  delivery        EmailDelivery? @relation(fields: [deliveryId], references: [id], onDelete: SetNull)
+  client           ApiClient?                  @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  delivery         EmailDelivery?              @relation(fields: [deliveryId], references: [id], onDelete: SetNull)
+  providerConfig   EmailProviderConfig?        @relation(fields: [providerConfigId], references: [id], onDelete: SetNull)
 
+  @@unique([providerConfigId, providerEventId])
   @@index([clientId])
   @@index([deliveryId])
+  @@index([providerConfigId])
+  @@index([status])
   @@index([eventType])
   @@index([providerEventId])
   @@index([occurredAt])

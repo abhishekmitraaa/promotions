@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, Suspense } from "react";
+import { useSearchParams } from "next/navigation";
 
 interface ProviderConfig {
   id: string;
@@ -14,9 +15,18 @@ interface ProviderConfig {
   createdAt: string;
 }
 
-export default function ProviderSettingsPage() {
+interface BannerNotice {
+  type: "success" | "error";
+  title: string;
+  message: string;
+}
+
+function ProviderSettingsContent() {
+  const searchParams = useSearchParams();
   const [providers, setProviders] = useState<ProviderConfig[]>([]);
   const [loading, setLoading] = useState(true);
+  const [connecting, setConnecting] = useState(false);
+  const [banner, setBanner] = useState<BannerNotice | null>(null);
 
   async function loadProviders() {
     try {
@@ -34,12 +44,65 @@ export default function ProviderSettingsPage() {
 
   useEffect(() => {
     loadProviders();
-  }, []);
 
-  function handleConnectGmail() {
-    // Redirect to Google OAuth authorization endpoint
-    // eslint-disable-next-line @next/next/no-location-assign-relative-destination
-    window.location.href = "/api/admin/email/providers/google/oauth";
+    // Check for callback query parameters from Google OAuth redirect
+    const status = searchParams.get("status");
+    const providerParam = searchParams.get("provider");
+    const messageParam = searchParams.get("message");
+
+    if (status === "success") {
+      setBanner({
+        type: "success",
+        title: "Google Workspace Connected",
+        message: providerParam
+          ? `Successfully authenticated and configured sender identity for ${providerParam}.`
+          : "Successfully authenticated and configured Google Workspace provider.",
+      });
+      // Re-fetch to immediately display newly connected provider in table
+      loadProviders();
+    } else if (status === "error") {
+      setBanner({
+        type: "error",
+        title: "OAuth Connection Failed",
+        message: messageParam || "Failed to complete Google Workspace authorization. Please try again.",
+      });
+    }
+  }, [searchParams]);
+
+  function handleDismissBanner() {
+    setBanner(null);
+    if (typeof window !== "undefined") {
+      window.history.replaceState({}, "", "/dashboard/email/providers");
+    }
+  }
+
+  async function handleConnectGmail() {
+    try {
+      setConnecting(true);
+      const res = await fetch("/api/admin/email/providers/google/oauth", {
+        headers: { Accept: "application/json" },
+      });
+      const json = await res.json();
+
+      if (res.ok && json.data?.authUrl) {
+        // Redirect browser to Google's consent screen
+        window.location.href = json.data.authUrl;
+      } else {
+        setBanner({
+          type: "error",
+          title: "Connection Failed",
+          message: json.error || "Unable to initiate Google OAuth. Check your GMAIL_CLIENT_ID configuration.",
+        });
+        setConnecting(false);
+      }
+    } catch {
+      setBanner({
+        type: "error",
+        title: "Network Error",
+        message: "Failed to connect to the authorization server.",
+      });
+      setConnecting(false);
+    }
   }
 
   return (
@@ -50,6 +113,32 @@ export default function ProviderSettingsPage() {
           Connect and configure Google Workspace / Gmail OAuth providers. Credentials and tokens are securely encrypted at rest and never exposed.
         </p>
       </div>
+
+      {/* OAuth Callback Notification Banner */}
+      {banner && (
+        <div
+          className={`p-4 rounded-xl border flex items-start justify-between gap-3 ${
+            banner.type === "success"
+              ? "bg-emerald-950/40 border-emerald-800/80 text-emerald-200"
+              : "bg-rose-950/40 border-rose-800/80 text-rose-200"
+          }`}
+        >
+          <div className="flex items-start gap-3">
+            <span className="text-xl shrink-0">{banner.type === "success" ? "✅" : "⚠️"}</span>
+            <div>
+              <h4 className="font-semibold text-sm">{banner.title}</h4>
+              <p className="text-xs opacity-90 mt-0.5">{banner.message}</p>
+            </div>
+          </div>
+          <button
+            onClick={handleDismissBanner}
+            className="text-xs opacity-60 hover:opacity-100 transition px-2 py-1 rounded"
+            aria-label="Dismiss notice"
+          >
+            ✕
+          </button>
+        </div>
+      )}
 
       {/* Gmail OAuth Connect Card */}
       <div className="bg-zinc-900/60 border border-zinc-800 rounded-xl p-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
@@ -64,9 +153,19 @@ export default function ProviderSettingsPage() {
         </div>
         <button
           onClick={handleConnectGmail}
-          className="px-4 py-2.5 bg-white hover:bg-zinc-100 text-zinc-950 font-medium rounded-lg text-sm transition flex items-center justify-center gap-2 shrink-0 shadow-sm"
+          disabled={connecting}
+          className="px-4 py-2.5 bg-white hover:bg-zinc-100 disabled:opacity-50 text-zinc-950 font-medium rounded-lg text-sm transition flex items-center justify-center gap-2 shrink-0 shadow-sm"
         >
-          <span>Connect Google Workspace</span> &rarr;
+          {connecting ? (
+            <>
+              <div className="w-4 h-4 border-2 border-zinc-950 border-t-transparent rounded-full animate-spin"></div>
+              <span>Connecting...</span>
+            </>
+          ) : (
+            <>
+              <span>Connect Google Workspace</span> &rarr;
+            </>
+          )}
         </button>
       </div>
 
@@ -130,5 +229,19 @@ export default function ProviderSettingsPage() {
         )}
       </div>
     </div>
+  );
+}
+
+export default function ProviderSettingsPage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="flex items-center justify-center min-h-[300px]">
+          <div className="w-8 h-8 border-2 border-sky-500 border-t-transparent rounded-full animate-spin"></div>
+        </div>
+      }
+    >
+      <ProviderSettingsContent />
+    </Suspense>
   );
 }

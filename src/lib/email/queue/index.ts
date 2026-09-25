@@ -3,4 +3,8 @@ export * from "./types";
 export * from "./queues";
 export * from "./producer";
 export * from "./worker";
+export * from "./campaign-worker";
+export * from "./campaign-trigger-worker";
+export * from "./event-worker";
+export * from "./promotional-delivery-worker";
 export * from "./health";

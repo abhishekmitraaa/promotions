@@ -12,6 +12,7 @@ export type EmailQueueName = (typeof QUEUE_NAMES)[keyof typeof QUEUE_NAMES];
 
 export const JOB_NAMES = {
   SEND_TRANSACTIONAL: "send-transactional",
+  SEND_PROMOTIONAL: "send-promotional",
   SEND_CAMPAIGN_RECIPIENT: "send-campaign-recipient",
   TRIGGER_SCHEDULED_CAMPAIGN: "trigger-scheduled-campaign",
   PROCESS_EMAIL_EVENT: "process-email-event",
@@ -31,6 +32,17 @@ export interface TransactionalJobData {
 }
 
 /**
+ * Single-Recipient Promotional Job Payload
+ * Carries authoritative database EmailDelivery ID for dedicated promotional sends.
+ */
+export interface PromotionalJobData {
+  deliveryId: string;
+  clientId: string;
+  category: "PROMOTIONAL";
+  attempt?: number;
+}
+
+/**
  * Campaign Recipient / Trigger Job Payload
  */
 export interface CampaignJobData {
@@ -42,13 +54,17 @@ export interface CampaignJobData {
 
 /**
  * Email Event Job Payload
+ * Carries authoritative database EmailEvent ID for durable processing.
  */
 export interface EmailEventJobData {
-  eventId: string;
+  eventRecordId: string;
+  eventId?: string;
+  providerEventId?: string;
   clientId?: string;
-  eventType: string;
-  providerType: string;
+  eventType?: string;
+  providerType?: string;
   providerMessageId?: string;
+  deliveryId?: string;
 }
 
 /**
@@ -60,6 +76,16 @@ export function getTransactionalJobId(deliveryId: string): string {
     throw new Error("deliveryId is required to generate transactional job ID");
   }
   return `email-transactional-${deliveryId.trim()}`;
+}
+
+/**
+ * Generates stable business-level idempotency Job ID for single promotional emails.
+ */
+export function getPromotionalJobId(deliveryId: string): string {
+  if (!deliveryId || typeof deliveryId !== "string") {
+    throw new Error("deliveryId is required to generate promotional job ID");
+  }
+  return `email-promotional-${deliveryId.trim()}`;
 }
 
 /**

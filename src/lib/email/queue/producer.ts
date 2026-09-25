@@ -174,21 +174,38 @@ export async function queueTransactionalEmail(
     // Graceful fallback in environments where EmailDelivery is not yet migrated
   }
 
-  // 5. Enqueue Job with Deterministic Custom Job ID
+  // 5. Enqueue Job with Deterministic Custom Job ID (Honest Queue Failure Contract)
   const jobId = getTransactionalJobId(deliveryRecordId);
   const queue = getTransactionalQueue();
 
-  await queue.add(
-    JOB_NAMES.SEND_TRANSACTIONAL,
-    {
-      deliveryId: deliveryRecordId,
-      clientId: input.clientId,
-      category: "TRANSACTIONAL",
-    },
-    {
-      jobId, // Custom Job ID prevents duplicate jobs in BullMQ
+  try {
+    await queue.add(
+      JOB_NAMES.SEND_TRANSACTIONAL,
+      {
+        deliveryId: deliveryRecordId,
+        clientId: input.clientId,
+        category: "TRANSACTIONAL",
+      },
+      {
+        jobId, // Custom Job ID prevents duplicate jobs in BullMQ
+      }
+    );
+  } catch (err: unknown) {
+    try {
+      await prisma.emailDelivery.updateMany({
+        where: { id: deliveryRecordId },
+        data: {
+          status: EmailDeliveryStatus.FAILED,
+          errorCode: "QUEUE_ENQUEUE_FAILED",
+          errorMessage: err instanceof Error ? err.message : "Failed to enqueue email dispatch job",
+          failedAt: new Date(),
+        },
+      });
+    } catch {
+      // Non-fatal if DB update fails
     }
-  );
+    throw err;
+  }
 
   return {
     queued: true,

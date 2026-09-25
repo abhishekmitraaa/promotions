@@ -82,6 +82,14 @@ export class EmailAnalyticsService {
     let totalClicks = 0;
 
     for (const recipient of campaign.recipients) {
+      let recipientSent = false;
+      let recipientDelivered = false;
+      let recipientFailed = false;
+      let recipientBounced = false;
+      let recipientComplained = false;
+      let recipientOpened = false;
+      let recipientClicked = false;
+
       for (const delivery of recipient.deliveries) {
         if (
           delivery.status === EmailDeliveryStatus.SENT ||
@@ -90,35 +98,43 @@ export class EmailAnalyticsService {
           delivery.status === EmailDeliveryStatus.COMPLAINED ||
           delivery.status === EmailDeliveryStatus.FAILED
         ) {
-          sent++;
+          recipientSent = true;
         }
 
         if (delivery.status === EmailDeliveryStatus.DELIVERED) {
-          delivered++;
+          recipientDelivered = true;
         } else if (delivery.status === EmailDeliveryStatus.FAILED) {
-          failed++;
+          recipientFailed = true;
         } else if (delivery.status === EmailDeliveryStatus.BOUNCED) {
-          bounced++;
+          recipientBounced = true;
         } else if (delivery.status === EmailDeliveryStatus.COMPLAINED) {
-          complaints++;
+          recipientComplained = true;
         }
-
-        let deliveryOpened = false;
-        let deliveryClicked = false;
 
         for (const evt of delivery.events) {
           if (evt.eventType === EmailEventType.OPENED) {
             totalOpens++;
-            deliveryOpened = true;
+            recipientOpened = true;
           } else if (evt.eventType === EmailEventType.CLICKED) {
             totalClicks++;
-            deliveryClicked = true;
+            recipientClicked = true;
           }
         }
-
-        if (deliveryOpened) uniqueOpens++;
-        if (deliveryClicked) uniqueClicks++;
       }
+
+      // Authoritative consistency: Opens/clicks imply delivery
+      if (recipientOpened || recipientClicked) {
+        recipientDelivered = true;
+      }
+
+      if (recipientSent) sent++;
+      if (recipientDelivered) delivered++;
+      else if (recipientBounced) bounced++;
+      else if (recipientComplained) complaints++;
+      else if (recipientFailed) failed++;
+
+      if (recipientOpened) uniqueOpens++;
+      if (recipientClicked) uniqueClicks++;
     }
 
     // Fall back to campaign counters if no deliveries exist in test/mock environment
@@ -128,6 +144,9 @@ export class EmailAnalyticsService {
       bounced = campaign.bouncedCount;
       complaints = campaign.complaintCount;
     }
+
+    // Consistency guard: delivered can never be less than uniqueOpens or uniqueClicks
+    delivered = Math.max(delivered, uniqueOpens, uniqueClicks);
 
     const unsubscribed = campaign.unsubscribedCount;
 

@@ -16,10 +16,13 @@ import { Worker, Job, UnrecoverableError } from "bullmq";
 import { prisma } from "../../prisma";
 import { EmailDelivery, EmailDeliveryStatus, EmailProviderType } from "@prisma/client";
 import { createWorkerRedisConnection } from "./connection";
-import { QUEUE_NAMES, TransactionalJobData, RetryableEmailError, isRetryableError } from "./types";
+import { QUEUE_NAMES, TransactionalJobData, PromotionalJobData, JOB_NAMES, RetryableEmailError, isRetryableError } from "./types";
 import { providerRegistry } from "../registry";
 import { EmailProvider } from "../types";
 import { logger } from "../../logger";
+import { processPromotionalDeliveryJob } from "./promotional-delivery-worker";
+
+export { processPromotionalDeliveryJob };
 
 export interface EmailWorkerOptions {
   connection?: ReturnType<typeof createWorkerRedisConnection>;
@@ -242,10 +245,15 @@ export function createEmailWorker(options?: EmailWorkerOptions): Worker {
   const connection = options?.connection || createWorkerRedisConnection();
   const concurrency = options?.concurrency || parseInt(process.env.EMAIL_WORKER_CONCURRENCY || "5", 10);
 
-  const worker = new Worker<TransactionalJobData>(
+  const worker = new Worker<TransactionalJobData | PromotionalJobData>(
     QUEUE_NAMES.TRANSACTIONAL,
     async (job) => {
-      return processTransactionalJob(job, {
+      if (job.name === JOB_NAMES.SEND_PROMOTIONAL) {
+        return processPromotionalDeliveryJob(job as Job<PromotionalJobData>, {
+          providerOverride: options?.providerOverride,
+        });
+      }
+      return processTransactionalJob(job as Job<TransactionalJobData>, {
         providerOverride: options?.providerOverride,
       });
     },

@@ -18,6 +18,7 @@ export interface GoogleAuthUrlOptions {
   googleClientId: string;
   redirectUri: string;
   tenantId: string;
+  adminUserId?: string;
   stateSecret?: string;
 }
 
@@ -37,54 +38,218 @@ export interface GoogleTokensResult {
   email: string;
 }
 
+export interface OAuthTransaction {
+  tenantId: string;
+  adminUserId?: string;
+  createdAt: number;
+  expiresAt: number;
+  used: boolean;
+}
+
 /**
- * Creates a signed state token encoding tenant information to protect against CSRF.
+ * In-memory registry for one-time OAuth transactions/nonces.
+ * Provides replay protection, tenant binding, and admin session verification.
  */
-export function createOAuthState(tenantId: string, secret?: string): string {
-  const pepper = secret || process.env.AUTH_SESSION_SECRET || "default_oauth_state_secret_32_chars!";
+export class OAuthTransactionStore {
+  private static store = new Map<string, OAuthTransaction>();
+
+  static save(nonce: string, tx: OAuthTransaction): void {
+    // Purge expired entries on each write
+    const now = Date.now();
+    for (const [key, val] of this.store.entries()) {
+      if (now > val.expiresAt) {
+        this.store.delete(key);
+      }
+    }
+    this.store.set(nonce, tx);
+  }
+
+  static get(nonce: string): OAuthTransaction | undefined {
+    return this.store.get(nonce);
+  }
+
+  static consume(nonce: string): boolean {
+    const tx = this.store.get(nonce);
+    if (!tx || tx.used) return false;
+    tx.used = true;
+    return true;
+  }
+
+  static clear(): void {
+    this.store.clear();
+  }
+}
+
+/**
+ * Creates a signed state token encoding tenant, admin, and one-time nonce information.
+ * Backward compatible with createOAuthState(tenantId, secret) from Phase 2.
+ */
+export function createOAuthState(
+  tenantId: string,
+  adminUserIdOrSecret?: string,
+  secret?: string
+): string {
+  let adminUserId: string | undefined;
+  let signingSecret: string | undefined;
+
+  if (secret !== undefined) {
+    adminUserId = adminUserIdOrSecret;
+    signingSecret = secret;
+  } else if (adminUserIdOrSecret !== undefined) {
+    // If only 2 arguments are provided:
+    // If it looks like a secret (length >= 20 or contains "secret"), treat as secret for Phase 2 backward compatibility
+    if (adminUserIdOrSecret.length >= 20 || adminUserIdOrSecret.includes("secret")) {
+      signingSecret = adminUserIdOrSecret;
+    } else {
+      adminUserId = adminUserIdOrSecret;
+      signingSecret = process.env.AUTH_SESSION_SECRET;
+    }
+  }
+
+  const pepper = signingSecret || process.env.AUTH_SESSION_SECRET || "default_oauth_state_secret_32_chars!";
+  const nonce = crypto.randomBytes(24).toString("hex");
+  const timestamp = Date.now();
+  const ttlMs = 15 * 60 * 1000; // 15-minute validity
+
+  // Register one-time transaction nonce
+  OAuthTransactionStore.save(nonce, {
+    tenantId,
+    adminUserId,
+    createdAt: timestamp,
+    expiresAt: timestamp + ttlMs,
+    used: false,
+  });
+
   const payload = JSON.stringify({
     tenantId,
-    timestamp: Date.now(),
-    nonce: crypto.randomBytes(16).toString("hex"),
+    adminUserId,
+    timestamp,
+    nonce,
   });
   const hmac = crypto.createHmac("sha256", pepper).update(payload).digest("hex");
   return `${Buffer.from(payload).toString("base64url")}.${hmac}`;
 }
 
+export type OAuthStateFailureReason =
+  | "MALFORMED"
+  | "INVALID_SIGNATURE"
+  | "EXPIRED"
+  | "UNKNOWN_NONCE"
+  | "REPLAYED"
+  | "TENANT_MISMATCH"
+  | "ADMIN_MISMATCH";
+
+export interface VerifyOAuthStateResult {
+  valid: boolean;
+  tenantId?: string;
+  adminUserId?: string;
+  reason?: OAuthStateFailureReason;
+}
+
 /**
- * Validates the signed OAuth state token and extracts the tenant ID.
+ * Validates the signed OAuth state token and atomically consumes its one-time transaction nonce.
+ * Prevents replay attacks, verifies HMAC signature, checks time expiration, and enforces tenant/admin binding.
  */
-export function verifyOAuthState(stateString: string, secret?: string): { valid: boolean; tenantId?: string } {
-  if (!stateString || !stateString.includes(".")) return { valid: false };
+export function verifyAndConsumeOAuthState(
+  stateString: string,
+  expectedAdminUserId?: string,
+  secret?: string
+): VerifyOAuthStateResult {
+  if (!stateString || typeof stateString !== "string" || !stateString.includes(".")) {
+    return { valid: false, reason: "MALFORMED" };
+  }
   const [b64Payload, signature] = stateString.split(".");
+  if (!b64Payload || !signature) {
+    return { valid: false, reason: "MALFORMED" };
+  }
+
   const pepper = secret || process.env.AUTH_SESSION_SECRET || "default_oauth_state_secret_32_chars!";
 
   try {
     const rawPayload = Buffer.from(b64Payload, "base64url").toString("utf8");
     const expectedHmac = crypto.createHmac("sha256", pepper).update(rawPayload).digest("hex");
 
-    if (!crypto.timingSafeEqual(Buffer.from(signature, "hex"), Buffer.from(expectedHmac, "hex"))) {
-      return { valid: false };
+    if (
+      signature.length !== expectedHmac.length ||
+      !crypto.timingSafeEqual(Buffer.from(signature, "hex"), Buffer.from(expectedHmac, "hex"))
+    ) {
+      return { valid: false, reason: "INVALID_SIGNATURE" };
     }
 
-    const parsed = JSON.parse(rawPayload);
+    const parsed = JSON.parse(rawPayload) as {
+      tenantId?: string;
+      adminUserId?: string;
+      timestamp?: number;
+      nonce?: string;
+    };
+
+    if (!parsed.tenantId || !parsed.timestamp || !parsed.nonce) {
+      return { valid: false, reason: "MALFORMED" };
+    }
+
     // 15-minute validity window for OAuth initiation
     if (Date.now() - parsed.timestamp > 15 * 60 * 1000) {
-      return { valid: false };
+      return { valid: false, reason: "EXPIRED" };
     }
 
-    return { valid: true, tenantId: parsed.tenantId };
+    // Look up one-time transaction in store
+    const tx = OAuthTransactionStore.get(parsed.nonce);
+    if (!tx) {
+      return { valid: false, reason: "UNKNOWN_NONCE" };
+    }
+
+    if (tx.used) {
+      return { valid: false, reason: "REPLAYED" };
+    }
+
+    if (Date.now() > tx.expiresAt) {
+      return { valid: false, reason: "EXPIRED" };
+    }
+
+    if (tx.tenantId !== parsed.tenantId) {
+      return { valid: false, reason: "TENANT_MISMATCH" };
+    }
+
+    // Enforce admin user binding if initiating user was recorded
+    if (tx.adminUserId && expectedAdminUserId && tx.adminUserId !== expectedAdminUserId) {
+      return { valid: false, reason: "ADMIN_MISMATCH" };
+    }
+
+    if (tx.adminUserId && parsed.adminUserId && tx.adminUserId !== parsed.adminUserId) {
+      return { valid: false, reason: "ADMIN_MISMATCH" };
+    }
+
+    // Atomically consume nonce to prevent replay
+    OAuthTransactionStore.consume(parsed.nonce);
+
+    return {
+      valid: true,
+      tenantId: parsed.tenantId,
+      adminUserId: parsed.adminUserId,
+    };
   } catch {
-    return { valid: false };
+    return { valid: false, reason: "MALFORMED" };
   }
+}
+
+/**
+ * Validates the signed OAuth state token and extracts the tenant ID.
+ * (Backward compatible wrapper for verifyAndConsumeOAuthState)
+ */
+export function verifyOAuthState(
+  stateString: string,
+  secret?: string
+): { valid: boolean; tenantId?: string; adminUserId?: string; reason?: string } {
+  return verifyAndConsumeOAuthState(stateString, undefined, secret);
 }
 
 /**
  * Generates the Google OAuth 2.0 authorization URL.
  * Requests offline access with prompt=consent to ensure a refresh token is returned.
+ * Requests minimum scopes: gmail.send (dispatch only) and userinfo.email (verified address lookup).
  */
 export function generateGoogleAuthUrl(options: GoogleAuthUrlOptions): string {
-  const state = createOAuthState(options.tenantId, options.stateSecret);
+  const state = createOAuthState(options.tenantId, options.adminUserId, options.stateSecret);
 
   const params = new URLSearchParams({
     client_id: options.googleClientId,

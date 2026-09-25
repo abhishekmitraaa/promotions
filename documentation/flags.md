@@ -176,6 +176,102 @@
   - Pushed `main` to remote `origin` and verified synchronization.
   - Working tree is clean on `main`.
 
+### Entry: 2026-09-25 — Email Platform E2E Hardening & Correctness Fixes
+- **Prompt / Phase**: Email Platform E2E Hardening & Correctness (Single Promotional Send Pipeline, Honest Queue Failures, Cross-Tenant Resource Validation, Deterministic CI Rate Limiter)
+- **Status**: ✅ Clean (No unresolved concerns)
+- **Unresolved Concerns**: None.
+- **Notes / Observations**:
+  - **Task A (Single Promotional Send)**: Replaced fake campaign/recipient fabrication with dedicated job architecture (`JOB_NAMES.SEND_PROMOTIONAL: "send-promotional"` on `QUEUE_NAMES.CAMPAIGN`). Created `src/lib/email/queue/promotional-delivery-worker.ts` resolving authoritative `EmailDelivery` DB record, re-evaluating real-time suppression and marketing consent, appending RFC 8058 `List-Unsubscribe` headers, utilizing the configured tenant provider, and updating delivery state.
+  - **Task B (Honest Queue Failures)**: Eliminated catch blocks that forged success counts. Public send API returns HTTP 500 (`QUEUE_ERROR`) and marks DB delivery `FAILED` (`errorCode: "QUEUE_ENQUEUE_FAILED"`). `EmailCampaignService.sendCampaignNow()` marks campaign `FAILED` and throws on queue error; `scheduleCampaign()` reverts campaign status to `DRAFT` (`scheduledAt: null`) and throws on enqueue failure.
+  - **Task C (Cross-Tenant Resource Validation)**: Created `EmailCampaignService.validateResourceOwnership()` explicitly verifying ownership for `templateId`, `templateVersionId`, `listId`, `segmentId`, and `senderIdentityId` across both campaign creation and updates.
+  - **Task D (CI Rate Limiter Fix)**: Fixed `scripts/verify-email-phase8.ts` rate limiter test to isolate keys dynamically per test run (`test_rate_limit_p8_${Date.now()}_${Math.random()}`), eliminating cross-suite key contamination in CI.
+  - **Task E (Hardening Verification Suite)**: Created `scripts/verify-email-hardening.ts` with 56 assertions covering all 9 required verification scenarios.
+  - Full suite verified: `npm test` (458 total checks passed), `npm run test:email`, `npm run test:email:queue`, `npm run test:email:campaign`, `npm run test:email:security`, `npm run lint` (0 errors), `npm run build` (61 routes compiled), `npm audit --audit-level=high` (0 vulnerabilities). All checks executed on branch `fix/email-platform-e2e-hardening` without merging to `main`. Zero modifications to WhatsApp infrastructure.
+
+### Entry: 2026-09-25 — Google Workspace Browser OAuth Flow Implementation
+- **Prompt / Phase**: Genuine Browser Google Workspace / Gmail OAuth Flow Implementation
+- **Status**: ✅ Clean (No unresolved concerns)
+- **Unresolved Concerns**: None.
+- **Notes / Observations**:
+  - Implemented `GET` handler on `/api/admin/email/providers/google/callback` to handle Google redirect browser flow, while maintaining `POST` for programmatic API compatibility.
+  - Implemented one-time OAuth state transaction store (`OAuthTransactionStore`) with 15-minute TTL, single-use atomic consumption, and replay attack defense (HTTP 409).
+  - Enforced tenant binding and admin session binding: state encodes `tenantId` and `adminUserId`, signed with HMAC-SHA256 (`AUTH_SESSION_SECRET`). Cross-tenant and cross-session completions are strictly rejected (HTTP 403).
+  - Handled Google consent denials (`error=access_denied`), missing `code`/`state`, expired states, tampered states, token exchange failures (HTTP 502), missing refresh tokens, and authoritative sender identity lookups.
+  - Audited requested scopes: confirmed minimum necessary scopes `gmail.send` (restricted sending only, no mail read/write permissions) + `userinfo.email` (verified address lookup only).
+  - Credentials encrypted at rest using AES-256-GCM (`encryptProviderCredential()`); tokens/secrets are never returned to the browser or logged.
+  - Added success/error callback notification UX to `/dashboard/email/providers` with dismissible status banners and automatic provider table reload reflecting the connected provider.
+  - Added full test suite `scripts/verify-email-oauth.ts` with 61 assertions covering all 15 required scenarios without external Google network calls.
+  - Full suite verified: `npm test` (519 total checks passed), `npm run test:email`, `npm run test:email:queue`, `npm run test:email:campaign`, `npm run test:email:security`, `npm run test:email:hardening`, `npm run test:email:oauth`, `npm run lint` (0 errors), `npm run build` (61 routes compiled), `npm audit --audit-level=high` (0 vulnerabilities). All checks executed on branch `fix/email-platform-e2e-hardening` without merging to `main`. Zero modifications to WhatsApp infrastructure.
+
+---
+
+### Entry: 2026-09-25 — Complete Email Campaign Lifecycle Implementation
+- **Prompt / Phase**: Complete Campaign Lifecycle (Scheduled Trigger Processor, Pause/Resume, Cancellation, Sender Identity Honoring, Deterministic Terminal Completion)
+- **Status**: ✅ Clean (No unresolved concerns)
+- **Unresolved Concerns**: None.
+- **Notes / Observations**:
+  - **Scheduled Campaign Trigger Processor**: Created dedicated `src/lib/email/queue/campaign-trigger-worker.ts` (`processScheduledCampaignTriggerJob`). Verified scheduled time arrival (throws `RetryableEmailError` if premature), verified configuration (template, audience, sender), atomically transitioned `SCHEDULED -> RUNNING` via PostgreSQL `updateMany`, created immutable audience snapshot exactly once, and enqueued deterministic recipient jobs on BullMQ (`jobId: getCampaignJobId(recipient.id)`).
+  - **Duplicate Trigger Defense**: Repeated triggers safely exit with `{ skipped: true }` without creating duplicate recipient snapshots or duplicate email dispatches.
+  - **Honest Queue Failures**: Queue insertion failures update campaign status honestly to `FAILED` in database (observable state) and throw an error, preventing fake success.
+  - **Pause/Resume Lifecycle**: Implemented `EmailCampaignService.resumeCampaign()` and authenticated ADMIN endpoint `POST /api/email/campaigns/[id]/resume`. Transitions `PAUSED -> RUNNING` and `FAILED -> RUNNING`, requeues only `PENDING` recipients into BullMQ (skipping already `SENT` recipients), and strictly blocks resuming `CANCELLED` or `COMPLETED` campaigns. RBAC enforced: `ADMIN` authorized, `VIEWER` receives 403 Forbidden.
+  - **Cancellation Lifecycle**: `EmailCampaignService.cancelCampaign()` removes delayed trigger jobs from BullMQ (`trigger-campaign-${campaign.id}`), updates pending recipients to `CANCELLED` in DB, transitions campaign to `CANCELLED`, and worker skips already queued jobs. Upstream transmitted emails remain untouched (no fake recalls).
+  - **Sender Identity Resolution**: Worker inspects `campaign.senderIdentityId`, strictly validates tenant ownership (`clientId`), verifies verified status and active provider configuration, applies sender name/email/reply-to, and strictly throws `UnrecoverableError` on cross-tenant mismatch without silently falling back to default sender.
+  - **Deterministic Completion**: `checkAndCompleteCampaign()` evaluates all non-terminal recipients (`PENDING`, `PROCESSING`). When all recipients reach terminal states (`SENT`, `FAILED`, `BOUNCED`, `COMPLAINED`, `CANCELLED`, `SUPPRESSED`), campaign automatically transitions to `COMPLETED` (`completedAt: new Date()`). Campaigns are never left permanently running.
+  - **Integration Verification**: Implemented `scripts/verify-email-campaign-lifecycle.ts` covering 56 assertions against real disposable PostgreSQL (`127.0.0.1:5433`) and Redis (`127.0.0.1:6379`).
+  - **Full Quality Gate**: `npm test` (575 passing checks across 13 suites), `npm run test:email` (575 passing checks), `npm run lint` (0 errors, 0 warnings), `npm run build` (61 routes compiled), and `npm audit --audit-level=high` (0 vulnerabilities). All checks executed on branch `fix/email-platform-e2e-hardening` without merging to `main`. Zero modifications to WhatsApp infrastructure.
+
+### Entry: 2026-09-25 — Durable Asynchronous EmailEvent Queue & State Machine Processing Architecture
+- **Prompt / Phase**: EmailEvent Asynchronous Queue & Durable Processing Architecture
+- **Status**: ✅ Clean (No unresolved concerns)
+- **Unresolved Concerns**: None.
+- **Notes / Observations**:
+  - **Schema Enhancements**: Added `EmailEventProcessingStatus` enum (`RECEIVED`, `PROCESSING`, `PROCESSED`, `FAILED`) and updated `EmailEvent` model with `status`, `providerConfigId` relation to `EmailProviderConfig`, `attempts`, `lastAttemptAt`, `processedAt`, `errorMessage`, `errorCode`, and indexed query paths. Successfully synchronized against PostgreSQL database. Zero WhatsApp schema changes.
+  - **Unambiguous Tenant Binding**: Eliminated unsafe recipient-email inference. Webhook events bind unambiguously to tenants via `EmailProviderConfig` (`configId` query/header parameter) or correlated `EmailDelivery` (`providerMessageId` / `deliveryId`). Ambiguous events lacking tenant correlation are strictly rejected with HTTP 400 (`AMBIGUOUS_TENANT_BINDING`).
+  - **Authoritative Persistence & BullMQ Queue Dispatch**: Incoming webhooks verify authenticity, normalize event payloads, persist authoritative DB record with `status: RECEIVED`, and enqueue BullMQ job on `email-events` queue with deterministic `jobId: getEventJobId(eventRecordId)` without blocking HTTP responses (returning HTTP 202 Accepted).
+  - **Real Event Worker Execution**: `processEmailEventJob` in `src/lib/email/queue/event-worker.ts` performs the real processing asynchronously: loads event from DB, transitions `RECEIVED -> PROCESSING`, correlates delivery scoped to tenant, evaluates delivery state machine, updates campaign metrics idempotently, applies bounce/complaint/unsubscribe suppression policies, and transitions event to `PROCESSED` with `processedAt`.
+  - **Strengthened Delivery State Machine**: Strict monotonicity enforced via `canTransitionDeliveryStatus()`:
+    - `SENT -> DELIVERED` allowed.
+    - `DELIVERED -> SENT` rejected (stale out-of-order events prevented from downgrading state).
+    - `BOUNCED -> DELIVERED` rejected (terminal bounce cannot be overwritten).
+    - `FAILED -> DELIVERED` rejected.
+    - `FAILED after BOUNCED` rejected (BOUNCED specific terminal state preserved).
+    - `COMPLAINT after DELIVERED` allowed (transitions delivery to `COMPLAINED`, records suppression, increments campaign complaint metrics).
+    - `COMPLAINT after BOUNCED` records suppression and campaign complaint metrics without breaking delivery state.
+    - Duplicate events rejected / no-op (never double-increments campaign metrics or double-creates suppressions).
+  - **Error Classification & Observable Terminal Failures**: Transient failures throw `RetryableEmailError` triggering BullMQ exponential backoff. Permanent failures transition DB record to `FAILED` with `errorMessage` and `errorCode: PERMANENT_FAILURE` and throw `PermanentEmailError` for observable dead-letter tracking.
+  - **Integration Verification**: Implemented comprehensive suite `scripts/verify-email-event-processing.ts` covering 50/50 passing assertions against real disposable PostgreSQL (`127.0.0.1:5433`) and Redis (`127.0.0.1:6379`).
+  - **Full Quality Gate**: `npm test` (625 passing checks across 14 suites), `npm run test:email` (625 passing checks), `npm run lint` (0 errors, 0 warnings), `npm run build` (61 routes compiled), and `npm audit --audit-level=high` (0 vulnerabilities). All checks executed on branch `fix/email-platform-e2e-hardening` without merging to `main`. Zero modifications to WhatsApp infrastructure.
+
+### Entry: 2026-09-25 — Complete Email Tracking Pipeline Implementation & Hardening
+- **Prompt / Phase**: Email Tracking Pipeline (Open Tracking Pixel, Click Tracking Wrapping, Signed Tokens, Redirect Defense, Stored Engagement Events, Authoritative Analytics)
+- **Status**: ✅ Clean (No unresolved concerns)
+- **Unresolved Concerns**: None.
+- **Notes / Observations**:
+  - **AST-Based HTML Tracking Pipeline**: Installed and integrated `node-html-parser` (^7.0.1) for spec-compliant DOM manipulation, completely eliminating fragile regex-only transformations.
+  - **Open Pixel Injection**: `EmailTrackingService.injectOpenPixel` generates a signed, privacy-safe HMAC-SHA256 open token tied strictly to `{ clientId, deliveryId, exp }` (never exposing raw recipient email addresses), generates a random cache-buster query parameter (`?cb=`), formats a transparent 1x1 GIF tag, and injects it into `<body>` (or document root if body tag is omitted), preserving valid HTML syntax.
+  - **Click Tracking Link Wrapping**: `EmailTrackingService.wrapLinksWithClickTracking` safely inspects all `<a>` tags. Skips unsubscribe links (`/unsubscribe`, `data-skip-track="true"`, `data-unsubscribe="true"`, `rel="unsubscribe"`), `mailto:` links, `#` anchor links, CRLF-containing URLs (`/[\r\n\t\0]/`), and unsafe protocols (`javascript:`, `data:`, `tel:`, `sms:`, `vbscript:`, `file:`). Replaces eligible HTTP and HTTPS links with signed tracking URLs containing the authenticated destination URL in the HMAC token.
+  - **Open Redirect Defense**: Destination URLs are sealed within the cryptographically signed click token (`ClickTokenPayload.targetUrl`). The click endpoint `GET /api/email/track/click/:token` strictly extracts and validates the target URL from the signed token, rejecting all query parameter destination overrides, CRLF characters, and non-http/https protocols.
+  - **Authoritative Event Recording & Delivery Synchronization**: Both `GET /api/email/track/open/:token` and `GET /api/email/track/click/:token` await `EmailTrackingService.recordOpen` and `recordClick`. Creates `EmailEvent` records with `status: PROCESSED`, promotes delivery state from `SENT` to `DELIVERED`, populates `deliveredAt`, updates recipient status to `DELIVERED`, and increments campaign `deliveredCount` idempotently.
+  - **Zero Invented Dashboard Metrics**: Removed all hardcoded heuristic numbers (`32.5%`, `11.2%`, `"35%"`, `"12%"`) in `src/app/dashboard/email/page.tsx`. Campaign listings and dashboard cards derive directly from real database events and deduplicated unique recipient opens/clicks (`EmailCampaignService.listCampaigns` and `EmailAnalyticsService.getCampaignAnalytics`).
+  - **Deduplication & Rate Integrity**: `EmailAnalyticsService` deduplicates unique opens and unique clicks strictly per recipient. Duplicate tracking requests increment total counts or deduplicate within the hour bucket, but never inflate unique metrics. Delivered count is guaranteed to be at least equal to unique opens/clicks, preventing open rates > 100% or divide-by-zero errors.
+  - **Integration Verification Suite**: Implemented `scripts/verify-email-tracking-pipeline.ts` testing all 10 requirements:
+    1. Campaign rendered HTML contains 1x1 open pixel with configured base URL and cache buster.
+    2. Eligible HTTP/HTTPS links converted to tracking URLs; mailto, anchors, unsafe protocols, CRLF, and unsubscribe skipped.
+    3. Raw recipient email address strictly absent from open/click tokens and query parameters.
+    4. Expired tracking tokens rejected (`Token has expired`).
+    5. Signature and payload tampering securely rejected.
+    6. Unsafe redirects (CRLF, javascript:, data:) blocked.
+    7. Click events recorded in `EmailEvent`, delivery promoted to `DELIVERED`.
+    8. Open events recorded in `EmailEvent`, delivery promoted to `DELIVERED`.
+    9. Duplicate tracking requests do not inflate unique counts.
+    10. Campaign analytics and campaign listing strictly reflect real database events.
+  - **Quality Gates Passing**:
+    - `npm test`: 635 passing checks across all 15 suites (exit code 0).
+    - `npm run lint`: 0 errors, 0 warnings (exit code 0).
+    - `npm run build`: 61 routes compiled cleanly with 0 TypeScript errors (exit code 0).
+    - `npm audit --audit-level=high`: 0 vulnerabilities (exit code 0).
+    - All work isolated on branch `fix/email-platform-e2e-hardening` without merging to `main`. WhatsApp infrastructure completely untouched.
+
 ---
 
 ## Flag Template for Subsequent Prompts

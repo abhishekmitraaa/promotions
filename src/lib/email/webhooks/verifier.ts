@@ -12,6 +12,20 @@ import { WebhookVerificationResult } from "./types";
 import { logger } from "../../logger";
 
 /**
+ * In-memory cache for AWS SNS signing certificates.
+ * Prevents redundant network fetches and allows deterministic injection in tests.
+ */
+const snsCertCache = new Map<string, string>();
+
+export function setSnsCertCache(url: string, pem: string): void {
+  snsCertCache.set(url, pem);
+}
+
+export function clearSnsCertCache(): void {
+  snsCertCache.clear();
+}
+
+/**
  * Verifies standard HMAC-SHA256 webhook signatures.
  * Header convention:
  * `X-Webhook-Signature`: hex or base64 signature
@@ -85,6 +99,7 @@ export function verifyHmacWebhookSignature(
 /**
  * Verifies Google Cloud Pub/Sub push notification authenticity.
  * Google Cloud Pub/Sub sends a pre-shared verification token via query parameter or Authorization Bearer header.
+ * Strictly fails closed in all environments if verification token is missing or incorrect.
  */
 export function verifyGmailPubSubWebhook(
   headers: Headers,
@@ -93,11 +108,8 @@ export function verifyGmailPubSubWebhook(
 ): WebhookVerificationResult {
   const expectedToken = verificationToken || process.env.GMAIL_WEBHOOK_VERIFICATION_TOKEN;
   if (!expectedToken) {
-    // If no token configured, fail closed in production
-    if (process.env.NODE_ENV === "production") {
-      return { valid: false, error: "GMAIL_WEBHOOK_VERIFICATION_TOKEN is not configured" };
-    }
-    return { valid: true };
+    // Fail closed in ALL environments: never allow unauthenticated push bypass
+    return { valid: false, error: "Google Pub/Sub verification token is not configured" };
   }
 
   // Token can come from query parameter or bearer header
@@ -120,13 +132,47 @@ export function verifyGmailPubSubWebhook(
 }
 
 /**
+ * Builds the canonical string to sign according to AWS SNS specification.
+ */
+export function buildSnsCanonicalString(parsed: Record<string, unknown>): string {
+  const type = String(parsed.Type || "");
+  const lines: string[] = [];
+
+  if (type === "Notification") {
+    lines.push("Message", String(parsed.Message ?? ""));
+    lines.push("MessageId", String(parsed.MessageId ?? ""));
+    if (parsed.Subject !== undefined && parsed.Subject !== null && parsed.Subject !== "") {
+      lines.push("Subject", String(parsed.Subject));
+    }
+    lines.push("Timestamp", String(parsed.Timestamp ?? ""));
+    lines.push("TopicArn", String(parsed.TopicArn ?? ""));
+    lines.push("Type", type);
+  } else if (type === "SubscriptionConfirmation" || type === "UnsubscribeConfirmation") {
+    lines.push("Message", String(parsed.Message ?? ""));
+    lines.push("MessageId", String(parsed.MessageId ?? ""));
+    lines.push("SubscribeURL", String(parsed.SubscribeURL ?? ""));
+    lines.push("Timestamp", String(parsed.Timestamp ?? ""));
+    lines.push("Token", String(parsed.Token ?? ""));
+    lines.push("TopicArn", String(parsed.TopicArn ?? ""));
+    lines.push("Type", type);
+  }
+
+  return lines.join("\n") + "\n";
+}
+
+/**
  * Verifies AWS SNS notification signature for AWS SES event webhooks.
- * Validates that the SigningCertURL is HTTPS and strictly on amazonaws.com.
+ * Validates that SigningCertURL is HTTPS and strictly on amazonaws.com.
+ * Performs real cryptographic signature validation against the public key certificate.
+ * Direct unverified SES payloads without signature or HMAC secret are strictly rejected.
  */
 export function verifyAwsSesWebhook(
   rawBody: string,
   headers: Headers,
-  secretOverride?: string
+  secretOverride?: string,
+  options?: {
+    certResolver?: (certUrl: string) => string | Promise<string>;
+  }
 ): WebhookVerificationResult {
   // If an HMAC secret is configured for SES, verify via standard HMAC
   if (secretOverride || process.env.SES_WEBHOOK_SECRET) {
@@ -143,28 +189,73 @@ export function verifyAwsSesWebhook(
       return { valid: false, error: "Invalid JSON payload" };
     }
 
-    // AWS SNS message structure validation
-    if (parsed.Type === "SubscriptionConfirmation") {
-      // Must have valid amazonaws.com cert URL
-      if (!isValidAwsCertUrl(parsed.SigningCertURL)) {
+    const type = String(parsed.Type || "");
+
+    // Validate AWS SNS message structure
+    if (
+      type === "Notification" ||
+      type === "SubscriptionConfirmation" ||
+      type === "UnsubscribeConfirmation"
+    ) {
+      const certUrl = parsed.SigningCertURL;
+      if (!isValidAwsCertUrl(certUrl)) {
         return { valid: false, error: "Invalid AWS SigningCertURL domain" };
       }
-      return { valid: true };
-    }
 
-    if (parsed.Type === "Notification") {
-      if (parsed.SigningCertURL && !isValidAwsCertUrl(parsed.SigningCertURL)) {
-        return { valid: false, error: "Invalid AWS SigningCertURL domain" };
+      if (!parsed.Signature || typeof parsed.Signature !== "string") {
+        return { valid: false, error: "Missing AWS SNS message signature" };
       }
+
+      const sigVersion = String(parsed.SignatureVersion || "1");
+      if (sigVersion !== "1" && sigVersion !== "2") {
+        return { valid: false, error: `Unsupported AWS SNS SignatureVersion: ${sigVersion}` };
+      }
+
+      // Check certificate from cache or resolver
+      let certPem = snsCertCache.get(certUrl);
+      if (!certPem && options?.certResolver) {
+        const resolved = options.certResolver(certUrl);
+        if (typeof resolved === "string") {
+          certPem = resolved;
+          snsCertCache.set(certUrl, resolved);
+        }
+      }
+
+      if (!certPem) {
+        return {
+          valid: false,
+          error: "AWS SNS signing certificate not found in cache or unresolvable",
+        };
+      }
+
+      // Extract public key from certificate
+      let publicKey: crypto.KeyObject;
+      try {
+        publicKey = crypto.createPublicKey(certPem);
+      } catch {
+        return { valid: false, error: "Malformed AWS SNS signing certificate" };
+      }
+
+      // Build canonical string per AWS SNS specification
+      const canonicalString = buildSnsCanonicalString(parsed);
+      const hashAlgorithm = sigVersion === "2" ? "RSA-SHA256" : "RSA-SHA1";
+
+      const verifier = crypto.createVerify(hashAlgorithm);
+      verifier.update(canonicalString, "utf8");
+
+      const isValid = verifier.verify(publicKey, Buffer.from(parsed.Signature, "base64"));
+      if (!isValid) {
+        return { valid: false, error: "Invalid AWS SNS cryptographic signature" };
+      }
+
       return { valid: true };
     }
 
-    // Direct SES event structure without SNS wrapper
-    if (parsed.eventType || parsed.event_type || parsed.notificationType) {
-      return { valid: true };
-    }
-
-    return { valid: false, error: "Unrecognized AWS SES webhook structure" };
+    // Direct unverified SES payloads are strictly rejected
+    return {
+      valid: false,
+      error: "AWS SES webhook missing valid cryptographic signature or authentication token",
+    };
   } catch {
     return { valid: false, error: "Payload is not valid JSON" };
   }
@@ -179,8 +270,10 @@ function isValidAwsCertUrl(urlStr?: string): boolean {
   try {
     const parsed = new URL(urlStr);
     if (parsed.protocol !== "https:") return false;
-    // Must match *.amazonaws.com
-    return /^sns\.[a-z0-9-]+\.amazonaws\.com$/.test(parsed.hostname);
+    // Must match sns.<region>.amazonaws.com and end with .pem
+    const isDomainValid = /^sns\.[a-z0-9-]+\.amazonaws\.com$/.test(parsed.hostname);
+    const isPem = parsed.pathname.endsWith(".pem");
+    return isDomainValid && isPem;
   } catch {
     return false;
   }

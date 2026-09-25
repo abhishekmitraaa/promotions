@@ -22,6 +22,10 @@ interface CampaignSummary {
   deliveredCount: number;
   bouncedCount: number;
   sentCount: number;
+  openRate?: number;
+  clickRate?: number;
+  uniqueOpens?: number;
+  uniqueClicks?: number;
 }
 
 interface QueueHealth {
@@ -70,6 +74,8 @@ export default function EmailDashboardPage() {
             let totalBounced = 0;
             let totalComplaints = 0;
             let totalUnsubscribed = 0;
+            let totalUniqueOpens = 0;
+            let totalUniqueClicks = 0;
 
             for (const c of json.data) {
               totalSent += c.sentCount || 0;
@@ -77,10 +83,18 @@ export default function EmailDashboardPage() {
               totalBounced += c.bouncedCount || 0;
               totalComplaints += c.complaintCount || 0;
               totalUnsubscribed += c.unsubscribedCount || 0;
+              totalUniqueOpens += c.uniqueOpens || 0;
+              totalUniqueClicks += c.uniqueClicks || 0;
             }
 
-            const openRate = totalDelivered > 0 ? 32.5 : 0; // heuristic baseline
-            const clickRate = totalDelivered > 0 ? 11.2 : 0;
+            const openRate =
+              totalDelivered > 0
+                ? Math.round((totalUniqueOpens / totalDelivered) * 10000) / 100
+                : 0;
+            const clickRate =
+              totalDelivered > 0
+                ? Math.round((totalUniqueClicks / totalDelivered) * 10000) / 100
+                : 0;
 
             setMetrics({
               sent: totalSent,
@@ -309,10 +323,10 @@ export default function EmailDashboardPage() {
                     <td className="px-5 py-3.5 text-emerald-400">{camp.deliveredCount}</td>
                     <td className="px-5 py-3.5 text-amber-400">{camp.bouncedCount}</td>
                     <td className="px-5 py-3.5 text-sky-400">
-                      {camp.deliveredCount > 0 ? "35%" : "0%"}
+                      {camp.openRate !== undefined ? `${camp.openRate}%` : "0%"}
                     </td>
                     <td className="px-5 py-3.5 text-indigo-400">
-                      {camp.deliveredCount > 0 ? "12%" : "0%"}
+                      {camp.clickRate !== undefined ? `${camp.clickRate}%` : "0%"}
                     </td>
                   </tr>
                 ))

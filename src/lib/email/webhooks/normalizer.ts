@@ -253,3 +253,79 @@ export function normalizeSesEvent(rawPayload: Record<string, unknown>): Normaliz
     },
   ];
 }
+
+/**
+ * Strict payload validator for normalized email webhook events.
+ * Enforces schema correctness, enum validity, RFC 5322 email syntax, and timestamp rationality.
+ */
+export function validateNormalizedEvent(
+  event: NormalizedEmailWebhookEvent
+): { valid: boolean; errors: string[] } {
+  const errors: string[] = [];
+
+  if (!event || typeof event !== "object") {
+    return { valid: false, errors: ["Event payload must be a non-null object"] };
+  }
+
+  // 1. providerType validation
+  const validProviderTypes = Object.values(EmailProviderType);
+  if (!event.providerType || !validProviderTypes.includes(event.providerType)) {
+    errors.push(`Invalid providerType: '${String(event.providerType)}'. Expected one of ${validProviderTypes.join(", ")}`);
+  }
+
+  // 2. providerEventId validation
+  if (!event.providerEventId || typeof event.providerEventId !== "string" || event.providerEventId.trim().length === 0) {
+    errors.push("providerEventId is required and must be a non-empty string");
+  }
+
+  // 3. eventType validation
+  const validEventTypes = Object.values(EmailEventType);
+  if (!event.eventType || !validEventTypes.includes(event.eventType)) {
+    errors.push(`Invalid eventType: '${String(event.eventType)}'. Expected one of ${validEventTypes.join(", ")}`);
+  }
+
+  // 4. recipient validation
+  if (!event.recipient || typeof event.recipient !== "string") {
+    errors.push("recipient is required and must be a string");
+  } else {
+    const trimmed = event.recipient.trim();
+    // RFC 5322 simplified email regex
+    const emailRegex = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$/;
+    if (trimmed.length === 0 || !emailRegex.test(trimmed)) {
+      errors.push(`Invalid recipient email format: '${event.recipient}'`);
+    }
+  }
+
+  // 5. occurredAt validation
+  if (event.occurredAt) {
+    if (!(event.occurredAt instanceof Date) || isNaN(event.occurredAt.getTime())) {
+      errors.push("occurredAt must be a valid Date object");
+    } else {
+      const nowMs = Date.now();
+      const maxFutureSkewMs = 24 * 60 * 60 * 1000; // 24 hours
+      if (event.occurredAt.getTime() > nowMs + maxFutureSkewMs) {
+        errors.push(`occurredAt cannot be in the future (> 24h skew): ${event.occurredAt.toISOString()}`);
+      }
+    }
+  }
+
+  // 6. bounceType validation
+  if (event.eventType === EmailEventType.BOUNCED) {
+    if (event.bounceType && event.bounceType !== "HARD_BOUNCE" && event.bounceType !== "SOFT_BOUNCE") {
+      errors.push(`Invalid bounceType: '${String(event.bounceType)}'. Expected 'HARD_BOUNCE' or 'SOFT_BOUNCE'`);
+    }
+  }
+
+  // 7. Optional identifier validations
+  if (event.deliveryId !== undefined && typeof event.deliveryId !== "string") {
+    errors.push("deliveryId must be a string if provided");
+  }
+  if (event.providerMessageId !== undefined && typeof event.providerMessageId !== "string") {
+    errors.push("providerMessageId must be a string if provided");
+  }
+
+  return {
+    valid: errors.length === 0,
+    errors,
+  };
+}

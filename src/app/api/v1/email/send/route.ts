@@ -10,7 +10,13 @@ import { normalizeEmail } from "@/lib/email/normalization";
 import { EmailDeliveryStatus, EmailProviderType, EmailType } from "@prisma/client";
 import { providerRegistry } from "@/lib/email/registry";
 import { getTransactionalQueue, getCampaignQueue } from "@/lib/email/queue/queues";
-import { JOB_NAMES, getTransactionalJobId, getCampaignJobId, CampaignJobData } from "@/lib/email/queue/types";
+import {
+  JOB_NAMES,
+  getTransactionalJobId,
+  getPromotionalJobId,
+  TransactionalJobData,
+  PromotionalJobData,
+} from "@/lib/email/queue/types";
 
 export async function POST(req: NextRequest) {
   // 1. Authenticate API Key & Resolve Tenant
@@ -209,32 +215,51 @@ export async function POST(req: NextRequest) {
     throw err;
   }
 
-  // 9. Queue Asynchronously
+  // 9. Queue Asynchronously (Honest Queue Failure Contract)
   try {
     if (input.type === "TRANSACTIONAL") {
       const queue = getTransactionalQueue();
-      await queue.add(
-        JOB_NAMES.SEND_TRANSACTIONAL,
-        {
-          deliveryId: delivery.id,
-          clientId,
-          category: "TRANSACTIONAL",
-        },
-        { jobId: getTransactionalJobId(delivery.id) }
-      );
+      const jobData: TransactionalJobData = {
+        deliveryId: delivery.id,
+        clientId,
+        category: "TRANSACTIONAL",
+      };
+      await queue.add(JOB_NAMES.SEND_TRANSACTIONAL, jobData, {
+        jobId: getTransactionalJobId(delivery.id),
+      });
     } else {
       const queue = getCampaignQueue();
-      const jobData: CampaignJobData = {
-        campaignId: `api-campaign-${delivery.id}`,
+      const jobData: PromotionalJobData = {
+        deliveryId: delivery.id,
         clientId,
         category: "PROMOTIONAL",
       };
-      await queue.add(JOB_NAMES.SEND_CAMPAIGN_RECIPIENT, jobData, {
-        jobId: getCampaignJobId(`del-${delivery.id}`),
+      await queue.add(JOB_NAMES.SEND_PROMOTIONAL, jobData, {
+        jobId: getPromotionalJobId(delivery.id),
       });
     }
-  } catch {
-    // Non-fatal if queue is offline during local test
+  } catch (err: unknown) {
+    const errorMsg = err instanceof Error ? err.message : "Failed to enqueue delivery job";
+    await prisma.emailDelivery.updateMany({
+      where: { id: delivery.id },
+      data: {
+        status: EmailDeliveryStatus.FAILED,
+        errorCode: "QUEUE_ENQUEUE_FAILED",
+        errorMessage: errorMsg,
+        failedAt: new Date(),
+      },
+    });
+
+    return NextResponse.json(
+      {
+        success: false,
+        error: {
+          code: "QUEUE_ERROR",
+          message: "Failed to enqueue email dispatch job. Durable delivery marked as failed.",
+        },
+      },
+      { status: 500 }
+    );
   }
 
   return NextResponse.json(

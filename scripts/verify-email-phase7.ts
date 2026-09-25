@@ -125,6 +125,13 @@ function setupMockPrisma() {
     return newEvt;
   };
 
+  (prisma.emailEvent.update as any) = async ({ where, data }: any) => {
+    const evt = store.events.find((e) => e.id === where.id);
+    if (!evt) throw new Error("Event not found");
+    Object.assign(evt, data);
+    return evt;
+  };
+
   (prisma.emailContact.findFirst as any) = async ({ where }: any) => {
     return (
       store.contacts.find((c) => {
@@ -224,11 +231,32 @@ function setupMockPrisma() {
     return camp;
   };
 
+  (prisma.emailCampaign.updateMany as any) = async ({ where, data }: any) => {
+    let count = 0;
+    for (const c of store.campaigns) {
+      if (where?.id && c.id !== where.id) continue;
+      if (where?.status?.in && !where.status.in.includes(c.status)) continue;
+      Object.assign(c, data);
+      count++;
+    }
+    return { count };
+  };
+
   (prisma.emailCampaignRecipient.update as any) = async ({ where, data }: any) => {
     const rcp = store.recipients.find((r) => r.id === where.id);
     if (!rcp) throw new Error("Recipient not found");
     Object.assign(rcp, data);
     return rcp;
+  };
+
+  (prisma.emailCampaignRecipient.count as any) = async ({ where }: any) => {
+    let count = 0;
+    for (const r of store.recipients) {
+      if (where?.campaignId && r.campaignId !== where.campaignId) continue;
+      if (where?.status?.in && !where.status.in.includes(r.status)) continue;
+      count++;
+    }
+    return count;
   };
 }
 
@@ -390,6 +418,7 @@ async function runPhase7Tests() {
   });
 
   const hardBounceEvent = {
+    clientId: tenantAlpha,
     providerType: EmailProviderType.MOCK,
     providerEventId: "evt-hard-bounce-1",
     eventType: EmailEventType.BOUNCED,
@@ -417,6 +446,7 @@ async function runPhase7Tests() {
   });
 
   const softBounceEvent = {
+    clientId: tenantAlpha,
     providerType: EmailProviderType.MOCK,
     providerEventId: "evt-soft-bounce-1",
     eventType: EmailEventType.BOUNCED,
@@ -446,6 +476,7 @@ async function runPhase7Tests() {
   });
 
   const complaintEvent = {
+    clientId: tenantAlpha,
     providerType: EmailProviderType.MOCK,
     providerEventId: "evt-complaint-1",
     eventType: EmailEventType.COMPLAINT,
@@ -589,6 +620,8 @@ async function runPhase7Tests() {
 
   if (failed > 0) {
     process.exit(1);
+  } else {
+    process.exit(0);
   }
 }
 
