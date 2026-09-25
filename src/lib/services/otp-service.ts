@@ -3,19 +3,46 @@ import { env, isMetaConfigured } from "../env";
 import { generateSecureOtp, hashOtp, normalizePhoneNumber } from "../crypto";
 import { OtpStatus } from "@prisma/client";
 import { MessageService } from "./message-service";
+import { EmailService } from "./email-service";
+import { EmailProvider } from "../email/types";
+import { isValidEmail, normalizeEmail } from "../email/normalization";
 import { dispatchOutgoingWebhooks } from "../webhooks/dispatcher";
 import { logger } from "../logger";
 
+export type OtpChannel = "WHATSAPP" | "EMAIL";
+
+export interface RequestOtpOptions {
+  emailSubject?: string;
+  providerOverride?: EmailProvider;
+}
+
 export class OtpService {
   /**
-   * Request a new OTP code sent to destination via WhatsApp, scoped to an ApiClient.
+   * Request a new OTP code sent to destination via WhatsApp or Email, scoped to an ApiClient.
+   * Default channel is WHATSAPP to preserve 100% backward compatibility.
    */
-  static async requestOtp(clientId: string, to: string, purpose: string = "login") {
+  static async requestOtp(
+    clientId: string,
+    to: string,
+    purpose: string = "login",
+    channel: OtpChannel = "WHATSAPP",
+    options?: RequestOtpOptions
+  ) {
     if (!clientId) {
       throw new Error("clientId is required to request an OTP");
     }
 
-    const normalizedTo = normalizePhoneNumber(to);
+    if (channel === "EMAIL") {
+      if (!to || !isValidEmail(to)) {
+        throw new Error(`Invalid recipient email address: '${to}'`);
+      }
+    } else {
+      if (!to || to.trim() === "") {
+        throw new Error("Recipient phone number is required");
+      }
+    }
+
+    const normalizedTo = channel === "EMAIL" ? normalizeEmail(to) : normalizePhoneNumber(to);
 
     // Invalidate existing active OTPs for this client, destination, and purpose
     await prisma.otpVerification.updateMany({
@@ -48,74 +75,135 @@ export class OtpService {
       },
     });
 
-    // Send WhatsApp message scoped to this client
-    const templateName = env.OTP_TEMPLATE_NAME;
-    const templateLanguage = env.OTP_TEMPLATE_LANGUAGE;
+    let messageStatus = "SENT";
 
-    let dispatchResult;
-    try {
-      dispatchResult = await MessageService.send(
-        {
-          to: normalizedTo,
-          type: "template",
-          templateName,
-          templateLanguage,
-          templateParameters: [
-            {
-              type: "body",
-              parameters: [{ type: "text", text: rawOtpCode }],
+    if (channel === "WHATSAPP") {
+      // Send WhatsApp message scoped to this client
+      const templateName = env.OTP_TEMPLATE_NAME;
+      const templateLanguage = env.OTP_TEMPLATE_LANGUAGE;
+
+      let dispatchResult;
+      try {
+        dispatchResult = await MessageService.send(
+          {
+            to: normalizedTo,
+            type: "template",
+            templateName,
+            templateLanguage,
+            templateParameters: [
+              {
+                type: "body",
+                parameters: [{ type: "text", text: rawOtpCode }],
+              },
+              {
+                type: "button",
+                sub_type: "url",
+                index: "0",
+                parameters: [{ type: "text", text: rawOtpCode }],
+              },
+            ],
+          },
+          { clientId }
+        );
+      } catch (sendErr) {
+        await prisma.otpVerification
+          .update({
+            where: { id: otpRecord.id },
+            data: { status: OtpStatus.FAILED },
+          })
+          .catch(() => {});
+
+        logger.error("Failed to send OTP message via WhatsApp Cloud API:", sendErr);
+        return {
+          success: false,
+          status: 502,
+          error: {
+            code: "OTP_DELIVERY_FAILED",
+            message:
+              sendErr instanceof Error
+                ? sendErr.message
+                : "Failed to dispatch OTP message via WhatsApp Cloud API",
+          },
+        };
+      }
+
+      if (dispatchResult.status === "FAILED") {
+        await prisma.otpVerification
+          .update({
+            where: { id: otpRecord.id },
+            data: { status: OtpStatus.FAILED },
+          })
+          .catch(() => {});
+
+        logger.warn(`OTP dispatch failed for destination ${normalizedTo}: ${dispatchResult.errorMessage}`);
+        return {
+          success: false,
+          status: 502,
+          error: {
+            code: "OTP_DELIVERY_FAILED",
+            message: dispatchResult.errorMessage || "WhatsApp OTP delivery could not be initiated",
+          },
+        };
+      }
+      messageStatus = dispatchResult.status;
+    } else {
+      // Channel: EMAIL
+      try {
+        const emailSendResult = await EmailService.sendTransactional(
+          {
+            clientId,
+            to: normalizedTo,
+            templateType: "EMAIL_OTP",
+            templateVariables: {
+              otp_code: rawOtpCode,
+              expires_in_minutes: Math.ceil(env.OTP_EXPIRY_SECONDS / 60),
+              purpose,
             },
-            {
-              type: "button",
-              sub_type: "url",
-              index: "0",
-              parameters: [{ type: "text", text: rawOtpCode }],
+            subject: options?.emailSubject,
+            transactionalReference: otpRecord.id,
+          },
+          { providerOverride: options?.providerOverride }
+        );
+
+        if (!emailSendResult.accepted) {
+          await prisma.otpVerification
+            .update({
+              where: { id: otpRecord.id },
+              data: { status: OtpStatus.FAILED },
+            })
+            .catch(() => {});
+
+          return {
+            success: false,
+            status: 502,
+            error: {
+              code: "OTP_DELIVERY_FAILED",
+              message: emailSendResult.error?.message || "Email OTP delivery could not be completed",
             },
-          ],
-        },
-        { clientId }
-      );
-    } catch (sendErr) {
-      // Mark OTP as FAILED if dispatch throws
-      await prisma.otpVerification
-        .update({
-          where: { id: otpRecord.id },
-          data: { status: OtpStatus.FAILED },
-        })
-        .catch(() => {});
+          };
+        }
+        messageStatus = emailSendResult.providerStatus;
+      } catch (sendErr) {
+        await prisma.otpVerification
+          .update({
+            where: { id: otpRecord.id },
+            data: { status: OtpStatus.FAILED },
+          })
+          .catch(() => {});
 
-      logger.error("Failed to send OTP message via WhatsApp Cloud API:", sendErr);
-      return {
-        success: false,
-        status: 502,
-        error: {
-          code: "OTP_DELIVERY_FAILED",
-          message:
-            sendErr instanceof Error
-              ? sendErr.message
-              : "Failed to dispatch OTP message via WhatsApp Cloud API",
-        },
-      };
-    }
-
-    if (dispatchResult.status === "FAILED") {
-      // Mark OTP as FAILED if dispatch result is FAILED
-      await prisma.otpVerification
-        .update({
-          where: { id: otpRecord.id },
-          data: { status: OtpStatus.FAILED },
-        })
-        .catch(() => {});
-
-      logger.warn(`OTP dispatch failed for destination ${normalizedTo}: ${dispatchResult.errorMessage}`);
-      return {
-        success: false,
-        status: 502,
-        error: {
-          code: "OTP_DELIVERY_FAILED",
-          message: dispatchResult.errorMessage || "WhatsApp OTP delivery could not be initiated",
-        },
-      };
+        logger.error("Failed to send OTP message via Email Provider:", sendErr);
+        return {
+          success: false,
+          status: 502,
+          error: {
+            code: "OTP_DELIVERY_FAILED",
+            message:
+              sendErr instanceof Error
+                ? sendErr.message
+                : "Failed to dispatch OTP message via Email Provider",
+          },
+        };
+      }
     }
 
     // Await durable webhook dispatch
@@ -125,6 +213,7 @@ export class OtpService {
         otpId: otpRecord.id,
         destination: normalizedTo,
         purpose,
+        channel,
         expiresAt: expiresAt.toISOString(),
       },
       clientId
@@ -132,7 +221,7 @@ export class OtpService {
       logger.error("Failed to dispatch otp.requested webhook:", err);
     });
 
-    // Only return devCode when NODE_ENV !== "production" and simulated Meta mode is active
+    // Only return devCode when NODE_ENV !== "production" and simulated mode is active
     const isSimulatedDevMode =
       process.env.NODE_ENV !== "production" &&
       !isMetaConfigured() &&
@@ -147,23 +236,33 @@ export class OtpService {
         otpId: otpRecord.id,
         destination: normalizedTo,
         purpose,
+        channel,
         expiresInSeconds: env.OTP_EXPIRY_SECONDS,
         expiresAt: expiresAt.toISOString(),
-        messageStatus: dispatchResult.status,
-        ...(devCode ? { devCodeNote: "Meta API credentials unconfigured in local dev mode", devCode } : {}),
+        messageStatus,
+        ...(devCode ? { devCodeNote: "Unconfigured in local dev mode", devCode } : {}),
       },
     };
   }
 
   /**
    * Verify an OTP code against active record with strict atomic concurrency protection.
+   * Supports both WhatsApp phone destinations and Email destinations.
    */
-  static async verifyOtp(clientId: string, to: string, purpose: string = "login", code: string) {
+  static async verifyOtp(
+    clientId: string,
+    to: string,
+    purpose: string = "login",
+    code: string,
+    channel?: OtpChannel
+  ) {
     if (!clientId) {
       throw new Error("clientId is required to verify an OTP");
     }
 
-    const normalizedTo = normalizePhoneNumber(to);
+    // Auto-detect channel if omitted based on whether destination is an email
+    const isEmail = channel === "EMAIL" || to.includes("@");
+    const normalizedTo = isEmail ? normalizeEmail(to) : normalizePhoneNumber(to);
 
     const otpRecord = await prisma.otpVerification.findFirst({
       where: {
@@ -286,6 +385,7 @@ export class OtpService {
         otpId: otpRecord.id,
         destination: normalizedTo,
         purpose,
+        channel: isEmail ? "EMAIL" : "WHATSAPP",
         verifiedAt: now.toISOString(),
       },
       clientId
@@ -300,6 +400,7 @@ export class OtpService {
         verified: true,
         destination: normalizedTo,
         purpose,
+        channel: isEmail ? "EMAIL" : "WHATSAPP",
         verifiedAt: now,
       },
     };

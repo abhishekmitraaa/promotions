@@ -254,3 +254,88 @@ To prevent accidental invocation, an explicit confirmation body is strictly mand
 
 Requests without this exact confirmation string are rejected with HTTP 400 Bad Request.
 
+---
+
+## 8. Public Email Send API
+
+`POST /api/v1/email/send`
+
+Dispatches a transactional or promotional email. Requests are authenticated via Bearer API Key, tenant-scoped, and processed asynchronously via the BullMQ email queue.
+
+### Request Headers
+- `Authorization: Bearer whub_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` (Required)
+- `Content-Type: application/json` (Required)
+- `Idempotency-Key: <unique_client_key>` (Optional - prevents duplicate sending)
+
+### Rate Limiting
+- **Limit**: 60 requests / minute per API key.
+- Returns HTTP 429 Too Many Requests if exceeded.
+
+### Payload Schema Requirements
+- `to`: Recipient email address string (e.g. `"user@example.com"`) or object (`{ "email": "user@example.com", "name": "Jane Doe" }`).
+- `type`: **STRICTLY REQUIRED**. Must be explicitly `"TRANSACTIONAL"` or `"PROMOTIONAL"`. Ambiguous or omitted values return HTTP 400.
+- `subject`: Email subject line (Required unless using a template that defines a subject).
+- `html`: HTML message body (Optional if `templateId` is provided).
+- `text`: Plain text alternative (Optional).
+- `templateId`: ID of an existing tenant `EmailTemplate` (Optional).
+- `variables`: Key-value map of variable substitutions for template rendering (Optional).
+- `senderId`: ID of an authorized tenant sender identity (Optional).
+- `headers`: Custom RFC 2822 email headers (Optional).
+
+### Payload Example 1: Direct Transactional Email
+```json
+{
+  "to": "alice@example.com",
+  "type": "TRANSACTIONAL",
+  "subject": "Your Security Code",
+  "html": "<p>Your one-time passcode is <strong>849201</strong>.</p>",
+  "text": "Your one-time passcode is 849201."
+}
+```
+
+### Payload Example 2: Templated Promotional Email
+```json
+{
+  "to": {
+    "email": "customer@example.com",
+    "name": "Alex Smith"
+  },
+  "type": "PROMOTIONAL",
+  "templateId": "tpl_clx123abc456",
+  "variables": {
+    "firstName": "Alex",
+    "discountCode": "SUMMER50",
+    "expiryDate": "2026-10-01"
+  }
+}
+```
+
+### Promotional Safety Guarantees
+For `PROMOTIONAL` emails:
+1. **Suppression Check**: Automatically verified against the tenant's suppression list (`EmailSuppression`). Suppressed recipients are immediately rejected with `400 Bad Request` (`RECIPIENT_SUPPRESSED`).
+2. **Marketing Consent Check**: If the recipient exists in `EmailContact`, `hasMarketingConsent` must be `true`. If `false`, the dispatch is rejected with `400 Bad Request` (`MISSING_CONSENT`).
+3. **One-Click Unsubscribe**: Compliant RFC 8058 `List-Unsubscribe` headers are automatically injected into every promotional dispatch.
+
+### Success Response (HTTP 200 OK)
+```json
+{
+  "success": true,
+  "data": {
+    "deliveryId": "del_clx789xyz123",
+    "status": "QUEUED",
+    "message": "Email queued successfully for dispatch"
+  }
+}
+```
+
+### Error Responses
+- **HTTP 401 Unauthorized**: Missing or invalid Bearer API key.
+- **HTTP 400 Bad Request**:
+  - Missing or invalid `type` field (`VALIDATION_ERROR`).
+  - Missing body content and missing `templateId`.
+  - Recipient is suppressed (`RECIPIENT_SUPPRESSED`).
+  - Recipient lacks marketing consent for promotional email (`MISSING_CONSENT`).
+- **HTTP 404 Not Found**: Specified `templateId` or `senderId` does not exist in tenant.
+- **HTTP 429 Too Many Requests**: Rate limit exceeded.
+
+

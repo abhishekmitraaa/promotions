@@ -43,11 +43,15 @@ All configurations are defined in `.env.local` for local development, or configu
 | `DATABASE_URL` | String | Required | Supabase PostgreSQL pooled connection URL (port 6543, `?pgbouncer=true`). |
 | `DIRECT_URL` | String | Optional | Supabase PostgreSQL direct connection URL (port 5432) for migrations. |
 | `APP_URL` | String | `http://localhost:3000` | Base public URL of your service. |
+| `REDIS_URL` | String | `redis://localhost:6379` | Redis connection URL for BullMQ email queues. |
 | `AUTH_SESSION_SECRET` | String | Min 32 chars | Cryptographic secret for signing HttpOnly session cookies. Required in production. |
 | `INTERNAL_WORKER_SECRET` | String | Optional | Secret key for authorizing external scheduled workers (`x-worker-secret` header). |
 | `API_KEY_PEPPER` | String | Auto-generated | Secret pepper used for HMAC-SHA256 hashing of API keys. Min 32 chars in production. |
-| `WEBHOOK_SECRET_ENCRYPTION_KEY` | String | Min 32 chars | Secret key for AES-256-GCM encryption of webhook signing secrets at rest. |
-| `META_GRAPH_API_VERSION` | String | `v22.0` | Meta Graph API version. |
+| `WEBHOOK_SECRET_ENCRYPTION_KEY` | String | Min 32 chars | Secret key for AES-256-GCM encryption of webhook signing secrets and provider OAuth credentials at rest. |
+| `GOOGLE_CLIENT_ID` | String | Optional | Google OAuth 2.0 Web Client ID for Gmail API provider integration. |
+| `GOOGLE_CLIENT_SECRET` | String | Optional | Google OAuth 2.0 Web Client Secret for Gmail API provider integration. |
+| `GOOGLE_REDIRECT_URI` | String | Optional | Google OAuth 2.0 authorized callback URI (e.g. `http://localhost:3000/api/email/providers/oauth/callback`). |
+| `META_GRAPH_API_VERSION` | String | `v22.0` | Meta Graph API version for WhatsApp. |
 | `META_ACCESS_TOKEN` | String | `""` | Meta Permanent System User Access Token. |
 | `META_PHONE_NUMBER_ID` | String | `""` | Sender WhatsApp Business Phone Number ID. |
 | `META_WABA_ID` | String | `""` | WhatsApp Business Account ID. |
@@ -61,9 +65,47 @@ All configurations are defined in `.env.local` for local development, or configu
 
 ---
 
-## 4. Database Architecture & Reproducible Migrations
+## 4. Google OAuth 2.0 & Gmail Provider Setup
 
-- **Managed Cloud PostgreSQL**: The application connects to hosted PostgreSQL on Supabase (`peqynzeioiauynfpdsdv`).
+To connect Gmail / Google Workspace as an email provider:
+
+1. **Google Cloud Console**:
+   - Go to [Google Cloud Console](https://console.cloud.google.com).
+   - Create a project and enable the **Gmail API**.
+2. **OAuth Consent Screen**:
+   - Configure User Type: Internal (for Google Workspace domain) or External.
+   - Add scope: `https://www.googleapis.com/auth/gmail.send`.
+3. **Credentials**:
+   - Create an **OAuth 2.0 Client ID** of type **Web application**.
+   - Set Authorized redirect URI to:
+     - Development: `http://localhost:3000/api/email/providers/oauth/callback`
+     - Production: `https://hub.yourdomain.com/api/email/providers/oauth/callback`
+   - Copy Client ID and Client Secret to `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`.
+4. **Connect via Admin Dashboard**:
+   - Navigate to `/dashboard/email/providers`.
+   - Click **Connect Gmail Account** to authenticate and authorize email dispatch. Tokens are automatically encrypted at rest via AES-256-GCM.
+
+---
+
+## 5. BullMQ Email Worker Daemon
+
+Asynchronous email dispatches, campaign recipient fan-outs, and delivery retries are executed by a persistent BullMQ worker daemon:
+
+```bash
+# Start the local email background worker
+npm run worker:email
+```
+
+Ensure Redis is running locally:
+```bash
+docker run -d -p 6379:6379 redis:7-alpine
+```
+
+---
+
+## 6. Database Architecture & Reproducible Migrations
+
+- **Managed Cloud PostgreSQL**: The application connects to hosted PostgreSQL on Supabase.
 - **Connection Pooling**: Use the Supavisor pooled connection on port 6543 (`?pgbouncer=true`) for application runtime, and the direct connection on port 5432 (`DIRECT_URL`) for Prisma migrations.
 - **Committed Migrations History**:
   - Migrations are committed in `prisma/migrations/`.
@@ -74,35 +116,28 @@ All configurations are defined in `.env.local` for local development, or configu
 
 ---
 
-## 5. Local Development vs Live Production Mode
-
-### Local Simulation Mode (`NODE_ENV !== "production"`)
-If `META_ACCESS_TOKEN` or `META_PHONE_NUMBER_ID` are omitted in development:
-- The service **does not fail**.
-- It records messages into the local database as `SENT`.
-- It generates a simulated provider ID (`wamid.dev_mock_...`).
-- It outputs simulation debug logs in your console.
-- The web dashboard will display amber diagnostic cards indicating that Meta credentials are unconfigured.
-
-### Live Production Mode
-When deployed or running with live credentials:
-- Set `META_ACCESS_TOKEN`, `META_PHONE_NUMBER_ID`, `META_APP_SECRET`, and `META_WEBHOOK_VERIFY_TOKEN`.
-- The service will perform live HTTPS calls to `https://graph.facebook.com/v22.0/{META_PHONE_NUMBER_ID}/messages`.
-- Meta webhook signatures will be verified using timing-safe HMAC-SHA256.
-
----
-
-## 6. Verification Test Suites
+## 7. Verification Test Suites
 
 ```bash
-# Core service verification suite (45 checks)
+# Core service and all unit/offline test suites
 npm test
 
-# Multi-tenant isolation, RLS, and security verification suite (32 checks)
+# Full Email suite (domain, provider, auth, queue, contacts, campaigns, webhooks, security matrix)
+npm run test:email
+
+# Specific subsystem email tests
+npm run test:email:queue      # BullMQ queue, retries, bounded backoff, idempotency
+npm run test:email:campaign   # Safe template engine, immutable versioning, campaign lifecycle
+npm run test:email:security   # Cross-tenant isolation (9 domains), RBAC, rate limiting, audit logging
+
+# Multi-tenant isolation and security verification (Requires local disposable test DB)
 npm run test:security
 
-# Phase 2 reliability, durable queue, and rate limiting suite (26 checks)
+# Phase 2 reliability and durable queue suite (Requires local disposable test DB)
 npm run test:phase2
+
+# Admin RBAC verification suite (Requires local disposable test DB)
+npm run test:rbac
 
 # Codebase linting
 npm run lint

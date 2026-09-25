@@ -158,3 +158,18 @@ export function decryptWebhookSecret(encryptedString: string, customKey?: string
   return decrypted.toString("utf8");
 }
 
+/**
+ * Encrypt arbitrary provider credentials (e.g. OAuth tokens, API secrets) using AES-256-GCM.
+ * Stored format: `iv:authTag:ciphertext` in hex.
+ */
+export function encryptProviderCredential(secret: string, customKey?: string): string {
+  return encryptWebhookSecret(secret, customKey || process.env.EMAIL_CREDENTIALS_ENCRYPTION_KEY);
+}
+
+/**
+ * Decrypt arbitrary provider credentials using AES-256-GCM.
+ */
+export function decryptProviderCredential(encryptedString: string, customKey?: string): string {
+  return decryptWebhookSecret(encryptedString, customKey || process.env.EMAIL_CREDENTIALS_ENCRYPTION_KEY);
+}
+

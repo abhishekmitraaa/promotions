@@ -1,48 +1,33 @@
-# WhatsApp Messaging Infrastructure Service
+# Communication Infrastructure Service (WhatsApp & Email)
 
-A production-minded, locally runnable self-hosted WhatsApp messaging service built with **Next.js 16 (App Router)**, **TypeScript**, **Prisma ORM (Supabase PostgreSQL)**, **Zod**, and **Meta's official WhatsApp Cloud API**.
+A production-minded, locally runnable self-hosted multi-channel messaging service built with **Next.js 16 (App Router)**, **TypeScript**, **Prisma ORM (Supabase PostgreSQL)**, **Redis + BullMQ**, **Zod**, **Meta's WhatsApp Cloud API**, and **Google Workspace / Gmail API**.
 
-This service acts as a hardened, standardized abstraction layer between your external applications and Meta's Graph API—hiding access tokens and phone number IDs behind Bearer API keys while providing an administrative web dashboard, incoming webhook processing with HMAC validation, OTP verification, and outgoing webhook forwarding.
+This service acts as a hardened, standardized abstraction layer between your external applications and communication providers—hiding access tokens, client secrets, and provider keys behind Bearer API keys while providing an administrative web dashboard, asynchronous queue processing, incoming webhook processing with cryptographic verification, OTP verification, contacts & segmentation management, campaign scheduling, and outbound delivery pipelines.
 
 ---
 
 ## 🌟 Key Capabilities
 
-- **Secure Public REST API (`/api/v1/*`)**:
-  - Protected by Bearer API Key authentication (`Authorization: Bearer whub_...`).
-  - Strict input validation via Zod schemas.
-  - Idempotent message dispatch via `Idempotency-Key` header.
-  - Built-in normalized rate limiting (60 req/min for messages, 5 req/min for OTP requests, 10 attempts/min for OTP verification).
-- **Admin Dashboard & API (`/dashboard/*`, `/api/admin/*`)**:
-  - Protected by Email/Password authentication & Role-Based Access Control (RBAC: `ADMIN` and `VIEWER`).
-  - Cryptographically signed HttpOnly session cookies backed by database sessions.
-  - Server-side mutation protection: Viewer role is strictly read-only (HTTP 403 on all mutations).
-  - Built-in last-admin lockout protection.
-  - Real-time messaging metrics, health diagnostics, and audit logs.
-  - Manual message composer supporting free-form text & pre-approved Meta templates.
-  - Conversation viewer grouped by participant phone number.
-  - API Key creation, revocation, and metadata auditing.
-  - Outgoing webhook endpoint manager and delivery retry viewer.
-  - User management interface for Admins to create, promote/demote, disable, and delete users.
-- **Meta WhatsApp Cloud API Client**:
-  - Direct HTTP integration using native `fetch` with `AbortController` timeouts.
-  - Full support for text messages and template messages:
-    - **Simple string array**: `["Alice", "ORD-123"]` (automatically mapped to body text parameters).
-    - **Meta-shaped components**: Structured header, body, and button URL/quick-reply parameters.
-  - Simulated sending mode in non-production environments only when Meta credentials are absent.
-- **Inbound Webhook Engine (`/api/webhooks/whatsapp`)**:
-  - Automatic `GET` challenge handshake validation (`hub.challenge`).
-  - Cryptographic `POST` verification using timing-safe HMAC-SHA256 (`X-Hub-Signature-256`).
-  - Ingestion of incoming messages, contact updates, and delivery status events (`sent`, `delivered`, `read`, `failed`).
-- **Cryptographic OTP Service (`/api/v1/otp/*`)**:
-  - Raw OTP codes are NEVER stored in plaintext (HMAC-SHA256 hashed with salt pepper).
-  - Strict attempt tracking with automatic invalidation upon expiry or exceeding max attempts.
-  - `devCode` is strictly returned only in non-production simulated mode; never leaked in production.
-- **Automated Developer Setup**:
-  - Single command `npm run setup` initializes environment with a random secure session secret and API pepper.
-  - 100% test pass verification via `npm test` and `npm run test:rbac`.
+### WhatsApp Platform
+- **Secure Public REST API (`/api/v1/messages`)**: Protected by Bearer API Key authentication (`Authorization: Bearer whub_...`), strict Zod validation, idempotent dispatch, and rate limiting (60 req/min).
+- **Meta WhatsApp Cloud API Client**: Native fetch with timeouts, supporting text and structured template messages.
+- **Inbound Webhook Engine (`/api/webhooks/whatsapp`)**: Timing-safe HMAC-SHA256 (`X-Hub-Signature-256`) verification.
+- **Cryptographic OTP Service (`/api/v1/otp/*`)**: HMAC-SHA256 hashed with salt pepper; raw OTPs never stored in plaintext.
 
----
+### Email Platform
+- **Secure Public REST API (`/api/v1/email/send`)**: Scoped by Bearer API key to tenant with explicit `type: "TRANSACTIONAL" | "PROMOTIONAL"`.
+- **Provider Abstraction Layer (`EmailProvider`)**: Normalized sender interface; first-class Google Workspace / Gmail OAuth2 provider with AES-256-GCM encrypted tokens.
+- **Dedicated BullMQ Queue Worker (`npm run worker:email`)**: Persistent Node.js worker handling asynchronous dispatches, exponential backoff retries, and bounded failures.
+- **Safe Template Renderer**: Strict variable validation, HTML escaping, and immutable versioning for scheduled campaigns.
+- **Contacts, Lists & Dynamic Segments**: Normalized emails, decoupled marketing consent, and parameterized dynamic criteria (zero raw SQL).
+- **Campaign Wizard**: 7-step creation wizard with audience resolution, consent checks, and suppression gatekeeping.
+- **Compliance & Suppression**: Automatic RFC 8058 `List-Unsubscribe` headers, one-click unsubscribe endpoint, and automated suppression on hard bounces and spam complaints.
+- **Provider Webhooks (`/api/email/webhooks/:provider`)**: Cryptographic signature validation and idempotent event deduplication.
+
+### Multi-Tenant Isolation & Admin RBAC
+- **9-Domain Tenant Isolation**: Strict `clientId` boundary across contacts, lists, segments, templates, campaigns, deliveries, providers, sender identities, and suppressions.
+- **Server-Side RBAC**: `ADMIN` has full mutation access; `VIEWER` is strictly read-only with HTTP 403 enforcement.
+- **High-Impact Audit Logging**: Sensitive credentials (`refreshToken`, `clientSecret`, `apiKey`, `password`) are automatically redacted with `[REDACTED]`.
 
 ## 🚀 Quick Start (Zero to Running in 2 Minutes)
 
@@ -258,6 +243,8 @@ npm run build
 
 - [Setup & Environment Guide](docs/setup.md)
 - [Public REST API Reference](docs/api.md)
+- [Email Architecture & Queue Guide](docs/email-architecture.md)
+- [Deployment Architecture & Production Operations](docs/deployment.md)
 - [Meta WhatsApp Cloud API Integration Guide](docs/whatsapp-cloud-api.md)
 - [Inbound & Outgoing Webhooks](docs/webhooks.md)
 - [OTP Verification Architecture](docs/otp.md)

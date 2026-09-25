@@ -158,6 +158,16 @@ model ApiClient {
   webhooks    WebhookEndpoint[]
   deliveries  WebhookDelivery[]
   otps        OtpVerification[]
+  emailConfigs        EmailProviderConfig[]
+  senderIdentities    EmailSenderIdentity[]
+  emailContacts       EmailContact[]
+  emailLists          EmailList[]
+  emailSegments       EmailSegment[]
+  emailTemplates      EmailTemplate[]
+  emailCampaigns      EmailCampaign[]
+  emailDeliveries     EmailDelivery[]
+  emailEvents         EmailEvent[]
+  emailSuppressions   EmailSuppression[]
 }
 
 model ApiKey {
@@ -245,6 +255,7 @@ model OtpVerification {
   @@index([destination])
   @@index([purpose])
   @@index([status])
+  @@index([codeHash])
 }
 
 model RateLimit {
@@ -255,4 +266,391 @@ model RateLimit {
   updatedAt DateTime @updatedAt
 
   @@index([resetAt])
+}
+
+// ==============================================================================
+// Email Platform Enums
+// ==============================================================================
+
+enum EmailProviderType {
+  GMAIL
+  SES
+  SMTP
+  MOCK
+}
+
+enum EmailProviderStatus {
+  ACTIVE
+  INACTIVE
+  FAILED
+}
+
+enum EmailType {
+  TRANSACTIONAL
+  PROMOTIONAL
+}
+
+enum EmailContactStatus {
+  SUBSCRIBED
+  UNSUBSCRIBED
+  BOUNCED
+  COMPLAINED
+  SUPPRESSED
+  PENDING
+}
+
+enum EmailSubscriptionStatus {
+  SUBSCRIBED
+  UNSUBSCRIBED
+  PENDING
+}
+
+enum EmailTemplateType {
+  TRANSACTIONAL
+  PROMOTIONAL
+}
+
+enum EmailCampaignStatus {
+  DRAFT
+  SCHEDULED
+  RUNNING
+  PAUSED
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum EmailDeliveryStatus {
+  QUEUED
+  PROCESSING
+  SENT
+  DELIVERED
+  BOUNCED
+  COMPLAINED
+  FAILED
+}
+
+enum EmailEventType {
+  SENT
+  DELIVERED
+  OPENED
+  CLICKED
+  BOUNCED
+  COMPLAINT
+  UNSUBSCRIBED
+  FAILED
+}
+
+enum EmailSuppressionReason {
+  HARD_BOUNCE
+  COMPLAINT
+  UNSUBSCRIBED
+  MANUAL
+  INVALID
+}
+
+// ==============================================================================
+// Email Platform Models
+// ==============================================================================
+
+model EmailProviderConfig {
+  id                         String              @id @default(uuid())
+  clientId                   String
+  name                       String
+  providerType               EmailProviderType
+  status                     EmailProviderStatus @default(ACTIVE)
+  isDefault                  Boolean             @default(false)
+  encryptedCredentials       String?
+  encryptedOAuthRefreshToken String?
+  senderEmail                String?
+  senderName                 String?
+  configMetadata             String?
+  lastVerifiedAt             DateTime?
+  errorMessage               String?
+  createdAt                  DateTime            @default(now())
+  updatedAt                  DateTime            @updatedAt
+
+  client                     ApiClient           @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  senderIdentities           EmailSenderIdentity[]
+
+  @@index([clientId])
+  @@index([providerType])
+  @@index([status])
+}
+
+model EmailSenderIdentity {
+  id               String               @id @default(uuid())
+  clientId         String
+  providerConfigId String?
+  email            String
+  name             String?
+  replyToEmail     String?
+  isDefault        Boolean              @default(false)
+  verified         Boolean              @default(false)
+  verifiedAt       DateTime?
+  createdAt        DateTime             @default(now())
+  updatedAt        DateTime             @updatedAt
+
+  client           ApiClient            @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  providerConfig   EmailProviderConfig? @relation(fields: [providerConfigId], references: [id], onDelete: SetNull)
+  campaigns        EmailCampaign[]
+
+  @@unique([clientId, email])
+  @@index([clientId])
+  @@index([providerConfigId])
+}
+
+model EmailContact {
+  id                  String                   @id @default(uuid())
+  clientId            String
+  email               String
+  normalizedEmail     String
+  firstName           String?
+  lastName            String?
+  metadata            String?
+  status              EmailContactStatus       @default(PENDING)
+  verified            Boolean                  @default(false)
+  hasMarketingConsent Boolean                  @default(false)
+  consentTimestamp    DateTime?
+  consentSource       String?
+  unsubscribedAt      DateTime?
+  unsubscribeReason   String?
+  lastEmailedAt       DateTime?
+  createdAt           DateTime                 @default(now())
+  updatedAt           DateTime                 @updatedAt
+
+  client              ApiClient                @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  listMemberships     EmailListMember[]
+  campaignRecipients  EmailCampaignRecipient[]
+
+  @@unique([clientId, normalizedEmail])
+  @@index([clientId])
+  @@index([normalizedEmail])
+  @@index([status])
+}
+
+model EmailList {
+  id          String            @id @default(uuid())
+  clientId    String
+  name        String
+  description String?
+  active      Boolean           @default(true)
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+
+  client      ApiClient         @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  members     EmailListMember[]
+  campaigns   EmailCampaign[]
+
+  @@unique([clientId, name])
+  @@index([clientId])
+  @@index([active])
+}
+
+model EmailListMember {
+  id             String                  @id @default(uuid())
+  listId         String
+  contactId      String
+  status         EmailSubscriptionStatus @default(SUBSCRIBED)
+  subscribedAt   DateTime                @default(now())
+  unsubscribedAt DateTime?
+  createdAt      DateTime                @default(now())
+  updatedAt      DateTime                @updatedAt
+
+  list           EmailList               @relation(fields: [listId], references: [id], onDelete: Cascade)
+  contact        EmailContact            @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  @@unique([listId, contactId])
+  @@index([listId])
+  @@index([contactId])
+  @@index([status])
+}
+
+model EmailSegment {
+  id          String          @id @default(uuid())
+  clientId    String
+  name        String
+  description String?
+  criteria    String
+  active      Boolean         @default(true)
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  client      ApiClient       @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  campaigns   EmailCampaign[]
+
+  @@unique([clientId, name])
+  @@index([clientId])
+  @@index([active])
+}
+
+model EmailTemplate {
+  id              String                 @id @default(uuid())
+  clientId        String
+  name            String
+  description     String?
+  type            EmailTemplateType
+  activeVersionId String?
+  createdAt       DateTime               @default(now())
+  updatedAt       DateTime               @updatedAt
+
+  client          ApiClient              @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  versions        EmailTemplateVersion[]
+
+  @@unique([clientId, name])
+  @@index([clientId])
+  @@index([type])
+}
+
+model EmailTemplateVersion {
+  id             String          @id @default(uuid())
+  templateId     String
+  version        Int             @default(1)
+  subject        String
+  htmlContent    String
+  textContent    String?
+  variableSchema String?
+  status         String          @default("ACTIVE")
+  createdAt      DateTime        @default(now())
+
+  template       EmailTemplate   @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  campaigns      EmailCampaign[]
+
+  @@unique([templateId, version])
+  @@index([templateId])
+}
+
+model EmailCampaign {
+  id                 String                   @id @default(uuid())
+  clientId           String
+  name               String
+  description        String?
+  status             EmailCampaignStatus      @default(DRAFT)
+  type               EmailType                @default(PROMOTIONAL)
+  templateVersionId  String?
+  segmentId          String?
+  listId             String?
+  senderIdentityId   String?
+  scheduledAt        DateTime?
+  startedAt          DateTime?
+  completedAt        DateTime?
+  totalRecipients    Int                      @default(0)
+  sentCount          Int                      @default(0)
+  deliveredCount     Int                      @default(0)
+  bouncedCount       Int                      @default(0)
+  complaintCount     Int                      @default(0)
+  unsubscribedCount  Int                      @default(0)
+  createdAt          DateTime                 @default(now())
+  updatedAt          DateTime                 @updatedAt
+
+  client             ApiClient                @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  templateVersion    EmailTemplateVersion?    @relation(fields: [templateVersionId], references: [id], onDelete: SetNull)
+  segment            EmailSegment?            @relation(fields: [segmentId], references: [id], onDelete: SetNull)
+  list               EmailList?               @relation(fields: [listId], references: [id], onDelete: SetNull)
+  senderIdentity     EmailSenderIdentity?     @relation(fields: [senderIdentityId], references: [id], onDelete: SetNull)
+  recipients         EmailCampaignRecipient[]
+
+  @@index([clientId])
+  @@index([status])
+  @@index([scheduledAt])
+  @@index([templateVersionId])
+  @@index([senderIdentityId])
+}
+
+model EmailCampaignRecipient {
+  id               String          @id @default(uuid())
+  campaignId       String
+  contactId        String?
+  email            String
+  metadataSnapshot String?
+  status           String          @default("PENDING")
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  campaign         EmailCampaign   @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  contact          EmailContact?   @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  deliveries       EmailDelivery[]
+
+  @@unique([campaignId, email])
+  @@index([campaignId])
+  @@index([contactId])
+  @@index([status])
+}
+
+model EmailDelivery {
+  id                     String                  @id @default(uuid())
+  clientId               String
+  providerType           EmailProviderType
+  providerMessageId      String?
+  campaignRecipientId    String?
+  transactionalReference String?
+  category               EmailType
+  from                   String
+  to                     String
+  subject                String
+  status                 EmailDeliveryStatus     @default(QUEUED)
+  attemptCount           Int                     @default(0)
+  lastAttemptAt          DateTime?
+  nextAttemptAt          DateTime?
+  sentAt                 DateTime?
+  deliveredAt            DateTime?
+  failedAt               DateTime?
+  errorCode              String?
+  errorMessage           String?
+  idempotencyKey         String?
+  createdAt              DateTime                @default(now())
+  updatedAt              DateTime                @updatedAt
+
+  client                 ApiClient               @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  campaignRecipient      EmailCampaignRecipient? @relation(fields: [campaignRecipientId], references: [id], onDelete: SetNull)
+  events                 EmailEvent[]
+
+  @@unique([clientId, idempotencyKey])
+  @@index([clientId])
+  @@index([status])
+  @@index([to])
+  @@index([providerMessageId])
+  @@index([category])
+  @@index([createdAt])
+  @@index([campaignRecipientId])
+}
+
+model EmailEvent {
+  id              String         @id @default(uuid())
+  clientId        String?
+  deliveryId      String?
+  providerEventId String?        @unique
+  eventType       EmailEventType
+  recipient       String
+  payload         String
+  occurredAt      DateTime       @default(now())
+  createdAt       DateTime       @default(now())
+
+  client          ApiClient?     @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  delivery        EmailDelivery? @relation(fields: [deliveryId], references: [id], onDelete: SetNull)
+
+  @@index([clientId])
+  @@index([deliveryId])
+  @@index([eventType])
+  @@index([providerEventId])
+  @@index([occurredAt])
+}
+
+model EmailSuppression {
+  id              String                 @id @default(uuid())
+  clientId        String
+  email           String
+  normalizedEmail String
+  reason          EmailSuppressionReason
+  source          String?
+  metadata        String?
+  createdAt       DateTime               @default(now())
+  updatedAt       DateTime               @updatedAt
+
+  client          ApiClient              @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@unique([clientId, normalizedEmail])
+  @@index([clientId])
+  @@index([normalizedEmail])
+  @@index([reason])
 }
