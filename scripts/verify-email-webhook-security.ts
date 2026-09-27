@@ -28,6 +28,7 @@ process.env.API_KEY_PEPPER = "webhook-security-pepper-32-chars-min";
 import crypto from "crypto";
 import { NextRequest } from "next/server";
 import { prisma } from "../src/lib/prisma";
+import { closeAllQueues } from "../src/lib/email/queue/queues";
 import { POST as webhookRoute } from "../src/app/api/email/webhooks/[provider]/route";
 import {
   EmailEventService,
@@ -110,6 +111,7 @@ async function main() {
   // Active Mock config for Alpha
   const configAlphaMock = await prisma.emailProviderConfig.create({
     data: {
+      name: `Mock Alpha ${testRunId}`,
       clientId: tenantAlpha.id,
       providerType: EmailProviderType.MOCK,
       status: "ACTIVE",
@@ -120,6 +122,7 @@ async function main() {
   // Active Mock config for Beta
   const configBetaMock = await prisma.emailProviderConfig.create({
     data: {
+      name: `Mock Beta ${testRunId}`,
       clientId: tenantBeta.id,
       providerType: EmailProviderType.MOCK,
       status: "ACTIVE",
@@ -130,6 +133,7 @@ async function main() {
   // Active Gmail config for Alpha
   const configAlphaGmail = await prisma.emailProviderConfig.create({
     data: {
+      name: `Gmail Alpha ${testRunId}`,
       clientId: tenantAlpha.id,
       providerType: EmailProviderType.GMAIL,
       status: "ACTIVE",
@@ -140,6 +144,7 @@ async function main() {
   // Active SES config for Alpha
   const configAlphaSes = await prisma.emailProviderConfig.create({
     data: {
+      name: `SES Alpha ${testRunId}`,
       clientId: tenantAlpha.id,
       providerType: EmailProviderType.SES,
       status: "ACTIVE",
@@ -150,6 +155,7 @@ async function main() {
   // Inactive config
   const configInactive = await prisma.emailProviderConfig.create({
     data: {
+      name: `Inactive Alpha ${testRunId}`,
       clientId: tenantAlpha.id,
       providerType: EmailProviderType.MOCK,
       status: "INACTIVE",
@@ -160,6 +166,7 @@ async function main() {
   // Config without webhook secret configured
   const configNoSecret = await prisma.emailProviderConfig.create({
     data: {
+      name: `NoSecret Alpha ${testRunId}`,
       clientId: tenantAlpha.id,
       providerType: EmailProviderType.MOCK,
       status: "ACTIVE",
@@ -319,6 +326,7 @@ async function main() {
   // 3a. Direct unverified SES payload without signature or secret
   const configSesNoSecret = await prisma.emailProviderConfig.create({
     data: {
+      name: `SES NoSecret Alpha ${testRunId}`,
       clientId: tenantAlpha.id,
       providerType: EmailProviderType.SES,
       status: "ACTIVE",
@@ -996,20 +1004,21 @@ async function main() {
     where: { id: { in: [tenantAlpha.id, tenantBeta.id] } },
   });
 
+  await closeAllQueues();
+  await prisma.$disconnect();
+
   console.log("================================================================================");
   console.log(`RESULTS: ${passed} PASSED, ${failed} FAILED`);
   console.log("================================================================================");
 
   if (failed > 0) {
     process.exit(1);
+  } else {
+    process.exit(0);
   }
 }
 
-main()
-  .catch((err) => {
-    console.error("Fatal error during test suite execution:", err);
-    process.exit(1);
-  })
-  .finally(async () => {
-    await prisma.$disconnect();
-  });
+main().catch((err) => {
+  console.error("Fatal error during test suite execution:", err);
+  process.exit(1);
+});

@@ -204,7 +204,7 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
       {
         success: false,
         error: {
-          code: "BAD_REQUEST",
+          code: "INVALID_PAYLOAD",
           message: `Failed to parse or normalize webhook payload: ${msg}`,
         },
       },

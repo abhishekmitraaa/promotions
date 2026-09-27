@@ -9,6 +9,8 @@
 
 import { prisma } from "../prisma";
 import { TemplateEngine } from "../email/template-engine";
+import { isValidEmail } from "../email/normalization";
+import { providerRegistry } from "../email/registry";
 import { EmailTemplate, EmailTemplateVersion, EmailTemplateType } from "@prisma/client";
 
 export interface CreateTemplateInput {
@@ -250,5 +252,129 @@ export class EmailTemplateService {
     });
 
     return { deleted: true };
+  }
+
+  /**
+   * Updates template metadata and safe active version pointer.
+   */
+  static async updateTemplate(
+    clientId: string,
+    templateId: string,
+    input: {
+      name?: string;
+      description?: string | null;
+      type?: EmailTemplateType;
+      activeVersionId?: string;
+    }
+  ): Promise<EmailTemplate & { activeVersion: EmailTemplateVersion | null; versions: EmailTemplateVersion[] }> {
+    const template = await prisma.emailTemplate.findFirst({
+      where: { id: templateId, clientId },
+      include: { versions: { orderBy: { version: "desc" } } },
+    });
+
+    if (!template) {
+      throw new Error(`Template '${templateId}' not found for tenant '${clientId}'.`);
+    }
+
+    const data: Record<string, unknown> = {};
+    if (input.name !== undefined) {
+      const clean = input.name.trim();
+      if (!clean) throw new Error("Template name cannot be empty");
+      data.name = clean;
+    }
+    if (input.description !== undefined) {
+      data.description = input.description?.trim() || null;
+    }
+    if (input.type !== undefined) {
+      data.type = input.type;
+    }
+    if (input.activeVersionId !== undefined) {
+      // Safe activation: ensure the version belongs to this template
+      const ver = template.versions.find((v) => v.id === input.activeVersionId);
+      if (!ver) {
+        throw new Error(
+          `Version '${input.activeVersionId}' does not belong to template '${templateId}'.`
+        );
+      }
+      data.activeVersionId = input.activeVersionId;
+    }
+
+    const updated = await prisma.emailTemplate.update({
+      where: { id: template.id },
+      data,
+      include: {
+        versions: {
+          orderBy: { version: "desc" },
+        },
+      },
+    });
+
+    const activeVersion =
+      updated.versions.find((v) => v.id === updated.activeVersionId) ||
+      updated.versions[0] ||
+      null;
+
+    return { ...updated, activeVersion };
+  }
+
+  /**
+   * Sends a test email for a template/version without creating campaign recipient records.
+   */
+  static async sendTestEmail(
+    clientId: string,
+    templateId: string,
+    testEmail: string,
+    customVariables: Record<string, unknown> = {},
+    versionId?: string
+  ): Promise<{ success: boolean; providerMessageId?: string; sentTo: string }> {
+    if (!isValidEmail(testEmail)) {
+      throw new Error(`Invalid test email address: '${testEmail}'`);
+    }
+
+    const template = await this.getTemplateById(clientId, templateId);
+    if (!template) {
+      throw new Error(`Template '${templateId}' not found for tenant '${clientId}'.`);
+    }
+
+    const targetVersion = versionId
+      ? template.versions.find((v) => v.id === versionId)
+      : template.activeVersion;
+
+    if (!targetVersion) {
+      throw new Error(`No valid template version found to test.`);
+    }
+
+    const sampleVariables = {
+      firstName: "TestUser",
+      lastName: "Tester",
+      email: testEmail,
+      ...customVariables,
+    };
+
+    const rendered = TemplateEngine.renderTemplate(targetVersion, sampleVariables);
+
+    const resolved = await providerRegistry.resolveForTenant(clientId);
+    const provider = resolved.provider;
+    const senderEmail = resolved.senderEmail || "test@whatsapphub.internal";
+
+    const result = await provider.send({
+      clientId,
+      type: "TRANSACTIONAL",
+      to: testEmail,
+      from: senderEmail,
+      subject: `[TEST] ${rendered.subject}`,
+      html: rendered.html,
+      text: rendered.text,
+    });
+
+    if (!result.accepted) {
+      throw new Error(result.error?.message || "Test email delivery failed.");
+    }
+
+    return {
+      success: true,
+      providerMessageId: result.providerMessageId,
+      sentTo: testEmail,
+    };
   }
 }

@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 
 interface SuppressionItem {
   id: string;
@@ -17,6 +18,9 @@ export default function SuppressionsPage() {
   const [showAddModal, setShowAddModal] = useState(false);
   const [newEmail, setNewEmail] = useState("");
   const [newReason, setNewReason] = useState("MANUAL");
+  const [adding, setAdding] = useState(false);
+  const [addError, setAddError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   async function loadSuppressions() {
     try {
@@ -38,34 +42,59 @@ export default function SuppressionsPage() {
 
   async function handleAdd(e: React.FormEvent) {
     e.preventDefault();
+    setAdding(true);
+    setAddError(null);
+    setActionError(null);
+
     try {
       const res = await fetch("/api/email/suppressions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email: newEmail, reason: newReason, source: "DASHBOARD_MANUAL" }),
+        body: JSON.stringify({ email: newEmail.trim(), reason: newReason, source: "DASHBOARD_MANUAL" }),
       });
 
-      if (res.ok) {
-        setShowAddModal(false);
-        setNewEmail("");
-        loadSuppressions();
+      const json = await res.json();
+      if (!res.ok) {
+        const msg =
+          res.status === 403
+            ? "Permission Denied: Adding suppressions requires ADMIN role. VIEWER accounts are strictly read-only."
+            : json.error?.message || "Failed to add suppression";
+        setAddError(msg);
+        return;
       }
-    } catch {
-      // Safe fallback
+
+      setShowAddModal(false);
+      setNewEmail("");
+      loadSuppressions();
+    } catch (err) {
+      setAddError(err instanceof Error ? err.message : "Error adding suppression");
+    } finally {
+      setAdding(false);
     }
   }
 
   async function handleRemove(emailToRemove: string) {
     if (!confirm(`Are you sure you want to remove suppression for ${emailToRemove}?`)) return;
+    setActionError(null);
+
     try {
       const res = await fetch(`/api/email/suppressions?email=${encodeURIComponent(emailToRemove)}`, {
         method: "DELETE",
       });
-      if (res.ok) {
-        loadSuppressions();
+
+      const json = await res.json();
+      if (!res.ok) {
+        const msg =
+          res.status === 403
+            ? "Permission Denied: Removing suppressions requires ADMIN role. VIEWER accounts are strictly read-only."
+            : json.error?.message || "Failed to remove suppression";
+        setActionError(msg);
+        return;
       }
-    } catch {
-      // Safe fallback
+
+      loadSuppressions();
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : "Error removing suppression");
     }
   }
 
@@ -75,6 +104,7 @@ export default function SuppressionsPage() {
 
   return (
     <div className="space-y-6">
+      {/* Top Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
           <h1 className="text-2xl font-bold tracking-tight text-white">Suppression Management</h1>
@@ -82,14 +112,35 @@ export default function SuppressionsPage() {
             Tenant-scoped suppression list protecting against sending to hard bounces, complaints, and unsubscribes.
           </p>
         </div>
-        <button
-          onClick={() => setShowAddModal(true)}
-          className="px-4 py-2 bg-sky-600 hover:bg-sky-500 text-white rounded-lg text-sm font-medium transition"
-        >
-          + Add Suppression
-        </button>
+        <div className="flex items-center gap-3">
+          <Link
+            href="/dashboard/email"
+            className="px-3 py-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded-lg text-sm font-medium transition"
+          >
+            &larr; Overview
+          </Link>
+          <button
+            onClick={() => {
+              setAddError(null);
+              setShowAddModal(true);
+            }}
+            className="px-4 py-2 bg-sky-600 hover:bg-sky-500 text-white rounded-lg text-sm font-medium transition"
+          >
+            + Add Suppression
+          </button>
+        </div>
       </div>
 
+      {actionError && (
+        <div className="p-4 bg-rose-500/10 border border-rose-500/20 text-rose-400 rounded-xl text-sm flex items-center justify-between">
+          <span>{actionError}</span>
+          <button onClick={() => setActionError(null)} className="text-zinc-500 hover:text-white">
+            ✕
+          </button>
+        </div>
+      )}
+
+      {/* Filter and Search */}
       <div className="max-w-md">
         <input
           type="text"
@@ -100,6 +151,7 @@ export default function SuppressionsPage() {
         />
       </div>
 
+      {/* Suppressions Table */}
       {loading ? (
         <div className="flex items-center justify-center min-h-[300px]">
           <div className="w-8 h-8 border-2 border-sky-500 border-t-transparent rounded-full animate-spin"></div>
@@ -141,6 +193,7 @@ export default function SuppressionsPage() {
                         <button
                           onClick={() => handleRemove(s.email)}
                           className="text-xs text-rose-400 hover:text-rose-300 font-medium"
+                          title="Remove suppression (ADMIN only)"
                         >
                           Remove
                         </button>
@@ -159,6 +212,13 @@ export default function SuppressionsPage() {
         <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="bg-zinc-900 border border-zinc-800 rounded-xl max-w-md w-full p-6 space-y-4">
             <h2 className="text-lg font-bold text-white">Add Email Suppression</h2>
+
+            {addError && (
+              <div className="p-3 bg-rose-500/10 border border-rose-500/20 text-rose-400 rounded-lg text-xs">
+                {addError}
+              </div>
+            )}
+
             <form onSubmit={handleAdd} className="space-y-3">
               <div>
                 <label className="text-xs text-zinc-400 block mb-1">Email Address</label>
@@ -195,9 +255,10 @@ export default function SuppressionsPage() {
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-2 bg-sky-600 hover:bg-sky-500 text-white rounded-lg text-sm font-medium transition"
+                  disabled={adding}
+                  className="px-4 py-2 bg-sky-600 hover:bg-sky-500 text-white rounded-lg text-sm font-medium transition disabled:opacity-50"
                 >
-                  Add Suppression
+                  {adding ? "Adding..." : "Add Suppression"}
                 </button>
               </div>
             </form>

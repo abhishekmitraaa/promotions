@@ -140,6 +140,7 @@ async function runPhase6Tests() {
   const origRecipientFindUnique = prisma.emailCampaignRecipient.findUnique;
   const origRecipientFindMany = prisma.emailCampaignRecipient.findMany;
   const origRecipientCreate = prisma.emailCampaignRecipient.create;
+  const origRecipientCreateMany = (prisma.emailCampaignRecipient as any)?.createMany;
   const origRecipientUpdate = prisma.emailCampaignRecipient.update;
   const origRecipientUpdateMany = prisma.emailCampaignRecipient.updateMany;
   const origDeliveryCreate = prisma.emailDelivery.create;
@@ -147,6 +148,7 @@ async function runPhase6Tests() {
   const origDeliveryUpdate = prisma.emailDelivery.update;
   const origDeliveryUpdateMany = prisma.emailDelivery.updateMany;
   const origSuppressionFindUnique = prisma.emailSuppression.findUnique;
+  const origSuppressionFindMany = prisma.emailSuppression.findMany;
   const origListMemberFindMany = prisma.emailListMember.findMany;
   const origContactFindMany = prisma.emailContact.findMany;
 
@@ -316,11 +318,33 @@ async function runPhase6Tests() {
       return inMemoryRecipients.get(where.id) || null;
     };
 
+    (prisma.emailCampaignRecipient as any).findMany = async ({ where }: any) => {
+      const results: any[] = [];
+      for (const r of inMemoryRecipients.values()) {
+        if (where?.campaignId && r.campaignId !== where.campaignId) continue;
+        if (where?.status?.in && !where.status.in.includes(r.status)) continue;
+        if (where?.status && typeof where.status === "string" && r.status !== where.status) continue;
+        results.push(r);
+      }
+      return results;
+    };
+
     (prisma.emailCampaignRecipient as any).create = async ({ data }: any) => {
       const id = `rcp-${Date.now()}-${Math.random().toString(36).substring(7)}`;
       const record = { id, ...data, createdAt: new Date(), updatedAt: new Date() };
       inMemoryRecipients.set(id, record);
       return record;
+    };
+
+    (prisma.emailCampaignRecipient as any).createMany = async ({ data }: any) => {
+      let count = 0;
+      for (const item of data) {
+        const id = `rcp-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+        const record = { id, ...item, createdAt: new Date(), updatedAt: new Date() };
+        inMemoryRecipients.set(id, record);
+        count++;
+      }
+      return { count };
     };
 
     (prisma.emailCampaignRecipient as any).update = async ({ where, data }: any) => {
@@ -390,6 +414,17 @@ async function runPhase6Tests() {
         if (s.clientId === clientId && s.normalizedEmail === normalizedEmail) return s;
       }
       return null;
+    };
+
+    (prisma.emailSuppression as any).findMany = async ({ where }: any) => {
+      const results: any[] = [];
+      const normalizedIn: string[] | undefined = where?.normalizedEmail?.in;
+      for (const s of inMemorySuppressions.values()) {
+        if (where?.clientId && s.clientId !== where.clientId) continue;
+        if (normalizedIn && !normalizedIn.includes(s.normalizedEmail)) continue;
+        results.push(s);
+      }
+      return results;
     };
 
     // List Members mock
@@ -529,9 +564,9 @@ async function runPhase6Tests() {
     inMemoryLists.set(audienceList.id, audienceList);
 
     // Add all 3 contacts as list members
-    inMemoryListMembers.set("m-1", { listId: audienceList.id, contactId: contactEligible.id, status: EmailSubscriptionStatus.SUBSCRIBED });
-    inMemoryListMembers.set("m-2", { listId: audienceList.id, contactId: contactNoConsent.id, status: EmailSubscriptionStatus.SUBSCRIBED });
-    inMemoryListMembers.set("m-3", { listId: audienceList.id, contactId: contactSuppressed.id, status: EmailSubscriptionStatus.SUBSCRIBED });
+    inMemoryListMembers.set("m-1", { id: "m-1", listId: audienceList.id, contactId: contactEligible.id, status: EmailSubscriptionStatus.SUBSCRIBED });
+    inMemoryListMembers.set("m-2", { id: "m-2", listId: audienceList.id, contactId: contactNoConsent.id, status: EmailSubscriptionStatus.SUBSCRIBED });
+    inMemoryListMembers.set("m-3", { id: "m-3", listId: audienceList.id, contactId: contactSuppressed.id, status: EmailSubscriptionStatus.SUBSCRIBED });
 
     // Link campaign to audience list
     await EmailCampaignService.updateCampaign("tenant-alpha", campaign1.id, {
@@ -726,6 +761,8 @@ async function runPhase6Tests() {
     (prisma.emailDelivery as any).update = origDeliveryUpdate;
     (prisma.emailDelivery as any).updateMany = origDeliveryUpdateMany;
     (prisma.emailSuppression as any).findUnique = origSuppressionFindUnique;
+    if (origSuppressionFindMany) (prisma.emailSuppression as any).findMany = origSuppressionFindMany;
+    if (origRecipientCreateMany) (prisma.emailCampaignRecipient as any).createMany = origRecipientCreateMany;
     (prisma.emailListMember as any).findMany = origListMemberFindMany;
     (prisma.emailContact as any).findMany = origContactFindMany;
 

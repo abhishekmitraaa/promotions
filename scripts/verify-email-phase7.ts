@@ -119,6 +119,19 @@ function setupMockPrisma() {
     return store.events.find((e) => e.id === where.id) || null;
   };
 
+  (prisma.emailEvent.findFirst as any) = async ({ where }: any) => {
+    if (!where) return store.events[0] || null;
+    return (
+      store.events.find((e) => {
+        if (where.id && e.id !== where.id) return false;
+        if (where.clientId && e.clientId !== where.clientId) return false;
+        if (where.providerConfigId && e.providerConfigId !== where.providerConfigId) return false;
+        if (where.providerEventId && e.providerEventId !== where.providerEventId) return false;
+        return true;
+      }) || null
+    );
+  };
+
   (prisma.emailEvent.create as any) = async ({ data }: any) => {
     const newEvt = { id: `evt-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`, ...data };
     store.events.push(newEvt);

@@ -181,4 +181,145 @@ export class EmailAnalyticsService {
       },
     };
   }
+
+  /**
+   * Retrieves authoritative aggregated tenant-wide email analytics.
+   * Completely replaces synthetic or hardcoded heuristic metrics.
+   */
+  static async getTenantAnalytics(clientId: string): Promise<{
+    sent: number;
+    delivered: number;
+    failed: number;
+    bounced: number;
+    complaints: number;
+    unsubscribed: number;
+    uniqueOpens: number;
+    uniqueClicks: number;
+    totalOpens: number;
+    totalClicks: number;
+    rates: {
+      deliveryRate: number;
+      bounceRate: number;
+      openRate: number;
+      clickRate: number;
+      complaintRate: number;
+      unsubscribeRate: number;
+    };
+  }> {
+    const [deliveries, campaigns, unsubsCount] = await Promise.all([
+      prisma.emailDelivery.findMany({
+        where: { clientId },
+        select: {
+          id: true,
+          status: true,
+          events: {
+            select: {
+              eventType: true,
+            },
+          },
+        },
+      }),
+      prisma.emailCampaign.findMany({
+        where: { clientId },
+        select: {
+          sentCount: true,
+          deliveredCount: true,
+          bouncedCount: true,
+          complaintCount: true,
+          unsubscribedCount: true,
+        },
+      }),
+      prisma.emailSuppression.count({
+        where: { clientId, reason: "UNSUBSCRIBED" },
+      }),
+    ]);
+
+    let sent = 0;
+    let delivered = 0;
+    let failed = 0;
+    let bounced = 0;
+    let complaints = 0;
+    let uniqueOpens = 0;
+    let uniqueClicks = 0;
+    let totalOpens = 0;
+    let totalClicks = 0;
+
+    if (deliveries.length > 0) {
+      for (const d of deliveries) {
+        if (
+          d.status === EmailDeliveryStatus.SENT ||
+          d.status === EmailDeliveryStatus.DELIVERED ||
+          d.status === EmailDeliveryStatus.BOUNCED ||
+          d.status === EmailDeliveryStatus.COMPLAINED ||
+          d.status === EmailDeliveryStatus.FAILED
+        ) {
+          sent++;
+        }
+
+        let isDelivered = d.status === EmailDeliveryStatus.DELIVERED;
+        if (d.status === EmailDeliveryStatus.FAILED) failed++;
+        else if (d.status === EmailDeliveryStatus.BOUNCED) bounced++;
+        else if (d.status === EmailDeliveryStatus.COMPLAINED) complaints++;
+
+        let opened = false;
+        let clicked = false;
+        for (const evt of d.events) {
+          if (evt.eventType === EmailEventType.OPENED) {
+            totalOpens++;
+            opened = true;
+          } else if (evt.eventType === EmailEventType.CLICKED) {
+            totalClicks++;
+            clicked = true;
+          }
+        }
+
+        // Authoritative consistency: open or click implies delivery
+        if (opened || clicked) isDelivered = true;
+        if (isDelivered) delivered++;
+        if (opened) uniqueOpens++;
+        if (clicked) uniqueClicks++;
+      }
+    } else {
+      // If no granular deliveries exist, aggregate from campaigns
+      for (const c of campaigns) {
+        sent += c.sentCount || 0;
+        delivered += c.deliveredCount || 0;
+        bounced += c.bouncedCount || 0;
+        complaints += c.complaintCount || 0;
+      }
+      failed = Math.max(0, sent - delivered - bounced - complaints);
+    }
+
+    const campaignUnsubs = campaigns.reduce((acc, c) => acc + (c.unsubscribedCount || 0), 0);
+    const unsubscribed = Math.max(unsubsCount, campaignUnsubs);
+
+    // Guard: delivered can never be less than uniqueOpens or uniqueClicks
+    delivered = Math.max(delivered, uniqueOpens, uniqueClicks);
+
+    const safeRate = (numerator: number, denominator: number): number => {
+      if (denominator <= 0) return 0;
+      return Math.round((numerator / denominator) * 10000) / 100;
+    };
+
+    return {
+      sent,
+      delivered,
+      failed,
+      bounced,
+      complaints,
+      unsubscribed,
+      uniqueOpens,
+      uniqueClicks,
+      totalOpens,
+      totalClicks,
+      rates: {
+        deliveryRate: safeRate(delivered, sent),
+        bounceRate: safeRate(bounced, sent),
+        openRate: safeRate(uniqueOpens, delivered),
+        clickRate: safeRate(uniqueClicks, delivered),
+        complaintRate: safeRate(complaints, delivered),
+        unsubscribeRate: safeRate(unsubscribed, delivered),
+      },
+    };
+  }
 }

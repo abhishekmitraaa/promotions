@@ -2,6 +2,7 @@
 
 import { useEffect, useState, Suspense } from "react";
 import { useSearchParams } from "next/navigation";
+import Link from "next/link";
 
 interface ProviderConfig {
   id: string;
@@ -12,6 +13,18 @@ interface ProviderConfig {
   senderEmail: string | null;
   senderName: string | null;
   lastVerifiedAt: string | null;
+  errorMessage?: string | null;
+  createdAt: string;
+}
+
+interface SenderIdentity {
+  id: string;
+  email: string;
+  name: string | null;
+  replyToEmail: string | null;
+  isDefault: boolean;
+  verified: boolean;
+  verifiedAt: string | null;
   createdAt: string;
 }
 
@@ -24,16 +37,36 @@ interface BannerNotice {
 function ProviderSettingsContent() {
   const searchParams = useSearchParams();
   const [providers, setProviders] = useState<ProviderConfig[]>([]);
+  const [senderIdentities, setSenderIdentities] = useState<SenderIdentity[]>([]);
   const [loading, setLoading] = useState(true);
   const [connecting, setConnecting] = useState(false);
   const [banner, setBanner] = useState<BannerNotice | null>(null);
 
-  async function loadProviders() {
+  // Add Sender Identity modal state
+  const [showAddSenderModal, setShowAddSenderModal] = useState(false);
+  const [senderEmail, setSenderEmail] = useState("");
+  const [senderName, setSenderName] = useState("");
+  const [replyToEmail, setReplyToEmail] = useState("");
+  const [isDefaultSender, setIsDefaultSender] = useState(false);
+  const [isVerifiedSender, setIsVerifiedSender] = useState(true);
+  const [addingSender, setAddingSender] = useState(false);
+  const [senderError, setSenderError] = useState<string | null>(null);
+
+  async function loadData() {
     try {
-      const res = await fetch("/api/admin/email/providers");
-      if (res.ok) {
-        const json = await res.json();
+      const [provRes, sndRes] = await Promise.all([
+        fetch("/api/admin/email/providers"),
+        fetch("/api/admin/email/sender-identities"),
+      ]);
+
+      if (provRes.ok) {
+        const json = await provRes.json();
         setProviders(json.data || []);
+      }
+
+      if (sndRes.ok) {
+        const json = await sndRes.json();
+        setSenderIdentities(json.data || []);
       }
     } catch {
       // Safe fallback
@@ -43,7 +76,7 @@ function ProviderSettingsContent() {
   }
 
   useEffect(() => {
-    loadProviders();
+    loadData();
 
     // Check for callback query parameters from Google OAuth redirect
     const status = searchParams.get("status");
@@ -58,8 +91,7 @@ function ProviderSettingsContent() {
           ? `Successfully authenticated and configured sender identity for ${providerParam}.`
           : "Successfully authenticated and configured Google Workspace provider.",
       });
-      // Re-fetch to immediately display newly connected provider in table
-      loadProviders();
+      loadData();
     } else if (status === "error") {
       setBanner({
         type: "error",
@@ -85,7 +117,6 @@ function ProviderSettingsContent() {
       const json = await res.json();
 
       if (res.ok && json.data?.authUrl) {
-        // Redirect browser to Google's consent screen
         window.location.href = json.data.authUrl;
       } else {
         setBanner({
@@ -105,13 +136,110 @@ function ProviderSettingsContent() {
     }
   }
 
+  async function handleSetDefaultProvider(providerId: string) {
+    try {
+      const res = await fetch("/api/admin/email/providers", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: providerId, isDefault: true }),
+      });
+
+      const json = await res.json();
+      if (!res.ok) {
+        alert(json.error || "Failed to set default provider");
+        return;
+      }
+      loadData();
+    } catch {
+      // Safe fallback
+    }
+  }
+
+  async function handleAddSenderIdentity(e: React.FormEvent) {
+    e.preventDefault();
+    setAddingSender(true);
+    setSenderError(null);
+
+    try {
+      const res = await fetch("/api/admin/email/sender-identities", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email: senderEmail.trim(),
+          name: senderName.trim() || undefined,
+          replyToEmail: replyToEmail.trim() || undefined,
+          isDefault: isDefaultSender,
+          verified: isVerifiedSender,
+        }),
+      });
+
+      const json = await res.json();
+      if (!res.ok) {
+        throw new Error(json.error || "Failed to create sender identity");
+      }
+
+      setShowAddSenderModal(false);
+      setSenderEmail("");
+      setSenderName("");
+      setReplyToEmail("");
+      setIsDefaultSender(false);
+      loadData();
+    } catch (err) {
+      setSenderError(err instanceof Error ? err.message : "Error creating sender identity");
+    } finally {
+      setAddingSender(false);
+    }
+  }
+
+  async function handleSetDefaultSender(identity: SenderIdentity) {
+    try {
+      const res = await fetch("/api/admin/email/sender-identities", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email: identity.email,
+          name: identity.name || undefined,
+          replyToEmail: identity.replyToEmail || undefined,
+          verified: identity.verified,
+          isDefault: true,
+        }),
+      });
+
+      if (res.ok) {
+        loadData();
+      }
+    } catch {
+      // Safe fallback
+    }
+  }
+
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold tracking-tight text-white">Email Provider Configuration</h1>
-        <p className="text-sm text-zinc-400">
-          Connect and configure Google Workspace / Gmail OAuth providers. Credentials and tokens are securely encrypted at rest and never exposed.
-        </p>
+      {/* Top Header */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-bold tracking-tight text-white">Email Providers & Sender Identities</h1>
+          <p className="text-sm text-zinc-400">
+            Configure Google Workspace OAuth connections and manage verified sender identities used by campaign workers.
+          </p>
+        </div>
+        <div className="flex items-center gap-3">
+          <Link
+            href="/dashboard/email"
+            className="px-3 py-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded-lg text-sm font-medium transition"
+          >
+            &larr; Overview
+          </Link>
+          <button
+            onClick={() => {
+              setSenderError(null);
+              setShowAddSenderModal(true);
+            }}
+            className="px-4 py-2 bg-sky-600 hover:bg-sky-500 text-white rounded-lg text-sm font-medium transition"
+          >
+            + Add Sender Identity
+          </button>
+        </div>
       </div>
 
       {/* OAuth Callback Notification Banner */}
@@ -140,7 +268,7 @@ function ProviderSettingsContent() {
         </div>
       )}
 
-      {/* Gmail OAuth Connect Card */}
+      {/* Google Workspace OAuth Card */}
       <div className="bg-zinc-900/60 border border-zinc-800 rounded-xl p-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
           <div className="flex items-center gap-2">
@@ -149,6 +277,7 @@ function ProviderSettingsContent() {
           </div>
           <p className="text-xs text-zinc-400 mt-1 max-w-xl">
             Authorizes transactional and campaign dispatch via Google Workspace API with the narrowest scope (<code className="text-zinc-300">gmail.send</code>).
+            Tokens are encrypted at rest with AES-256-GCM.
           </p>
         </div>
         <button
@@ -169,18 +298,18 @@ function ProviderSettingsContent() {
         </button>
       </div>
 
-      {/* Active Providers Table */}
+      {/* Configured Providers Table */}
       <div className="space-y-3">
         <h3 className="text-sm font-semibold text-zinc-400 uppercase tracking-wider">
-          Configured Providers
+          Configured Email Providers
         </h3>
 
         {loading ? (
-          <div className="flex items-center justify-center min-h-[200px]">
+          <div className="flex items-center justify-center min-h-[150px]">
             <div className="w-8 h-8 border-2 border-sky-500 border-t-transparent rounded-full animate-spin"></div>
           </div>
         ) : providers.length === 0 ? (
-          <div className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-8 text-center text-zinc-400">
+          <div className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-8 text-center text-zinc-400 text-xs">
             No external email providers connected yet. Connect Google Workspace to start dispatching.
           </div>
         ) : (
@@ -192,9 +321,9 @@ function ProviderSettingsContent() {
                     <th className="px-5 py-3">Provider Name</th>
                     <th className="px-5 py-3">Type</th>
                     <th className="px-5 py-3">Status</th>
-                    <th className="px-5 py-3">Sender Identity</th>
+                    <th className="px-5 py-3">Connected Sender</th>
                     <th className="px-5 py-3">Default</th>
-                    <th className="px-5 py-3">Connected Date</th>
+                    <th className="px-5 py-3">Action</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-zinc-800/60">
@@ -203,7 +332,13 @@ function ProviderSettingsContent() {
                       <td className="px-5 py-3.5 font-medium text-white">{p.name}</td>
                       <td className="px-5 py-3.5 text-xs text-zinc-400">{p.providerType}</td>
                       <td className="px-5 py-3.5">
-                        <span className="text-xs px-2 py-0.5 rounded font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                        <span
+                          className={`text-xs px-2 py-0.5 rounded font-medium border ${
+                            p.status === "ACTIVE"
+                              ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
+                              : "bg-rose-500/10 text-rose-400 border-rose-500/20"
+                          }`}
+                        >
                           {p.status}
                         </span>
                       </td>
@@ -212,13 +347,20 @@ function ProviderSettingsContent() {
                       </td>
                       <td className="px-5 py-3.5 text-xs">
                         {p.isDefault ? (
-                          <span className="text-emerald-400 font-medium">Default</span>
+                          <span className="text-emerald-400 font-semibold">✓ Default</span>
                         ) : (
                           <span className="text-zinc-500">—</span>
                         )}
                       </td>
-                      <td className="px-5 py-3.5 text-xs text-zinc-500">
-                        {new Date(p.createdAt).toLocaleDateString()}
+                      <td className="px-5 py-3.5 text-xs">
+                        {!p.isDefault && (
+                          <button
+                            onClick={() => handleSetDefaultProvider(p.id)}
+                            className="text-sky-400 hover:text-sky-300 font-medium transition"
+                          >
+                            Set Default
+                          </button>
+                        )}
                       </td>
                     </tr>
                   ))}
@@ -228,6 +370,170 @@ function ProviderSettingsContent() {
           </div>
         )}
       </div>
+
+      {/* Verified Sender Identities Table */}
+      <div className="space-y-3 pt-4 border-t border-zinc-800">
+        <div className="flex items-center justify-between">
+          <div>
+            <h3 className="text-sm font-semibold text-zinc-400 uppercase tracking-wider">
+              Sender Identities
+            </h3>
+            <p className="text-xs text-zinc-500">
+              Verified From addresses that campaign workers bind to during dispatch.
+            </p>
+          </div>
+        </div>
+
+        {senderIdentities.length === 0 ? (
+          <div className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-8 text-center text-zinc-400 text-xs">
+            No sender identities registered. Workers will fallback to the connected default provider address.
+          </div>
+        ) : (
+          <div className="bg-zinc-900/50 border border-zinc-800 rounded-xl overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-sm text-zinc-300">
+                <thead className="bg-zinc-800/40 text-xs uppercase text-zinc-400 border-b border-zinc-800">
+                  <tr>
+                    <th className="px-5 py-3">From Address</th>
+                    <th className="px-5 py-3">Display Name</th>
+                    <th className="px-5 py-3">Reply-To</th>
+                    <th className="px-5 py-3">Verification</th>
+                    <th className="px-5 py-3">Default</th>
+                    <th className="px-5 py-3">Action</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-zinc-800/60">
+                  {senderIdentities.map((s) => (
+                    <tr key={s.id} className="hover:bg-zinc-800/20 transition">
+                      <td className="px-5 py-3.5 font-medium text-white font-mono text-xs">{s.email}</td>
+                      <td className="px-5 py-3.5 text-zinc-300">{s.name || "—"}</td>
+                      <td className="px-5 py-3.5 text-xs text-zinc-400 font-mono">{s.replyToEmail || "—"}</td>
+                      <td className="px-5 py-3.5">
+                        {s.verified ? (
+                          <span className="text-xs px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-medium">
+                            ✓ Verified
+                          </span>
+                        ) : (
+                          <span className="text-xs px-2 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/20">
+                            Unverified
+                          </span>
+                        )}
+                      </td>
+                      <td className="px-5 py-3.5 text-xs">
+                        {s.isDefault ? (
+                          <span className="text-emerald-400 font-semibold">✓ Default</span>
+                        ) : (
+                          <span className="text-zinc-500">—</span>
+                        )}
+                      </td>
+                      <td className="px-5 py-3.5 text-xs">
+                        {!s.isDefault && (
+                          <button
+                            onClick={() => handleSetDefaultSender(s)}
+                            className="text-sky-400 hover:text-sky-300 font-medium transition"
+                          >
+                            Set Default
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Add Sender Identity Modal */}
+      {showAddSenderModal && (
+        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-zinc-900 border border-zinc-800 rounded-xl max-w-md w-full p-6 space-y-4">
+            <h2 className="text-lg font-bold text-white">Add Sender Identity</h2>
+
+            {senderError && (
+              <div className="p-3 bg-rose-500/10 border border-rose-500/20 text-rose-400 rounded-lg text-xs">
+                {senderError}
+              </div>
+            )}
+
+            <form onSubmit={handleAddSenderIdentity} className="space-y-3">
+              <div>
+                <label className="text-xs text-zinc-400 block mb-1">Sender Email Address</label>
+                <input
+                  type="email"
+                  required
+                  placeholder="marketing@example.com"
+                  value={senderEmail}
+                  onChange={(e) => setSenderEmail(e.target.value)}
+                  className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-sky-500"
+                />
+              </div>
+
+              <div>
+                <label className="text-xs text-zinc-400 block mb-1">Display Name (Optional)</label>
+                <input
+                  type="text"
+                  placeholder="e.g. Acme Promotions"
+                  value={senderName}
+                  onChange={(e) => setSenderName(e.target.value)}
+                  className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-sky-500"
+                />
+              </div>
+
+              <div>
+                <label className="text-xs text-zinc-400 block mb-1">Reply-To Address (Optional)</label>
+                <input
+                  type="email"
+                  placeholder="support@example.com"
+                  value={replyToEmail}
+                  onChange={(e) => setReplyToEmail(e.target.value)}
+                  className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-sky-500"
+                />
+              </div>
+
+              <div className="pt-2 border-t border-zinc-800 space-y-2">
+                <label className="flex items-center gap-2 cursor-pointer text-sm text-zinc-300">
+                  <input
+                    type="checkbox"
+                    checked={isVerifiedSender}
+                    onChange={(e) => setIsVerifiedSender(e.target.checked)}
+                    className="rounded bg-zinc-950 border-zinc-700 text-sky-500 focus:ring-0"
+                  />
+                  <span>Mark as verified identity (authorized sender)</span>
+                </label>
+
+                <label className="flex items-center gap-2 cursor-pointer text-sm text-zinc-300">
+                  <input
+                    type="checkbox"
+                    checked={isDefaultSender}
+                    onChange={(e) => setIsDefaultSender(e.target.checked)}
+                    className="rounded bg-zinc-950 border-zinc-700 text-sky-500 focus:ring-0"
+                  />
+                  <span>Set as tenant default sender identity</span>
+                </label>
+              </div>
+
+              <div className="flex justify-end gap-2 pt-3">
+                <button
+                  type="button"
+                  onClick={() => setShowAddSenderModal(false)}
+                  className="px-4 py-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded-lg text-sm transition"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={addingSender}
+                  className="px-4 py-2 bg-sky-600 hover:bg-sky-500 text-white rounded-lg text-sm font-medium transition disabled:opacity-50"
+                >
+                  {addingSender ? "Saving..." : "Save Identity"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import Link from "next/link";
 
 interface DeliveryItem {
   id: string;
@@ -53,11 +54,21 @@ export default function DeliveriesPage() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold tracking-tight text-white">Email Deliveries</h1>
-        <p className="text-sm text-zinc-400">
-          Delivery status telemetry and complete event timeline history.
-        </p>
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-bold tracking-tight text-white">Email Deliveries</h1>
+          <p className="text-sm text-zinc-400">
+            Delivery status telemetry and complete event timeline history.
+          </p>
+        </div>
+        <div className="flex items-center gap-3">
+          <Link
+            href="/dashboard/email"
+            className="px-3 py-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded-lg text-sm font-medium transition"
+          >
+            &larr; Overview
+          </Link>
+        </div>
       </div>
 
       {/* Filter Bar */}

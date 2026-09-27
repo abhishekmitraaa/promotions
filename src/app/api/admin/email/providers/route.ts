@@ -10,7 +10,7 @@ export async function GET(req: NextRequest) {
 
   try {
     const { searchParams } = new URL(req.url);
-    const clientId = searchParams.get("clientId");
+    const clientId = searchParams.get("clientId") || undefined;
 
     const providers = await prisma.emailProviderConfig.findMany({
       where: clientId ? { clientId } : undefined,
@@ -110,6 +110,50 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ success: true, data: providerConfig }, { status: 201 });
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Error creating email provider";
+    return NextResponse.json({ success: false, error: msg }, { status: 500 });
+  }
+}
+
+export async function PATCH(req: NextRequest) {
+  // Only ADMIN can mutate email providers
+  const auth = await requireUser(req, "ADMIN");
+  if (auth.response) return auth.response;
+
+  try {
+    const body = await req.json();
+    const { id, isDefault, status, clientId } = body;
+
+    if (!id) {
+      return NextResponse.json({ success: false, error: "id is required" }, { status: 400 });
+    }
+
+    const provider = await prisma.emailProviderConfig.findUnique({ where: { id } });
+    if (!provider) {
+      return NextResponse.json({ success: false, error: "Provider not found" }, { status: 404 });
+    }
+
+    if (clientId && provider.clientId !== clientId) {
+      return NextResponse.json({ success: false, error: "Forbidden: provider belongs to another tenant" }, { status: 403 });
+    }
+
+    if (isDefault) {
+      await prisma.emailProviderConfig.updateMany({
+        where: { clientId: provider.clientId, isDefault: true },
+        data: { isDefault: false },
+      });
+    }
+
+    const updated = await prisma.emailProviderConfig.update({
+      where: { id },
+      data: {
+        isDefault: isDefault !== undefined ? Boolean(isDefault) : undefined,
+        status: status || undefined,
+      },
+    });
+
+    return NextResponse.json({ success: true, data: updated });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Error updating provider";
     return NextResponse.json({ success: false, error: msg }, { status: 500 });
   }
 }

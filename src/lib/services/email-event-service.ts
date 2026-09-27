@@ -184,6 +184,18 @@ export class EmailEventService {
       clientId = providerConfig.clientId;
     } else if (event.clientId) {
       clientId = event.clientId;
+    } else if (event.deliveryId) {
+      const d = await prisma.emailDelivery.findUnique({
+        where: { id: event.deliveryId },
+        select: { clientId: true },
+      });
+      if (d) clientId = d.clientId;
+    } else if (event.providerMessageId) {
+      const d = await prisma.emailDelivery.findFirst({
+        where: { providerMessageId: event.providerMessageId },
+        select: { clientId: true },
+      });
+      if (d) clientId = d.clientId;
     }
 
     if (!clientId) {

@@ -62,54 +62,34 @@ export default function EmailDashboardPage() {
   useEffect(() => {
     async function loadDashboard() {
       try {
-        // Fetch campaigns
+        // 1. Fetch authoritative analytics from backend
+        const analyticsRes = await fetch("/api/email/analytics");
+        if (analyticsRes.ok) {
+          const json = await analyticsRes.json();
+          if (json.data) {
+            setMetrics({
+              sent: json.data.sent || 0,
+              delivered: json.data.delivered || 0,
+              failed: json.data.failed || 0,
+              bounced: json.data.bounced || 0,
+              complaints: json.data.complaints || 0,
+              unsubscribed: json.data.unsubscribed || 0,
+              openRate: json.data.rates?.openRate ?? 0,
+              clickRate: json.data.rates?.clickRate ?? 0,
+            });
+          }
+        }
+
+        // 2. Fetch campaigns list
         const campRes = await fetch("/api/email/campaigns");
         if (campRes.ok) {
           const json = await campRes.json();
           if (json.data) {
             setCampaigns(json.data.slice(0, 5));
-
-            let totalSent = 0;
-            let totalDelivered = 0;
-            let totalBounced = 0;
-            let totalComplaints = 0;
-            let totalUnsubscribed = 0;
-            let totalUniqueOpens = 0;
-            let totalUniqueClicks = 0;
-
-            for (const c of json.data) {
-              totalSent += c.sentCount || 0;
-              totalDelivered += c.deliveredCount || 0;
-              totalBounced += c.bouncedCount || 0;
-              totalComplaints += c.complaintCount || 0;
-              totalUnsubscribed += c.unsubscribedCount || 0;
-              totalUniqueOpens += c.uniqueOpens || 0;
-              totalUniqueClicks += c.uniqueClicks || 0;
-            }
-
-            const openRate =
-              totalDelivered > 0
-                ? Math.round((totalUniqueOpens / totalDelivered) * 10000) / 100
-                : 0;
-            const clickRate =
-              totalDelivered > 0
-                ? Math.round((totalUniqueClicks / totalDelivered) * 10000) / 100
-                : 0;
-
-            setMetrics({
-              sent: totalSent,
-              delivered: totalDelivered,
-              failed: Math.max(0, totalSent - totalDelivered - totalBounced),
-              bounced: totalBounced,
-              complaints: totalComplaints,
-              unsubscribed: totalUnsubscribed,
-              openRate,
-              clickRate,
-            });
           }
         }
 
-        // Fetch provider status
+        // 3. Fetch provider status
         const provRes = await fetch("/api/admin/email/providers");
         if (provRes.ok) {
           const json = await provRes.json();
@@ -178,6 +158,37 @@ export default function EmailDashboardPage() {
             Templates
           </Link>
         </div>
+      </div>
+
+      {/* Top Navigation Submodule Tabs */}
+      <div className="flex flex-wrap items-center gap-2 border-b border-zinc-800 pb-3 text-xs">
+        <Link href="/dashboard/email" className="px-3 py-1.5 rounded-lg bg-sky-500/10 text-sky-400 font-semibold border border-sky-500/20">
+          Overview
+        </Link>
+        <Link href="/dashboard/email/campaigns" className="px-3 py-1.5 rounded-lg bg-zinc-900 text-zinc-300 hover:text-white border border-zinc-800 transition">
+          Campaigns
+        </Link>
+        <Link href="/dashboard/email/templates" className="px-3 py-1.5 rounded-lg bg-zinc-900 text-zinc-300 hover:text-white border border-zinc-800 transition">
+          Templates
+        </Link>
+        <Link href="/dashboard/email/contacts" className="px-3 py-1.5 rounded-lg bg-zinc-900 text-zinc-300 hover:text-white border border-zinc-800 transition">
+          Contacts & Consent
+        </Link>
+        <Link href="/dashboard/email/lists" className="px-3 py-1.5 rounded-lg bg-zinc-900 text-zinc-300 hover:text-white border border-zinc-800 transition">
+          Lists
+        </Link>
+        <Link href="/dashboard/email/segments" className="px-3 py-1.5 rounded-lg bg-zinc-900 text-zinc-300 hover:text-white border border-zinc-800 transition">
+          Segments
+        </Link>
+        <Link href="/dashboard/email/deliveries" className="px-3 py-1.5 rounded-lg bg-zinc-900 text-zinc-300 hover:text-white border border-zinc-800 transition">
+          Deliveries
+        </Link>
+        <Link href="/dashboard/email/providers" className="px-3 py-1.5 rounded-lg bg-zinc-900 text-zinc-300 hover:text-white border border-zinc-800 transition">
+          Providers
+        </Link>
+        <Link href="/dashboard/email/suppressions" className="px-3 py-1.5 rounded-lg bg-zinc-900 text-zinc-300 hover:text-white border border-zinc-800 transition">
+          Suppressions
+        </Link>
       </div>
 
       {/* KPI Cards Grid */}

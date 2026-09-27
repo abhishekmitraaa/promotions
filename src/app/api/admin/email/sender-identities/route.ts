@@ -9,7 +9,7 @@ export async function GET(req: NextRequest) {
 
   try {
     const { searchParams } = new URL(req.url);
-    const clientId = searchParams.get("clientId");
+    const clientId = searchParams.get("clientId") || undefined;
 
     const identities = await prisma.emailSenderIdentity.findMany({
       where: clientId ? { clientId } : undefined,

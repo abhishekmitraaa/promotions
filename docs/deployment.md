@@ -107,6 +107,11 @@ DIRECT_URL="postgresql://postgres:[PASSWORD]@[HOST]:5432/postgres"
 
 # Redis Queue Connection
 REDIS_URL="rediss://default:[PASSWORD]@[HOST]:6379"
+REDIS_HOST="your-redis-host"
+REDIS_PORT=6379
+
+# Worker Concurrency Tuning
+EMAIL_WORKER_CONCURRENCY=5
 
 # Security & Encryption Secrets (All must be 32+ characters)
 AUTH_SESSION_SECRET="production-session-secret-at-least-32-chars-long"
@@ -131,7 +136,27 @@ DEV_ALLOW_UNCONFIGURED_META=false
 
 ---
 
-## 4. Production Deployment Checklist
+## 4. Disposable Testing Infrastructure for Local & CI Certification
+
+For running full certification passes without touching production Supabase:
+
+```bash
+# 1. Start disposable PostgreSQL (e.g. port 5433)
+docker run -d --name disposable-email-postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=email_test -p 5433:5432 postgres:16-alpine
+
+# 2. Start disposable Redis (port 6379)
+docker run -d --name disposable-redis -p 6379:6379 redis:7-alpine
+
+# 3. Push schema to disposable database
+DATABASE_URL="postgresql://postgres:postgres@127.0.0.1:5433/email_test" npx prisma db push
+
+# 4. Run full certification suite (Flows A through P)
+npm run test:email:certify
+```
+
+---
+
+## 5. Production Deployment Checklist
 
 1. [ ] **Database Migration**:
    ```bash
