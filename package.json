@@ -42,6 +42,7 @@
     "test:live": "tsx scripts/test-live-features.ts",
     "db:migrate-data": "tsx scripts/migrate-sqlite-to-postgres.ts",
     "db:verify": "tsx scripts/verify-postgres-migration.ts",
+    "test:migration": "tsx scripts/verify-migration-reconciliation.ts",
     "auth:seed-admin": "tsx scripts/seed-admin.ts",
     "test:rbac": "tsx scripts/verify-rbac.ts"
   },

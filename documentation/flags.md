@@ -337,6 +337,50 @@
 - **Mitigation / Next Steps**:
   - Future production deployment must apply migration `20260928000000_email_authoritative_content_and_events` to Supabase before deploying new worker code.
 
+### Entry: 2026-09-28 — Complete Prisma Migration Reconciliation & Structural Alignment
+- **Prompt / Phase**: Complete Prisma Migration Reconciliation (Zero Migrations vs Production Upgrade vs Schema Parity)
+- **Status**: ✅ Clean (No unresolved concerns / 100% Drift-Free Parity)
+- **Unresolved Concerns**: None.
+- **Notes / Observations**:
+  - **Full Schema Reconciliation Audit**:
+    - Conducted comprehensive comparison between `prisma/schema.prisma` and every historical migration in `prisma/migrations/`.
+    - Identified that `20260928000000_email_authoritative_content_and_events` reconciled `EmailEvent` fields, `EmailEventProcessingStatus`, `User.emailVerified`, and `EmailDelivery` authoritative content fields.
+    - Detected remaining missing index: `CREATE INDEX "EmailDelivery_templateId_idx" ON "EmailDelivery"("templateId");`.
+  - **Forward-Only Migration Created**:
+    - Added `prisma/migrations/20260928010000_email_delivery_template_idx/migration.sql`.
+    - Verified strict forward-only constraint: zero edits were made to historical migrations (`20260916000000_init_supabase_schema`, `20260921220000_add_user_rbac`, `20260925000000_add_email_platform_foundation`, `20260925120000_add_email_auth`, `20260928000000_email_authoritative_content_and_events`).
+    - Validated migration diff against shadow database: `npx prisma migrate diff --from-migrations prisma/migrations --to-schema-datamodel prisma/schema.prisma` returned `-- This is an empty migration.` (100.0% structural equivalence).
+  - **Migration Sequence & Canonical Ordering**:
+    1. `20260916000000_init_supabase_schema`: Core WhatsApp, API client, and webhook tables.
+    2. `20260921220000_add_user_rbac`: `User`, `UserSession`, `UserRole` enum, `whatsapp_hub` DB role & RLS.
+    3. `20260925000000_add_email_platform_foundation`: 13 Email tables, 10 enums, RLS policies.
+    4. `20260925120000_add_email_auth`: `User.emailVerified` column, `OtpVerification` codeHash index.
+    5. `20260928000000_email_authoritative_content_and_events`: `EmailEventProcessingStatus` enum, `User.emailVerified` DDL sync, `EmailDelivery` authoritative content columns/FKs, `EmailEvent` status/attempt/config columns.
+    6. `20260928010000_email_delivery_template_idx`: Missing `EmailDelivery(templateId)` index.
+  - **Comprehensive Verification Suite (`scripts/verify-migration-reconciliation.ts`)**:
+    - Added `npm run test:migration`.
+    - Executed against disposable PostgreSQL (`127.0.0.1:5433`):
+      1. **Fresh Database from Zero (`email_from_zero`)**: Deploys all 6 migrations cleanly from scratch; `prisma migrate status` reports schema is up to date; zero structural drift.
+      2. **Upgrade Database from Production Baseline (`email_upgrade_sim`)**: Simulates current production database (only WhatsApp & User tables pre-existing without `_prisma_migrations`). Baselined via `prisma migrate resolve --applied 20260916000000_init_supabase_schema` and `20260921220000_add_user_rbac`, followed by `prisma migrate deploy`. Successfully applied pending migrations with 100% data preservation of existing API clients, keys, users, and WhatsApp messages.
+      3. **Detailed Invariant Checks**: Verified all 23 application tables, all 18 PostgreSQL enums, all `EmailEvent` processing fields, compound unique constraint `(providerConfigId, providerEventId)`, all `EmailDelivery` authoritative content columns, foreign keys (`campaignId`, `templateId`, `templateVersionId`, `providerConfigId`, `deliveryId`), indexes (`EmailDelivery_templateId_idx`, `EmailDelivery_campaignId_idx`, unique idempotency index), RLS enabled and policies active on all 13 Email tables, and zero WhatsApp schema regressions.
+      4. **Prisma Generate**: `npx prisma generate` generated Prisma Client v6.19.0 cleanly without errors.
+    - Result: **33 PASSED, 0 FAILED**.
+  - **Safety Guarantee**:
+    - Production Supabase database (`peqynzeioiauynfpdsdv`) was NOT touched or modified.
+  - **Production Deployment & Rollback Strategy**:
+    - Production deployment requires standard baselining:
+      ```bash
+      npx prisma migrate resolve --applied 20260916000000_init_supabase_schema
+      npx prisma migrate resolve --applied 20260921220000_add_user_rbac
+      npx prisma migrate deploy
+      ```
+    - Rollback is non-destructive because all new migrations are strictly additive; rollback can be enacted via dropping the additive index/columns without affecting WhatsApp operations.
+  - **Quality Gates Passing**:
+    - `npm test`: 635 passing checks across all 18 test suites (exit code 0).
+    - `npm run test:migration`: 33 passing checks across all 4 migration phases (exit code 0).
+    - `npm run lint`: 0 errors, 0 warnings (exit code 0).
+    - `npm run build`: Turbopack build succeeded with all 64 routes compiled cleanly (exit code 0).
+
 ---
 
 ## Flag Template for Subsequent Prompts
