@@ -427,14 +427,35 @@ One-click unsubscribe endpoint complying with RFC 8058.
 
 ---
 
-## 14. Provider Webhooks
+## 14. Provider Delivery Webhooks
 
 `POST /api/email/webhooks/[provider]?configId=[providerConfigId]`
 
-Supported providers: `gmail`, `ses`, `mock`, `generic`.
+Supported provider webhook endpoints: `gmail`, `ses` (inbound delivery telemetry only), `mock` (tests), `generic`.
 - **Mandatory Provider Config**: Must be bound to an active `EmailProviderConfig` via `?configId=...` or `X-Provider-Config-Id`.
-- **Signature Verification**: Validates HMAC-SHA256 signature in `X-Webhook-Signature`.
+- **Signature Verification**: Validates HMAC-SHA256 signature in `X-Webhook-Signature` or AWS SNS certificate for SES events.
 - **Deduplication**: Replayed webhooks return HTTP 202 with `deduplicated: true`.
 - **Asynchronous Ingestion**: Enqueues event to `email-events` queue for worker processing. Returns HTTP 202 immediately.
+
+---
+
+## 15. Admin Email Provider & Health Management
+
+### List Configured Providers
+`GET /api/admin/email/providers`
+Requires `ADMIN` or `VIEWER` session. Omits encrypted credentials and secrets.
+
+### Create Provider Configuration
+`POST /api/admin/email/providers`
+Requires `ADMIN` session.
+- **Supported Provider**: `GMAIL` (Google Workspace / Gmail API via OAuth 2.0).
+- **Unavailable Providers**: `SES` and `SMTP` return HTTP 400 (`code: "PROVIDER_UNAVAILABLE"`).
+- **Test-Only Provider**: `MOCK` is strictly forbidden in production and returns HTTP 400 (`code: "MOCK_PROVIDER_FORBIDDEN"`).
+
+### Provider Health Verification
+`GET /api/admin/email/providers/health?id=[providerConfigId]`
+`POST /api/admin/email/providers/health`
+Requires `ADMIN` session.
+Executes live credential validation and connectivity check against the upstream provider endpoint, records `lastVerifiedAt` and latency metrics, and updates `errorMessage` upon failure without leaking credentials or tokens.
 
 

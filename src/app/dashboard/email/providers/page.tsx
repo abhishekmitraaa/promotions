@@ -52,6 +52,43 @@ function ProviderSettingsContent() {
   const [addingSender, setAddingSender] = useState(false);
   const [senderError, setSenderError] = useState<string | null>(null);
 
+  // Provider health verification state
+  const [verifyingId, setVerifyingId] = useState<string | null>(null);
+  const [healthMap, setHealthMap] = useState<Record<string, { healthy: boolean; latencyMs?: number; message?: string; error?: string }>>({});
+
+  async function handleCheckHealth(providerId: string) {
+    try {
+      setVerifyingId(providerId);
+      const res = await fetch(`/api/admin/email/providers/health?id=${providerId}`);
+      const json = await res.json();
+      if (res.ok && json.data) {
+        setHealthMap((prev) => ({
+          ...prev,
+          [providerId]: json.data,
+        }));
+        await loadData();
+      } else {
+        setHealthMap((prev) => ({
+          ...prev,
+          [providerId]: {
+            healthy: false,
+            error: json.error || "Health check failed",
+          },
+        }));
+      }
+    } catch (err) {
+      setHealthMap((prev) => ({
+        ...prev,
+        [providerId]: {
+          healthy: false,
+          error: err instanceof Error ? err.message : "Network error checking health",
+        },
+      }));
+    } finally {
+      setVerifyingId(null);
+    }
+  }
+
   async function loadData() {
     try {
       const [provRes, sndRes] = await Promise.all([
@@ -268,6 +305,52 @@ function ProviderSettingsContent() {
         </div>
       )}
 
+      {/* Email Provider Architecture Status Card */}
+      <div className="bg-zinc-900/40 border border-zinc-800 rounded-xl p-5 space-y-3">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+          <h2 className="text-sm font-semibold text-white uppercase tracking-wider flex items-center gap-2">
+            <span>🛡️</span> Provider Architecture & Near-Term Strategy
+          </h2>
+          <span className="text-xs px-2.5 py-0.5 rounded-full bg-sky-500/10 text-sky-400 border border-sky-500/20 font-medium self-start sm:self-auto">
+            Strategy: Gmail-Only
+          </span>
+        </div>
+        <p className="text-xs text-zinc-400">
+          The production email dispatch layer is strictly standardized on <strong>Google Workspace / Gmail OAuth 2.0</strong>.
+          Amazon SES and generic SMTP adapters are currently unavailable. The system prohibits silent fallback between providers.
+        </p>
+        <div className="grid grid-cols-1 sm:grid-cols-4 gap-3 pt-1">
+          <div className="bg-zinc-950/60 border border-emerald-500/30 rounded-lg p-3">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-semibold text-white">Google Workspace</span>
+              <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-medium">Supported</span>
+            </div>
+            <p className="text-[11px] text-zinc-400 mt-1">OAuth 2.0, AES-256-GCM tokens, RFC 2822 MIME</p>
+          </div>
+          <div className="bg-zinc-950/60 border border-zinc-800/80 rounded-lg p-3 opacity-60">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-semibold text-zinc-300">Amazon SES</span>
+              <span className="text-[10px] px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-400 font-medium">Unavailable</span>
+            </div>
+            <p className="text-[11px] text-zinc-500 mt-1">Roadmap / Not in near-term production scope</p>
+          </div>
+          <div className="bg-zinc-950/60 border border-zinc-800/80 rounded-lg p-3 opacity-60">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-semibold text-zinc-300">SMTP Relay</span>
+              <span className="text-[10px] px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-400 font-medium">Unavailable</span>
+            </div>
+            <p className="text-[11px] text-zinc-500 mt-1">Roadmap / Not in near-term production scope</p>
+          </div>
+          <div className="bg-zinc-950/60 border border-zinc-800/80 rounded-lg p-3 opacity-60">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-semibold text-zinc-300">Mock Provider</span>
+              <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 font-medium">Test-Only</span>
+            </div>
+            <p className="text-[11px] text-zinc-500 mt-1">CI & unit suites only; forbidden in production</p>
+          </div>
+        </div>
+      </div>
+
       {/* Google Workspace OAuth Card */}
       <div className="bg-zinc-900/60 border border-zinc-800 rounded-xl p-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
@@ -323,47 +406,96 @@ function ProviderSettingsContent() {
                     <th className="px-5 py-3">Status</th>
                     <th className="px-5 py-3">Connected Sender</th>
                     <th className="px-5 py-3">Default</th>
+                    <th className="px-5 py-3">Health Verification</th>
                     <th className="px-5 py-3">Action</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-zinc-800/60">
-                  {providers.map((p) => (
-                    <tr key={p.id} className="hover:bg-zinc-800/20 transition">
-                      <td className="px-5 py-3.5 font-medium text-white">{p.name}</td>
-                      <td className="px-5 py-3.5 text-xs text-zinc-400">{p.providerType}</td>
-                      <td className="px-5 py-3.5">
-                        <span
-                          className={`text-xs px-2 py-0.5 rounded font-medium border ${
-                            p.status === "ACTIVE"
-                              ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
-                              : "bg-rose-500/10 text-rose-400 border-rose-500/20"
-                          }`}
-                        >
-                          {p.status}
-                        </span>
-                      </td>
-                      <td className="px-5 py-3.5 font-mono text-xs text-zinc-300">
-                        {p.senderEmail || "N/A"}
-                      </td>
-                      <td className="px-5 py-3.5 text-xs">
-                        {p.isDefault ? (
-                          <span className="text-emerald-400 font-semibold">✓ Default</span>
-                        ) : (
-                          <span className="text-zinc-500">—</span>
-                        )}
-                      </td>
-                      <td className="px-5 py-3.5 text-xs">
-                        {!p.isDefault && (
-                          <button
-                            onClick={() => handleSetDefaultProvider(p.id)}
-                            className="text-sky-400 hover:text-sky-300 font-medium transition"
+                  {providers.map((p) => {
+                    const isChecking = verifyingId === p.id;
+                    const health = healthMap[p.id];
+
+                    return (
+                      <tr key={p.id} className="hover:bg-zinc-800/20 transition">
+                        <td className="px-5 py-3.5 font-medium text-white">{p.name}</td>
+                        <td className="px-5 py-3.5 text-xs text-zinc-400">{p.providerType}</td>
+                        <td className="px-5 py-3.5">
+                          <span
+                            className={`text-xs px-2 py-0.5 rounded font-medium border ${
+                              p.status === "ACTIVE"
+                                ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
+                                : "bg-rose-500/10 text-rose-400 border-rose-500/20"
+                            }`}
                           >
-                            Set Default
-                          </button>
-                        )}
-                      </td>
-                    </tr>
-                  ))}
+                            {p.status}
+                          </span>
+                        </td>
+                        <td className="px-5 py-3.5 font-mono text-xs text-zinc-300">
+                          {p.senderEmail || "N/A"}
+                        </td>
+                        <td className="px-5 py-3.5 text-xs">
+                          {p.isDefault ? (
+                            <span className="text-emerald-400 font-semibold">✓ Default</span>
+                          ) : (
+                            <span className="text-zinc-500">—</span>
+                          )}
+                        </td>
+                        <td className="px-5 py-3.5 text-xs">
+                          {isChecking ? (
+                            <span className="inline-flex items-center gap-1.5 text-sky-400 font-medium">
+                              <span className="w-3 h-3 border-2 border-sky-400 border-t-transparent rounded-full animate-spin"></span>
+                              Verifying...
+                            </span>
+                          ) : health ? (
+                            health.healthy ? (
+                              <span className="text-xs px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-medium">
+                                ✓ Healthy {health.latencyMs !== undefined ? `(${health.latencyMs}ms)` : ""}
+                              </span>
+                            ) : (
+                              <span
+                                className="text-xs px-2 py-0.5 rounded bg-rose-500/10 text-rose-400 border border-rose-500/20 font-medium"
+                                title={health.error}
+                              >
+                                ✕ Error: {health.error?.substring(0, 30)}...
+                              </span>
+                            )
+                          ) : p.errorMessage ? (
+                            <span
+                              className="text-xs px-2 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/20 font-medium"
+                              title={p.errorMessage}
+                            >
+                              ⚠️ {p.errorMessage.substring(0, 30)}...
+                            </span>
+                          ) : p.lastVerifiedAt ? (
+                            <span className="text-xs text-zinc-400">
+                              ✓ {new Date(p.lastVerifiedAt).toLocaleDateString()}
+                            </span>
+                          ) : (
+                            <span className="text-xs text-zinc-500">Unchecked</span>
+                          )}
+                        </td>
+                        <td className="px-5 py-3.5 text-xs">
+                          <div className="flex items-center gap-3">
+                            <button
+                              onClick={() => handleCheckHealth(p.id)}
+                              disabled={isChecking}
+                              className="text-sky-400 hover:text-sky-300 font-medium transition disabled:opacity-50"
+                            >
+                              Check Health
+                            </button>
+                            {!p.isDefault && (
+                              <button
+                                onClick={() => handleSetDefaultProvider(p.id)}
+                                className="text-zinc-400 hover:text-white font-medium transition"
+                              >
+                                Set Default
+                              </button>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>

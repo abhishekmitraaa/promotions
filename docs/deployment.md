@@ -46,7 +46,7 @@ The platform uses a split architecture separating the serverless/stateless HTTP 
 │  - Node.js >= 22.12.0 long-running daemon (`npm run worker:email`)         │
 │  - BullMQ Queue Workers & Job Processors                                    │
 │  - Provider Abstraction Layer & Rate Limit Throttlers                       │
-│  - Dispatches to Email Providers (Gmail API, SMTP, etc.)                    │
+│  - Dispatches to Email Providers (Google Workspace / Gmail API)             │
 │  - Updates EmailDelivery records & campaign metrics                         │
 └──────────────────────────────────────┬──────────────────────────────────────┘
                                        │
@@ -88,7 +88,8 @@ The platform uses a split architecture separating the serverless/stateless HTTP 
 
 ### E. Email Providers
 - **Role**: Outbound delivery endpoints.
-- **Initial Implementation**: Gmail / Google Workspace API via OAuth2 (RFC 2822 base64url MIME transmission with automatic token refresh).
+- **Production Scope**: Standardized exclusively on **Google Workspace / Gmail API via OAuth 2.0** (RFC 2822 base64url MIME transmission with automatic token refresh).
+- **Other Providers**: Amazon SES and generic SMTP adapters are currently out of scope and explicitly unavailable. The MOCK provider is strictly restricted to automated tests. Silent fallback across providers is prohibited.
 
 ---
 

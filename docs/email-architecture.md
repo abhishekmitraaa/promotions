@@ -41,7 +41,7 @@ The Email platform is designed as an enterprise-grade multi-tenant messaging inf
  │  * Audience Resolution (Lists + Segments)                  │
  │  * Deduplication & Suppression Filtering                   │
  │  * Safe Template Rendering (Variable substitution)         │
- │  * Provider Abstraction (Gmail, SMTP, etc.)                │
+ │  * Provider Abstraction (Google Workspace / Gmail API)     │
  │  * RFC 8058 One-Click Unsubscribe Headers                  │
  │  * Automatic Retry & Backoff for Transient Failures        │
  └──────────────────────────────┬─────────────────────────────┘
@@ -66,23 +66,48 @@ The Email platform is designed as an enterprise-grade multi-tenant messaging inf
 
 ---
 
-## 2. Provider Abstraction Layer
+## 2. Provider Abstraction Layer & Near-Term Strategy
 
 All outbound email transmission is isolated behind the normalized `EmailProvider` interface:
 
 ```typescript
 export interface EmailProvider {
+  readonly id: string;
   readonly name: string;
-  send(options: EmailSendOptions): Promise<EmailSendResult>;
-  verifyConnection(): Promise<ProviderHealthResult>;
+  readonly providerType: EmailProviderType;
+
+  send(request: EmailSendRequest): Promise<EmailSendResult>;
+  verifyCredentials?(): Promise<{ valid: boolean; error?: string }>;
+  checkHealth?(): Promise<EmailProviderHealthResult>;
 }
 ```
 
-### Gmail / Google Workspace Provider
-- **Authentication**: OAuth 2.0 with offline access tokens and refresh tokens.
-- **Security**: Tokens are stored AES-256-GCM encrypted in the database.
-- **Protocol**: Transmits raw RFC 2822 MIME messages formatted in base64url via the Gmail REST API (`POST https://gmail.googleapis.com/gmail/v1/users/me/messages/send`).
-- **Token Lifecycle**: Automatically checks token expiry and performs silent refresh using Google's token endpoint before dispatching.
+### Production Strategy: Gmail-Only
+Based on an architectural audit of operational adapters, the production email infrastructure is standardized strictly on **Google Workspace / Gmail API via OAuth 2.0**:
+
+1. **Google Workspace / Gmail (Supported & Active)**:
+   - **Authentication**: OAuth 2.0 with offline access tokens and refresh tokens.
+   - **Scope**: Narrowest practical sending permission (`https://www.googleapis.com/auth/gmail.send`).
+   - **Security**: Tokens are stored AES-256-GCM encrypted in the database. Tokens and secrets are never logged.
+   - **Protocol**: Transmits raw RFC 2822 MIME messages formatted in base64url via the Gmail REST API (`POST https://gmail.googleapis.com/gmail/v1/users/me/messages/send`).
+   - **Token Lifecycle**: Automatically checks token expiry and performs silent refresh using Google's token endpoint before dispatching.
+   - **Health Verification**: Built-in `checkHealth()` verifies token acquisition against Google OAuth token endpoint and reports round-trip latency.
+
+2. **Amazon SES & Generic SMTP (Explicitly Unavailable)**:
+   - Operational sending adapters for SES and SMTP are not implemented.
+   - Creating or requesting SES or SMTP provider configurations via API returns HTTP 400 (`PROVIDER_UNAVAILABLE`).
+   - The provider registry throws `ProviderUnavailableError` if SES or SMTP is requested.
+   - Dashboards display SES and SMTP as unavailable roadmap items to remove misleading claims of operational support.
+
+3. **MOCK Provider (Strictly Test-Only)**:
+   - Restricted exclusively to automated test suites (`NODE_ENV !== "production"`).
+   - Attempting to configure, register, or resolve the MOCK provider in production throws `MockProviderForbiddenError` and returns HTTP 400 (`MOCK_PROVIDER_FORBIDDEN`).
+
+4. **Zero Silent Fallback**:
+   - The system prohibits silent fallback from one provider to another.
+   - If an explicit `providerConfigId` is requested, the system resolves only that configuration; if inactive or missing, it fails explicitly with `ProviderNotFoundError`.
+   - When resolving the tenant default provider, if multiple active providers exist and none is marked `isDefault: true`, resolution fails explicitly with `ProviderAmbiguityError` rather than arbitrarily picking one.
+   - Provider delivery failures are classified and surfaced honestly—never silently rerouted.
 
 ---
 

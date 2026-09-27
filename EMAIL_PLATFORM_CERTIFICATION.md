@@ -45,14 +45,14 @@ The WhatsApp Hub Email Platform provides an enterprise multi-tenant messaging in
 │ - Campaign Recipient Worker (`processCampaignRecipientJob`)                     │
 │ - Scheduled Campaign Trigger Worker (`processScheduledCampaignTriggerJob`)      │
 │ - Webhook Event Worker (`processEmailEventJob`)                                 │
-│ - Provider Abstraction Layer (Gmail OAuth2, SES, Mock)                          │
+│ - Provider Abstraction Layer (Gmail OAuth2; SES/SMTP Unavailable; Mock Test-Only) │
 │ - RFC 8058 Header Injection & Monotonic Status Transitions                      │
 └──────────────────────────────────────┬──────────────────────────────────────────┘
                                        │
                                        ▼ HTTPS (OAuth2 / REST)
                         ┌─────────────────────────────┐
                         │       EMAIL PROVIDERS       │
-                        │ (Gmail API, AWS SES, Mock)  │
+                        │ (Google Workspace / Gmail)  │
                         └─────────────────────────────┘
 ```
 
@@ -161,25 +161,37 @@ npm test                     # 17 full service test suites passed (Exit Code 0)
 
 3. **Provider Daily Quotas**:
    - Google Workspace / Gmail API enforces daily recipient limits (typically 2,000 messages/day for Google Workspace accounts, 500/day for standard Gmail).
-   - High-volume promotional campaigns exceeding Google's daily sending limits require routing through Amazon SES.
+   - Near-term production scope is standardized on Google Workspace / Gmail. Accounts must stay within domain-level sending quotas.
 
 ---
 
-## 6. Provider Requirements
+## 6. Provider Requirements & Architecture Strategy
 
-### Google Workspace / Gmail Provider
+### Production Strategy: Gmail-Only
+Following an architectural audit of provider implementations, the near-term production strategy is standardized exclusively on **Google Workspace / Gmail API**:
+
+### Google Workspace / Gmail Provider (Active & Supported)
 - **OAuth 2.0 Credentials**: Requires `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`.
 - **Authorized Redirect URI**: Must include `https://your-domain.com/api/admin/email/providers/google/callback`.
-- **Required Scopes**: `https://www.googleapis.com/auth/gmail.send`.
-- **Token Storage**: Refresh and access tokens must be stored AES-256-GCM encrypted in `EmailProviderConfig.encryptedCredentials`.
+- **Required Scopes**: Narrowest practical sending permission `https://www.googleapis.com/auth/gmail.send` + `userinfo.email`.
+- **Token Storage**: Refresh and access tokens must be stored AES-256-GCM encrypted in `EmailProviderConfig.encryptedCredentials`. Tokens are never logged.
 - **MIME Formatting**: Outbound emails must be formatted as raw RFC 2822 base64url-encoded messages.
+- **Health Verification**: Built-in `checkHealth()` executes OAuth token acquisition and measures round-trip latency to ensure operational readiness.
 
-### Amazon SES Provider
-- **Credentials**: Requires IAM Access Key ID and Secret Access Key with `ses:SendRawEmail` permissions.
-- **Webhook Telemetry**: Requires Amazon SNS topic subscription to `/api/email/webhooks/ses?configId=...` for bounce and complaint notifications.
+### Amazon SES & Generic SMTP (Explicitly Unavailable)
+- Operational adapters for SES and SMTP are not implemented in the current near-term production scope.
+- Creating or requesting SES or SMTP configurations via API is rejected with HTTP 400 (`PROVIDER_UNAVAILABLE`).
+- The provider registry throws `ProviderUnavailableError` if SES or SMTP is requested.
+- Administrative dashboards display SES and SMTP as unavailable roadmap features, removing misleading claims of operational support.
 
-### Mock Provider (CI & Testing)
-- Built-in `MockEmailProvider` allows zero-cost end-to-end testing with deterministic message IDs (`msg-...`) and configurable failure simulations.
+### Mock Provider (CI & Testing Only)
+- In-memory `MockEmailProvider` allows zero-cost end-to-end testing with deterministic message IDs (`mock-msg-...`) in development and automated CI suites.
+- Strictly forbidden in production (`NODE_ENV === "production"`). Attempting to register or resolve MOCK in production throws `MockProviderForbiddenError` and returns HTTP 400 (`MOCK_PROVIDER_FORBIDDEN`).
+
+### Zero Silent Fallback Invariant
+- The email dispatch architecture prohibits silent fallback across different providers.
+- Specific `providerConfigId` requests resolve only that exact configuration; failures fail closed.
+- Tenant default resolution refuses to guess if multiple active providers exist without a designated default (`isDefault: true`), failing with `ProviderAmbiguityError`.
 
 ---
 

@@ -414,6 +414,37 @@
 
 ---
 
+### Entry: 2026-09-28 — Email Provider Architecture Audit & Hardening
+- **Prompt / Phase**: Email Provider Architecture Audit & Hardening (Gmail-Only Strategy, Explicit SES/SMTP Unavailability, MOCK Test-Only Protection, No Silent Fallback, Provider Health Verification)
+- **Status**: ✅ Clean (No unresolved concerns / Gmail-Only Strategy Fully Certified)
+- **Unresolved Concerns**: None.
+- **Notes / Observations**:
+  - **Architecture Audit & Production Strategy Decision**:
+    - Audited provider interface (`src/lib/email/types.ts`), provider implementations (`src/lib/email/providers/`), provider registry (`src/lib/email/registry.ts`), API routes, dashboard, and webhook verifiers.
+    - Selected and codified near-term production strategy: **Option A: Gmail-only** (Google Workspace REST API via OAuth 2.0).
+  - **Explicit Unavailability of SES & SMTP**:
+    - Confirmed that operational sending adapters for SES and SMTP do not exist in the repository.
+    - Added `ProviderUnavailableError` in `src/lib/email/registry.ts` throwing explicit error if `SES` or `SMTP` is requested or registered.
+    - Enforced validation in `POST /api/admin/email/providers`: requests to create `SES` or `SMTP` providers are rejected with HTTP 400 (`code: "PROVIDER_UNAVAILABLE"`).
+    - Updated Admin Dashboard (`src/app/dashboard/email/providers/page.tsx`): added Architecture & Strategy card displaying Google Workspace as the sole supported production provider, and SES & SMTP as "Unavailable (Roadmap / Not in near-term scope)", removing misleading operational claims.
+    - Updated documentation across `docs/email-architecture.md`, `docs/deployment.md`, `docs/api.md`, and `EMAIL_PLATFORM_CERTIFICATION.md`.
+  - **MOCK Test-Only Enforcement**:
+    - Restricted `MOCK` provider strictly to automated tests and non-production environments (`NODE_ENV !== "production"`).
+    - Added `MockProviderForbiddenError`: attempting to register, instantiate, or configure MOCK when `NODE_ENV === "production"` throws an error and returns HTTP 400 (`code: "MOCK_PROVIDER_FORBIDDEN"`).
+    - Implemented standardized in-memory `MockEmailProvider` in `src/lib/email/registry.ts` for automated test suites.
+  - **Elimination of Silent Fallback**:
+    - Audited and eliminated arbitrary fallback logic in `EmailProviderRegistry.resolveForTenant`.
+    - Explicit `providerConfigId` requests resolve only that exact configuration; if inactive or missing, throws `ProviderNotFoundError` with explicit notice that silent fallback is prohibited.
+    - Tenant default provider resolution strictly checks `isDefault: true`. If no default is designated, resolves single configuration if exactly one exists; if multiple active configurations exist without an explicit default, refuses to guess and throws `ProviderAmbiguityError`.
+    - Upstream sending errors fail honestly without background provider switching.
+  - **Standardized Provider Health Verification**:
+    - Added `EmailProviderHealthResult` and `checkHealth?(): Promise<EmailProviderHealthResult>` to `EmailProvider` interface contract.
+    - Implemented `checkHealth()` on `GmailProvider` measuring token refresh latency against Google's OAuth endpoint with zero secret leakage (`redactSecrets`).
+    - Implemented authenticated ADMIN endpoint `GET` and `POST /api/admin/email/providers/health` to execute live health checks, persist `lastVerifiedAt` / `errorMessage` in the database, and return latency metrics.
+    - Added "Check Health" action and live health verification status badges (latency in ms, verification timestamp, error tooltips) to the Admin Dashboard table.
+
+---
+
 ## Flag Template for Subsequent Prompts
 
 ```markdown

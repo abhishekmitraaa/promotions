@@ -57,6 +57,30 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ success: false, error: "Valid providerType is required" }, { status: 400 });
     }
 
+    // Explicitly reject unavailable providers (SES & SMTP)
+    if (providerType === EmailProviderType.SES || providerType === EmailProviderType.SMTP) {
+      return NextResponse.json(
+        {
+          success: false,
+          code: "PROVIDER_UNAVAILABLE",
+          error: `Email provider '${providerType}' is currently unavailable. The near-term production strategy is Gmail-only. Operational adapters for '${providerType}' are not implemented.`,
+        },
+        { status: 400 }
+      );
+    }
+
+    // Prohibit MOCK in production
+    if (providerType === EmailProviderType.MOCK && process.env.NODE_ENV === "production") {
+      return NextResponse.json(
+        {
+          success: false,
+          code: "MOCK_PROVIDER_FORBIDDEN",
+          error: "MOCK email provider is strictly restricted to test environments and is forbidden in production.",
+        },
+        { status: 400 }
+      );
+    }
+
     // Verify tenant exists
     const client = await prisma.apiClient.findUnique({ where: { id: clientId } });
     if (!client) {
