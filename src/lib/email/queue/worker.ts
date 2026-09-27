@@ -142,16 +142,26 @@ export async function processTransactionalJob(
     }
   }
 
-  // 6. Execute Send via Resolved Provider
+  // 6. Execute Send via Resolved Provider with Authoritative Content
+  const outgoingHtml = delivery.htmlContent || undefined;
+  const outgoingText = delivery.textContent || undefined;
+
+  if (!outgoingHtml && !outgoingText) {
+    throw new UnrecoverableError(
+      `Delivery '${delivery.id}' has no authoritative content (htmlContent and textContent are both empty).`
+    );
+  }
+
   try {
     const sendResult = await provider.send({
       clientId: delivery.clientId,
       type: "TRANSACTIONAL",
       to: delivery.to,
       from: delivery.from || providerSenderEmail || "system@whatsapphub.internal",
+      replyTo: delivery.replyTo || undefined,
       subject: delivery.subject,
-      html: `<p>${delivery.subject}</p>`,
-      text: delivery.subject,
+      html: outgoingHtml,
+      text: outgoingText,
       transactionalReference: delivery.transactionalReference || undefined,
     });
 

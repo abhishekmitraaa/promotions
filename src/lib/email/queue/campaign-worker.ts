@@ -301,11 +301,17 @@ export async function processCampaignRecipientJob(
       data: {
         clientId,
         campaignRecipientId: recipient.id,
+        campaignId: campaign.id,
+        templateId: campaign.templateVersion?.templateId || null,
+        templateVersionId: campaign.templateVersionId || null,
         category: EmailType.PROMOTIONAL,
         providerType,
         from: fromAddress,
+        replyTo: replyToAddress || null,
         to: recipient.email,
         subject: rendered.subject,
+        htmlContent: rendered.html,
+        textContent: rendered.text || null,
         status: EmailDeliveryStatus.PROCESSING,
         attemptCount: 1,
         lastAttemptAt: new Date(),
@@ -315,6 +321,12 @@ export async function processCampaignRecipientJob(
     delivery = await prisma.emailDelivery.update({
       where: { id: delivery.id },
       data: {
+        campaignId: delivery.campaignId || campaign.id,
+        templateId: delivery.templateId || campaign.templateVersion?.templateId || null,
+        templateVersionId: delivery.templateVersionId || campaign.templateVersionId || null,
+        replyTo: delivery.replyTo || replyToAddress || null,
+        htmlContent: delivery.htmlContent || rendered.html,
+        textContent: delivery.textContent || rendered.text || null,
         status: EmailDeliveryStatus.PROCESSING,
         attemptCount: { increment: 1 },
         lastAttemptAt: new Date(),
@@ -323,8 +335,9 @@ export async function processCampaignRecipientJob(
   }
 
   // 9. Prepare Tracked HTML: Inject signed open pixel & wrap eligible HTTP/HTTPS links
+  const contentHtml = delivery.htmlContent || rendered.html;
   const trackedHtml = EmailTrackingService.prepareTrackedHtml(
-    rendered.html,
+    contentHtml,
     clientId,
     delivery.id,
     { baseUrl }
@@ -337,11 +350,12 @@ export async function processCampaignRecipientJob(
       to: recipient.email,
       from: fromAddress,
       replyTo: replyToAddress,
-      subject: rendered.subject,
+      subject: delivery.subject || rendered.subject,
       html: trackedHtml,
-      text: rendered.text,
+      text: delivery.textContent || rendered.text,
       headers: unsubscribeHeaders,
       campaignRecipientId: recipient.id,
+      campaignId: campaign.id,
     });
 
     if (sendResult.accepted) {

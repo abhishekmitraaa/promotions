@@ -22,6 +22,7 @@ import { providerRegistry } from "../registry";
 import { EmailProvider } from "../types";
 import { EmailSuppressionService } from "../../services/email-suppression-service";
 import { EmailUnsubscribeService } from "../../services/email-unsubscribe-service";
+import { EmailTrackingService } from "../tracking/email-tracking-service";
 import { normalizeEmail } from "../normalization";
 import { logger } from "../../logger";
 
@@ -96,6 +97,7 @@ export async function processPromotionalDeliveryJob(
   }
 
   // 5. Verify Marketing Consent & Prepare One-Click Unsubscribe Headers
+  const baseUrl = process.env.NEXT_PUBLIC_APP_URL || "https://hub.local";
   let unsubscribeHeaders: Record<string, string> | undefined;
   try {
     const normalizedTo = normalizeEmail(delivery.to);
@@ -118,7 +120,6 @@ export async function processPromotionalDeliveryJob(
       }
 
       // Generate RFC 8058 One-Click Unsubscribe Headers
-      const baseUrl = process.env.NEXT_PUBLIC_APP_URL || "https://hub.local";
       const unsubToken = EmailUnsubscribeService.generateUnsubscribeToken(
         delivery.clientId,
         contact.id
@@ -161,18 +162,32 @@ export async function processPromotionalDeliveryJob(
     }
   }
 
-  // 7. Dispatch Email
+  // 7. Dispatch Email with Authoritative Content & Tracking
   const fromAddress = delivery.from || providerSenderEmail || "marketing@whatsapphub.internal";
+  const rawHtml = delivery.htmlContent || undefined;
+  const outgoingHtml = rawHtml
+    ? EmailTrackingService.prepareTrackedHtml(rawHtml, delivery.clientId, delivery.id, { baseUrl })
+    : undefined;
+  const outgoingText = delivery.textContent || undefined;
+
+  if (!outgoingHtml && !outgoingText) {
+    throw new UnrecoverableError(
+      `Delivery '${delivery.id}' has no authoritative content (htmlContent and textContent are both empty).`
+    );
+  }
+
   try {
     const sendResult = await provider.send({
       clientId: delivery.clientId,
       type: "PROMOTIONAL",
       to: delivery.to,
       from: fromAddress,
+      replyTo: delivery.replyTo || undefined,
       subject: delivery.subject,
-      html: `<p>${delivery.subject}</p>`,
-      text: delivery.subject,
+      html: outgoingHtml,
+      text: outgoingText,
       headers: unsubscribeHeaders,
+      campaignId: delivery.campaignId || undefined,
     });
 
     if (sendResult.accepted) {

@@ -274,6 +274,8 @@ async function runPhase4Tests() {
         from: "sender@example.test",
         to: "recipient1@example.test",
         subject: "Welcome to Platform",
+        htmlContent: "<p>Welcome to Platform</p>",
+        textContent: "Welcome to Platform",
         status: EmailDeliveryStatus.QUEUED,
       },
     });
@@ -377,6 +379,8 @@ async function runPhase4Tests() {
         from: "sender@example.test",
         to: "charlie@example.test",
         subject: "System Alert",
+        htmlContent: "<p>System Alert</p>",
+        textContent: "System Alert",
         status: EmailDeliveryStatus.QUEUED,
       },
     });
@@ -417,6 +421,8 @@ async function runPhase4Tests() {
         from: "sender@example.test",
         to: "dave@example.test",
         subject: "Your Report",
+        htmlContent: "<p>Your Report</p>",
+        textContent: "Your Report",
         status: EmailDeliveryStatus.QUEUED,
       },
     });
@@ -457,6 +463,8 @@ async function runPhase4Tests() {
         from: "sender@example.test",
         to: "eve@example.test",
         subject: "Bad Request Email",
+        htmlContent: "<p>Bad Request Email</p>",
+        textContent: "Bad Request Email",
         status: EmailDeliveryStatus.QUEUED,
       },
     });
@@ -499,6 +507,8 @@ async function runPhase4Tests() {
         from: "sender@example.test",
         to: "race@example.test",
         subject: "Concurrent Job Test",
+        htmlContent: "<p>Concurrent Job Test</p>",
+        textContent: "Concurrent Job Test",
         status: EmailDeliveryStatus.QUEUED,
       },
     });

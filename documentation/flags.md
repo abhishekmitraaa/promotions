@@ -274,6 +274,71 @@
 
 ---
 
+### Entry: 2026-09-28 — Comprehensive Engineering Baseline Audit
+- **Prompt / Phase**: Baseline Audit (Git, Prisma, Email, Production Reality, Security Matrix)
+- **Status**: 🔴 Open (Critical Architectural & Database Migration Blockers Identified)
+- **Unresolved Concerns**:
+  - **Prisma Schema Drift / Missing Migrations**:
+    - `EmailEvent` schema additions (`status`, `attempts`, `lastAttemptAt`, `processedAt`, `errorMessage`, `errorCode`, `providerConfigId` relation to `EmailProviderConfig`, indexes, compound unique constraint `[providerConfigId, providerEventId]`, and enum `EmailEventProcessingStatus`) are implemented in `prisma/schema.prisma` and heavily used in `EmailEventService`, but **no migration file exists** in `prisma/migrations`.
+    - `prisma/migrations/migration_lock.toml` is completely missing, preventing standard `prisma migrate diff` connector resolution.
+    - Migration `20260925120000_add_email_auth` added `emailVerified` and `emailVerifiedAt` columns to table `User` via raw SQL, but `model User` in `prisma/schema.prisma` never declared them. As a result, `@prisma/client` does not expose them, `AuthTokenService.verifyEmailToken` does not update the `User` record upon verification, and `/api/auth/login` does not enforce verification.
+  - **Production Database State Disconnect**:
+    - Direct read inspection of production Supabase database (`peqynzeioiauynfpdsdv` at `aws-0-ap-south-1.pooler.supabase.com:5432`) confirmed that neither `20260925000000_add_email_platform_foundation` nor `20260925120000_add_email_auth` has been applied to production.
+    - Zero email platform tables exist in the production database. Any email endpoint deployed to production will fail with database relation not found errors.
+  - **Single Send API / Worker Body Hardcoding & Data Loss**:
+    - `EmailDelivery` table lacks `htmlContent` and `textContent` columns.
+    - In `POST /api/v1/email/send`, HTML and text bodies passed in the request are not stored in `EmailDelivery` and not forwarded in BullMQ job data.
+    - `worker.ts` and `promotional-delivery-worker.ts` hardcode `html: <p>${delivery.subject}</p>` and `text: delivery.subject`, discarding the real email body on single sends.
+  - **CI Workflow Disconnect**:
+    - `.github/workflows/rbac-tests.yml` triggers only on branch `feature/email-password-rbac`, never on working branch `fix/email-platform-e2e-hardening` or `main`. Branch `fix/email-platform-e2e-hardening` has never run in GitHub Actions (0 runs).
+    - Previous CI runs on `main` HEAD (`cc30aeee`) failed at the "Run email test suites" step due to `npx prisma migrate deploy` vs test expectation divergence.
+  - **Serverless Worker Execution Gap**:
+    - Netlify deployment (`netlify.toml`) is serverless Next.js functions and cannot host long-running BullMQ worker processes (`workers/email-worker.ts`). A persistent containerized Node daemon (Docker/ECS/Fly/Railway) is required for background queue processing.
+  - **Campaign Dispatch Memory & Gateway Timeout Risk**:
+    - `EmailAudienceResolver.createRecipientSnapshot` returns the full recipient snapshot array via unpaginated `findMany`.
+    - `EmailCampaignService.sendCampaignNow` sequentially awaits `queue.add()` in a single loop during the HTTP request handler, risking Netlify gateway timeouts for large audiences (>10,000 recipients).
+  - **In-Memory OAuth Transaction Store**:
+    - `OAuthTransactionStore` is in-memory and will fail across distributed/serverless instances on Google callback.
+  - **Email Dashboard Health Discrepancy**:
+    - `/dashboard/email` checks non-existent property `json.data.redisStatus === "ready"`, causing queue status to display as `DEGRADED` permanently even when Redis is healthy, while hardcoding `workerStatus: "ACTIVE"` without verifying daemon health.
+- **Mitigation / Next Steps**:
+  1. Synchronize Prisma migrations: create a migration for `EmailEvent` schema additions, add `emailVerified` to `model User`, and create `migration_lock.toml`.
+  2. Add `htmlContent` and `textContent` to `EmailDelivery` (or store template variables/references) so workers do not hardcode `<p>${delivery.subject}</p>`.
+  3. Batch or background the campaign BullMQ queue dispatch in `sendCampaignNow` using `queue.addBulk` or cursor streaming.
+  4. Move OAuth state storage to Redis or database with TTL.
+  5. Update `.github/workflows/rbac-tests.yml` to trigger on PRs and relevant branches.
+---
+
+### Entry: 2026-09-28 — Public Email API Authoritative Content & Worker Correctness Resolution
+- **Prompt / Phase**: Fix production-critical correctness issue in public Email API (Authoritative content persistence and worker substitution elimination)
+- **Status**: ✅ Clean (Authoritative Content Model Implemented & Fully Certified)
+- **Unresolved Concerns**: None for this capability.
+- **Notes / Observations**:
+  - **Root Cause Resolved**: `POST /api/v1/email/send` previously enqueued only `{ deliveryId, clientId, category }` without storing the rendered HTML/text/reply-to in PostgreSQL. Workers were substituting hardcoded `<p>${delivery.subject}</p>`.
+  - **Authoritative Content Model**:
+    - Added `htmlContent`, `textContent`, `replyTo`, `campaignId`, `templateId`, `templateVersionId` directly to `EmailDelivery` table in PostgreSQL.
+    - Added foreign key relations to `EmailCampaign`, `EmailTemplate`, and `EmailTemplateVersion` with indexes.
+    - Synchronized Prisma schema, created `prisma/migrations/migration_lock.toml`, and created migration `20260928000000_email_authoritative_content_and_events`.
+    - Added `emailVerified` and `emailVerifiedAt` to `model User` in `schema.prisma` matching raw migration DDL.
+  - **API & Producer Layer**:
+    - `POST /api/v1/email/send`: Renders template once (if templateId supplied) or preserves exact direct HTML/text, resolves reply-to, and authoritatively persists rendered content before enqueuing.
+    - `EmailService.send`: Authoritatively persists exact supplied HTML, text, replyTo, templateId, and templateVersionId on `EmailDelivery.create`.
+    - `queueTransactionalEmail`: Persists exact supplied or system-rendered HTML, text, and replyTo.
+    - BullMQ job payloads remain strictly lightweight (`{ deliveryId, clientId, category }`); zero secrets or credentials in payloads or logs.
+  - **Worker Processors**:
+    - `processTransactionalJob`: Dispatches authoritative `htmlContent` and `textContent` loaded from PostgreSQL along with `replyTo`. Throws `UnrecoverableError` if content is missing. Never reconstructs from subject. Preserves exact untracked HTML.
+    - `processPromotionalDeliveryJob`: Loads authoritative content from PostgreSQL, applies `EmailTrackingService.prepareTrackedHtml` to inject open pixel and wrap links, passes RFC 8058 headers and `replyTo`.
+    - `processCampaignRecipientJob`: Persists rendered personalized content, `replyTo`, `campaignId`, `templateId`, and `templateVersionId` on `EmailDelivery.create`/`update`, ensuring retries use the identical authoritative content without re-rendering differently.
+  - **Verification & Testing**:
+    - Created dedicated 59-assertion verification suite `scripts/verify-email-authoritative-content.ts` testing all 11 required scenarios: direct HTML send, direct text send, template send, template variables, retry preservation, worker replay protection, idempotency, tracking (promotional vs transactional), promotional RFC 8058 headers, cross-tenant template access rejection, and content immutability across template mutations.
+    - Added `npm run test:email:content` and wired into `npm test` and `npm run test:email`.
+    - Full test suite passed: `npm test` (0 failures), `npm run test:email:certify` (99 PASSED across all 16 Flows A-P), `npm run db:verify` (0 failures).
+    - Code quality gates: `npm run lint` (0 errors, 0 warnings), `npm run build` (Turbopack, all 64 pages & API routes compiled cleanly with 0 TypeScript errors), `npm audit --audit-level=high` (0 vulnerabilities).
+- **Mitigation / Next Steps**:
+  - Future production deployment must apply migration `20260928000000_email_authoritative_content_and_events` to Supabase before deploying new worker code.
+
+---
+
 ## Flag Template for Subsequent Prompts
 
 ```markdown
@@ -286,3 +351,5 @@
 - **Mitigation / Next Steps**:
   - [Action to resolve concern in future phase]
 ```
+
+

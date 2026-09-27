@@ -119,7 +119,11 @@ export async function POST(req: NextRequest) {
   }
 
   // 6. Template Resolution or Direct Content Rendering
-  let subject = input.subject || "";
+  let finalSubject = input.subject || "";
+  let finalHtml = input.html;
+  let finalText = input.text;
+  let resolvedTemplateId: string | undefined = input.templateId;
+  let resolvedTemplateVersionId: string | undefined = input.templateVersionId;
 
   if (input.templateId) {
     const template = await EmailTemplateService.getTemplateById(clientId, input.templateId);
@@ -161,7 +165,11 @@ export async function POST(req: NextRequest) {
     };
 
     const rendered = TemplateEngine.renderTemplate(version, variables);
-    subject = rendered.subject;
+    finalSubject = rendered.subject;
+    finalHtml = rendered.html;
+    finalText = rendered.text;
+    resolvedTemplateId = template.id;
+    resolvedTemplateVersionId = version.id;
   }
 
   // 7. Resolve Tenant Provider & Sender
@@ -178,7 +186,7 @@ export async function POST(req: NextRequest) {
     // Falls back to mock provider in testing/development
   }
 
-  // 8. Create Delivery Record
+  // 8. Create Authoritative Delivery Record
   const idempotencyKey = req.headers.get("idempotency-key") || undefined;
 
   let delivery;
@@ -190,7 +198,12 @@ export async function POST(req: NextRequest) {
         providerType,
         from: fromAddress,
         to: recipientEmail,
-        subject,
+        replyTo: input.replyTo || null,
+        subject: finalSubject,
+        htmlContent: finalHtml || null,
+        textContent: finalText || null,
+        templateId: resolvedTemplateId || null,
+        templateVersionId: resolvedTemplateVersionId || null,
         status: EmailDeliveryStatus.QUEUED,
         idempotencyKey,
       },

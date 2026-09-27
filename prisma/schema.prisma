@@ -64,6 +64,8 @@ model User {
   passwordHash  String
   role         UserRole      @default(VIEWER)
   active       Boolean       @default(true)
+  emailVerified Boolean     @default(false)
+  emailVerifiedAt DateTime?
   lastLoginAt  DateTime?
   createdAt    DateTime      @default(now())
   updatedAt    DateTime      @updatedAt
@@ -504,6 +506,7 @@ model EmailTemplate {
 
   client          ApiClient              @relation(fields: [clientId], references: [id], onDelete: Cascade)
   versions        EmailTemplateVersion[]
+  deliveries      EmailDelivery[]
 
   @@unique([clientId, name])
   @@index([clientId])
@@ -523,6 +526,7 @@ model EmailTemplateVersion {
 
   template       EmailTemplate   @relation(fields: [templateId], references: [id], onDelete: Cascade)
   campaigns      EmailCampaign[]
+  deliveries     EmailDelivery[]
 
   @@unique([templateId, version])
   @@index([templateId])
@@ -557,6 +561,7 @@ model EmailCampaign {
   list               EmailList?               @relation(fields: [listId], references: [id], onDelete: SetNull)
   senderIdentity     EmailSenderIdentity?     @relation(fields: [senderIdentityId], references: [id], onDelete: SetNull)
   recipients         EmailCampaignRecipient[]
+  deliveries         EmailDelivery[]
 
   @@index([clientId])
   @@index([status])
@@ -595,7 +600,13 @@ model EmailDelivery {
   category               EmailType
   from                   String
   to                     String
+  replyTo                String?
   subject                String
+  htmlContent            String?
+  textContent            String?
+  templateId             String?
+  templateVersionId      String?
+  campaignId             String?
   status                 EmailDeliveryStatus     @default(QUEUED)
   attemptCount           Int                     @default(0)
   lastAttemptAt          DateTime?
@@ -611,6 +622,9 @@ model EmailDelivery {
 
   client                 ApiClient               @relation(fields: [clientId], references: [id], onDelete: Cascade)
   campaignRecipient      EmailCampaignRecipient? @relation(fields: [campaignRecipientId], references: [id], onDelete: SetNull)
+  campaign               EmailCampaign?          @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  template               EmailTemplate?          @relation(fields: [templateId], references: [id], onDelete: SetNull)
+  templateVersion        EmailTemplateVersion?   @relation(fields: [templateVersionId], references: [id], onDelete: SetNull)
   events                 EmailEvent[]
 
   @@unique([clientId, idempotencyKey])
@@ -621,6 +635,8 @@ model EmailDelivery {
   @@index([category])
   @@index([createdAt])
   @@index([campaignRecipientId])
+  @@index([campaignId])
+  @@index([templateId])
 }
 
 model EmailEvent {

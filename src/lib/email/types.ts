@@ -183,6 +183,11 @@ export interface EmailSendRequest {
   idempotencyKey?: string;
 
   /**
+   * Association with a campaign (if dispatched from a campaign).
+   */
+  campaignId?: string;
+
+  /**
    * Association with a campaign recipient (if dispatched from a campaign).
    */
   campaignRecipientId?: string;
