@@ -85,7 +85,7 @@ export async function GET(req: NextRequest) {
   }
 
   // 3. Verify and atomically consume the one-time CSRF/transaction state
-  const stateCheck = verifyAndConsumeOAuthState(state, auth.user.id);
+  const stateCheck = await verifyAndConsumeOAuthState(state, auth.user.id);
   if (!stateCheck.valid || !stateCheck.tenantId) {
     let message = "Invalid or expired OAuth state parameter";
     let status = 403;
@@ -182,7 +182,7 @@ export async function POST(req: NextRequest) {
     }
 
     // 1. Verify and atomically consume the one-time state
-    const stateCheck = verifyAndConsumeOAuthState(state, auth.user.id);
+    const stateCheck = await verifyAndConsumeOAuthState(state, auth.user.id);
     if (!stateCheck.valid || !stateCheck.tenantId) {
       let status = 403;
       if (stateCheck.reason === "REPLAYED") status = 409;

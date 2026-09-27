@@ -381,6 +381,37 @@
     - `npm run lint`: 0 errors, 0 warnings (exit code 0).
     - `npm run build`: Turbopack build succeeded with all 64 routes compiled cleanly (exit code 0).
 
+### Entry: 2026-09-28 — Google Workspace/Gmail OAuth Multi-Instance Production Hardening
+- **Prompt / Phase**: Harden Google Workspace/Gmail OAuth for multi-instance production deployment
+- **Status**: ✅ Clean (No unresolved concerns / Multi-Instance Durable Certified)
+- **Unresolved Concerns**: None.
+- **Notes / Observations**:
+  - **Durable Shared State Store**:
+    - Eliminated process-memory `Map` storage in `OAuthTransactionStore`.
+    - Implemented `RedisOAuthTransactionStore` implementing `IOAuthTransactionStore` with Redis persistence under `oauth:state:${nonce}`.
+    - Provided `MemoryOAuthTransactionStore` as fallback for isolated test environments.
+    - Swappable backend architecture with `OAuthTransactionStore.setBackend(...)`.
+  - **Complete State Schema Invariants**:
+    - Persisted state contains: `nonce`, `tenantId`, `adminUserId`, `createdAt`, `expiresAt`, `used: boolean`, and `consumedAt?: number`.
+  - **Atomic Lua Script Consume & Race Condition Prevention**:
+    - Atomic Lua script evaluates key existence, expiration, and `used` state in a single Redis execution unit.
+    - Two simultaneous callback requests for the same state cannot both succeed: exactly one succeeds (HTTP 200) and all concurrent replays receive `status: ALREADY_USED` mapping to HTTP 409 Conflict (`reason: REPLAYED`).
+    - Verified with 2 simultaneous HTTP callbacks and 10 concurrent atomic consumers (1 succeeded, 9 returned `ALREADY_USED`).
+  - **Multi-Instance & Process Restart Safety**:
+    - Verified multi-instance simulation: Instance A writes state to Redis; Instance B reads and consumes state; Instance C receives replay defense.
+    - Verified process restart simulation: In-memory store unmounted (`backend: null`); rebooted instance loads state from Redis and successfully consumes it.
+  - **15-Minute Expiration & TTL**:
+    - Redis keys written with millisecond TTL (`PSETEX`); consumed keys retain remaining TTL for replay protection until natural expiration.
+  - **Secret Redaction**:
+    - Added `redactSecrets` utility in `src/lib/crypto.ts` masking `ya29\...` access tokens, `1//...` refresh tokens, `client_secret`, authorization `code`, and passwords across all error messages and logs.
+  - **Minimum Scopes Preserved**:
+    - Strictly maintained minimum Google OAuth scopes: `gmail.send` (restricted dispatch) + `userinfo.email` (sender address lookup).
+  - **Quality Gates Passing**:
+    - `npm run test:email:oauth`: 79 PASSED, 0 FAILED.
+    - `npm test`: all 18 test suites passing cleanly (exit code 0).
+    - `npm run lint`: 0 errors, 0 warnings (exit code 0).
+    - `npm run build`: Turbopack compiled all 64 pages and API routes cleanly (exit code 0).
+
 ---
 
 ## Flag Template for Subsequent Prompts

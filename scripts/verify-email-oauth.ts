@@ -18,6 +18,8 @@
  * 14. ADMIN success (complete browser redirect flow)
  */
 
+process.env.REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
+
 import { NextRequest } from "next/server";
 import { GET as getOAuthUrl } from "../src/app/api/admin/email/providers/google/oauth/route";
 import { GET as getOAuthCallback, POST as postOAuthCallback } from "../src/app/api/admin/email/providers/google/callback/route";
@@ -25,10 +27,13 @@ import { GET as listProviders } from "../src/app/api/admin/email/providers/route
 import {
   createOAuthState,
   OAuthTransactionStore,
+  RedisOAuthTransactionStore,
+  verifyAndConsumeOAuthState,
   generateGoogleAuthUrl,
 } from "../src/lib/email/providers/gmail/oauth";
 import { GMAIL_SEND_SCOPE, GOOGLE_TOKEN_ENDPOINT } from "../src/lib/email/providers/gmail/gmail-provider";
 import { GOOGLE_USERINFO_ENDPOINT } from "../src/lib/email/providers/gmail/oauth";
+import { closeRedisConnections } from "../src/lib/email/queue/connection";
 import { createSessionToken, hashSessionToken, SESSION_COOKIE } from "../src/lib/auth";
 import { decryptProviderCredential } from "../src/lib/crypto";
 import { prisma } from "../src/lib/prisma";
@@ -284,7 +289,8 @@ async function runOAuthVerification() {
 
     // Construct expired state (> 15 minutes old)
     const oldNonce = "expired-nonce-12345";
-    OAuthTransactionStore.save(oldNonce, {
+    await OAuthTransactionStore.save(oldNonce, {
+      nonce: oldNonce,
       tenantId: "client-alpha",
       adminUserId: adminId,
       createdAt: Date.now() - 20 * 60 * 1000,
@@ -314,7 +320,7 @@ async function runOAuthVerification() {
     // -------------------------------------------------------------------------
     console.log("\n--- [5] Tampered State Defense ---");
 
-    const validState = createOAuthState("client-alpha", adminId);
+    const validState = await createOAuthState("client-alpha", adminId);
     const [b64, validSig] = validState.split(".");
     // Tamper with payload (change client-alpha to client-beta)
     const tamperedPayload = Buffer.from(b64, "base64url").toString("utf8").replace("client-alpha", "client-beta");
@@ -333,7 +339,7 @@ async function runOAuthVerification() {
     console.log("\n--- [6] Cross-Tenant Admin Defense ---");
 
     // State created by Admin A
-    const adminAState = createOAuthState("client-alpha", adminId);
+    const adminAState = await createOAuthState("client-alpha", adminId);
 
     // Another admin session (Admin B) tries to consume it
     const adminBId = "admin-user-beta";
@@ -368,7 +374,7 @@ async function runOAuthVerification() {
     // -------------------------------------------------------------------------
     console.log("\n--- [7] One-Time Nonce & Replay Attack Defense ---");
 
-    const replayState = createOAuthState("client-alpha", adminId);
+    const replayState = await createOAuthState("client-alpha", adminId);
 
     // First completion: succeeds
     const firstReq = new NextRequest(
@@ -396,7 +402,7 @@ async function runOAuthVerification() {
     mockTokenStatus = 400;
     mockTokenResponse = { error: "invalid_grant", error_description: "Code has already been redeemed" };
 
-    const tokenFailState = createOAuthState("client-alpha", adminId);
+    const tokenFailState = await createOAuthState("client-alpha", adminId);
     const tokenFailReq = new NextRequest(
       `http://localhost:3000/api/admin/email/providers/google/callback?code=bad_code&state=${tokenFailState}`,
       { headers: { cookie: adminCookie, accept: "application/json" } }
@@ -427,7 +433,7 @@ async function runOAuthVerification() {
       scope: `${GMAIL_SEND_SCOPE} https://www.googleapis.com/auth/userinfo.email`,
     };
 
-    const noRefreshState = createOAuthState("client-alpha", adminId);
+    const noRefreshState = await createOAuthState("client-alpha", adminId);
     const noRefreshReq = new NextRequest(
       `http://localhost:3000/api/admin/email/providers/google/callback?code=mock_code&state=${noRefreshState}`,
       { headers: { cookie: adminCookie, accept: "application/json" } }
@@ -453,7 +459,7 @@ async function runOAuthVerification() {
     mockUserinfoStatus = 401;
     mockUserinfoResponse = { error: "unauthorized" };
 
-    const userinfoFailState = createOAuthState("client-alpha", adminId);
+    const userinfoFailState = await createOAuthState("client-alpha", adminId);
     const userinfoFailReq = new NextRequest(
       `http://localhost:3000/api/admin/email/providers/google/callback?code=mock_code&state=${userinfoFailState}`,
       { headers: { cookie: adminCookie, accept: "application/json" } }
@@ -475,7 +481,7 @@ async function runOAuthVerification() {
     // -------------------------------------------------------------------------
     console.log("\n--- [11] Encrypted Persistence at Rest ---");
 
-    const validSetupState = createOAuthState("client-alpha", adminId);
+    const validSetupState = await createOAuthState("client-alpha", adminId);
     const setupReq = new NextRequest(
       `http://localhost:3000/api/admin/email/providers/google/callback?code=mock_code_setup&state=${validSetupState}`,
       { headers: { cookie: adminCookie, accept: "application/json" } }
@@ -519,7 +525,7 @@ async function runOAuthVerification() {
     // -------------------------------------------------------------------------
     console.log("\n--- [13] RBAC Matrix: VIEWER Rejection ---");
 
-    const viewerState = createOAuthState("client-alpha", adminId);
+    const viewerState = await createOAuthState("client-alpha", adminId);
     const viewerReq = new NextRequest(
       `http://localhost:3000/api/admin/email/providers/google/callback?code=mock_code&state=${viewerState}`,
       { headers: { cookie: viewerCookie, accept: "application/json" } }
@@ -572,7 +578,7 @@ async function runOAuthVerification() {
     // -------------------------------------------------------------------------
     console.log("\n--- [15] Programmatic POST Callback Compatibility ---");
 
-    const postState = createOAuthState("client-alpha", adminId);
+    const postState = await createOAuthState("client-alpha", adminId);
     const postReq = new NextRequest("http://localhost:3000/api/admin/email/providers/google/callback", {
       method: "POST",
       headers: {
@@ -590,6 +596,126 @@ async function runOAuthVerification() {
     testAssert(postRes.status === 200, "POST callback returns HTTP 200");
     const postData = (await postRes.json()).data;
     testAssert(postData.status === "ACTIVE", "POST callback marks provider ACTIVE");
+
+    // -------------------------------------------------------------------------
+    // 16. Concurrency & Race Condition Defense
+    // -------------------------------------------------------------------------
+    console.log("\n--- [16] Concurrency & Race Condition Defense ---");
+
+    // Scenario A: Two simultaneous callback requests for the same state
+    const raceState = await createOAuthState("client-alpha", adminId);
+    const raceReq1 = new NextRequest(
+      `http://localhost:3000/api/admin/email/providers/google/callback?code=mock_race_1&state=${raceState}`,
+      { headers: { cookie: adminCookie, accept: "application/json" } }
+    );
+    const raceReq2 = new NextRequest(
+      `http://localhost:3000/api/admin/email/providers/google/callback?code=mock_race_2&state=${raceState}`,
+      { headers: { cookie: adminCookie, accept: "application/json" } }
+    );
+
+    const [raceRes1, raceRes2] = await Promise.all([
+      getOAuthCallback(raceReq1),
+      getOAuthCallback(raceReq2),
+    ]);
+
+    const statuses = [raceRes1.status, raceRes2.status].sort();
+    testAssert(
+      statuses[0] === 200 && statuses[1] === 409,
+      "RACE CONDITION: Two simultaneous callbacks result in exactly one 200 OK and one 409 Conflict"
+    );
+
+    // Scenario B: High-concurrency atomic consume (10 concurrent consumers for single state)
+    const highConcurrencyState = await createOAuthState("client-alpha", adminId);
+    const payloadB64 = highConcurrencyState.split(".")[0];
+    const highNonce = JSON.parse(Buffer.from(payloadB64, "base64url").toString()).nonce;
+
+    const concurrentConsumeResults = await Promise.all(
+      Array.from({ length: 10 }, () => OAuthTransactionStore.consume(highNonce))
+    );
+    const okCount = concurrentConsumeResults.filter((r) => r.status === "OK").length;
+    const replayedCount = concurrentConsumeResults.filter((r) => r.status === "ALREADY_USED").length;
+
+    testAssert(okCount === 1, "CONCURRENCY: Exactly 1 out of 10 concurrent consumes succeeds (status: OK)");
+    testAssert(replayedCount === 9, "CONCURRENCY: Exactly 9 out of 10 concurrent consumes return ALREADY_USED");
+
+    // -------------------------------------------------------------------------
+    // 17. Multi-Instance & Process Restart Simulation
+    // -------------------------------------------------------------------------
+    console.log("\n--- [17] Multi-Instance & Process Restart Simulation ---");
+
+    // Simulation A: Multi-Instance State Sharing
+    const instanceAStore = new RedisOAuthTransactionStore();
+    const instanceBStore = new RedisOAuthTransactionStore();
+    const multiInstNonce = "multi-inst-" + Date.now();
+
+    await instanceAStore.save(multiInstNonce, {
+      nonce: multiInstNonce,
+      tenantId: "client-alpha",
+      adminUserId: adminId,
+      createdAt: Date.now(),
+      expiresAt: Date.now() + 15 * 60 * 1000,
+      used: false,
+    });
+
+    // Instance B reads state saved by Instance A
+    const instanceBRecord = await instanceBStore.get(multiInstNonce);
+    testAssert(instanceBRecord !== null && instanceBRecord.tenantId === "client-alpha", "MULTI-INSTANCE: Instance B reads state generated on Instance A via shared store");
+
+    // Instance B consumes state
+    const instanceBConsume = await instanceBStore.consume(multiInstNonce);
+    testAssert(instanceBConsume.status === "OK", "MULTI-INSTANCE: Instance B successfully consumes state created on Instance A");
+
+    // Instance C attempts to consume already consumed state
+    const instanceCStore = new RedisOAuthTransactionStore();
+    const instanceCConsume = await instanceCStore.consume(multiInstNonce);
+    testAssert(instanceCConsume.status === "ALREADY_USED", "MULTI-INSTANCE: Instance C receives ALREADY_USED for state consumed on Instance B");
+
+    // Simulation B: Process Restart / Serverless Cold Boot
+    const restartState = await createOAuthState("client-alpha", adminId);
+
+    // Simulate process crash: clear in-process singleton backend reference
+    OAuthTransactionStore.setBackend(null);
+
+    // New process instance boots up and validates state from Redis
+    const verifyAfterRestart = await verifyAndConsumeOAuthState(restartState, adminId);
+    testAssert(verifyAfterRestart.valid === true, "PROCESS RESTART: Valid state survives process restart and in-memory wipe");
+
+    // Replay check after restart
+    const replayAfterRestart = await verifyAndConsumeOAuthState(restartState, adminId);
+    testAssert(
+      verifyAfterRestart.valid === true && replayAfterRestart.valid === false && replayAfterRestart.reason === "REPLAYED",
+      "PROCESS RESTART: Replay detection survives process restart and reports REPLAYED"
+    );
+
+    // -------------------------------------------------------------------------
+    // 18. Durable State Schema, TTL & Expiration Verification
+    // -------------------------------------------------------------------------
+    console.log("\n--- [18] Durable State Schema, TTL & Expiration Verification ---");
+
+    const ttlNonce = "ttl-test-" + Date.now();
+    const nowTimestamp = Date.now();
+    await OAuthTransactionStore.save(ttlNonce, {
+      nonce: ttlNonce,
+      tenantId: "client-alpha",
+      adminUserId: adminId,
+      createdAt: nowTimestamp,
+      expiresAt: nowTimestamp + 15 * 60 * 1000,
+      used: false,
+    });
+
+    const storedRecord = await OAuthTransactionStore.get(ttlNonce);
+    testAssert(storedRecord !== null, "Stored record retrieved from shared store");
+    testAssert(storedRecord?.nonce === ttlNonce, "Record contains required 'nonce' field");
+    testAssert(storedRecord?.tenantId === "client-alpha", "Record contains required 'tenantId' field");
+    testAssert(storedRecord?.adminUserId === adminId, "Record contains required 'adminUserId' field");
+    testAssert(typeof storedRecord?.createdAt === "number", "Record contains required 'createdAt' timestamp");
+    testAssert(typeof storedRecord?.expiresAt === "number", "Record contains required 'expiresAt' timestamp");
+    testAssert(storedRecord?.used === false, "Record contains initial used flag: false");
+
+    const consumedResult = await OAuthTransactionStore.consume(ttlNonce);
+    testAssert(consumedResult.status === "OK", "Consume operation completes with status: OK");
+    testAssert(consumedResult.data?.used === true, "Record contains updated used flag: true");
+    testAssert(typeof consumedResult.data?.consumedAt === "number", "Record contains required 'consumedAt' timestamp");
   } finally {
     // Restore mocks
     globalThis.fetch = origFetch;
@@ -601,7 +727,8 @@ async function runOAuthVerification() {
     (prisma.emailProviderConfig as any).updateMany = origProviderUpdateMany;
     (prisma.emailSenderIdentity as any).upsert = origIdentityUpsert;
     (prisma.emailSenderIdentity as any).findMany = origIdentityFindMany;
-    OAuthTransactionStore.clear();
+    await OAuthTransactionStore.clear();
+    await closeRedisConnections();
   }
 
   console.log("\n-------------------------------------------------");
@@ -613,7 +740,11 @@ async function runOAuthVerification() {
   }
 }
 
-runOAuthVerification().catch((err) => {
-  console.error("Fatal error during OAuth verification:", err);
-  process.exit(1);
-});
+runOAuthVerification()
+  .then(() => {
+    process.exit(0);
+  })
+  .catch((err) => {
+    console.error("Fatal error during OAuth verification:", err);
+    process.exit(1);
+  });

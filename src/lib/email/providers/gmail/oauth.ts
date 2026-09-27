@@ -6,10 +6,13 @@
  */
 
 import crypto from "crypto";
+import { Redis } from "ioredis";
 import { prisma } from "../../../prisma";
-import { encryptProviderCredential } from "../../../crypto";
+import { encryptProviderCredential, redactSecrets } from "../../../crypto";
 import { EmailProviderStatus, EmailProviderType } from "@prisma/client";
 import { GMAIL_SEND_SCOPE, GOOGLE_TOKEN_ENDPOINT } from "./gmail-provider";
+import { getRedisConnection } from "../../queue/connection";
+import { logger } from "../../../logger";
 
 export const GOOGLE_AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth";
 export const GOOGLE_USERINFO_ENDPOINT = "https://www.googleapis.com/oauth2/v2/userinfo";
@@ -39,56 +42,214 @@ export interface GoogleTokensResult {
 }
 
 export interface OAuthTransaction {
+  nonce: string;
   tenantId: string;
   adminUserId?: string;
   createdAt: number;
   expiresAt: number;
   used: boolean;
+  consumedAt?: number;
+}
+
+export type OAuthConsumeStatus = "OK" | "NOT_FOUND" | "ALREADY_USED" | "EXPIRED";
+
+export interface OAuthConsumeResult {
+  status: OAuthConsumeStatus;
+  data?: OAuthTransaction;
+}
+
+export interface IOAuthTransactionStore {
+  save(nonce: string, tx: OAuthTransaction): Promise<void>;
+  get(nonce: string): Promise<OAuthTransaction | null>;
+  consume(nonce: string, now?: number): Promise<OAuthConsumeResult>;
+  clear(): Promise<void>;
+}
+
+const LUA_CONSUME_OAUTH_STATE = `
+  local key = KEYS[1]
+  local now = tonumber(ARGV[1])
+  local raw = redis.call('GET', key)
+
+  if not raw then
+    return cjson.encode({ status = 'NOT_FOUND' })
+  end
+
+  local data = cjson.decode(raw)
+
+  if data.used then
+    return cjson.encode({ status = 'ALREADY_USED', data = data })
+  end
+
+  if data.expiresAt and now > data.expiresAt then
+    return cjson.encode({ status = 'EXPIRED', data = data })
+  end
+
+  data.used = true
+  data.consumedAt = now
+
+  local ttl = redis.call('PTTL', key)
+  local encoded = cjson.encode(data)
+  if ttl > 0 then
+    redis.call('PSETEX', key, ttl, encoded)
+  else
+    redis.call('SET', key, encoded)
+  end
+
+  return cjson.encode({ status = 'OK', data = data })
+`;
+
+/**
+ * Distributed Redis-backed store for OAuth transactions.
+ * Supports multi-instance deployments, serverless functions, and process restarts.
+ * Uses atomic Lua script for single-use consumption and race condition prevention.
+ */
+export class RedisOAuthTransactionStore implements IOAuthTransactionStore {
+  private client: Redis;
+  private keyPrefix: string;
+
+  constructor(client?: Redis, keyPrefix = "oauth:state:") {
+    this.client = client || getRedisConnection();
+    this.keyPrefix = keyPrefix;
+  }
+
+  private getKey(nonce: string): string {
+    return `${this.keyPrefix}${nonce}`;
+  }
+
+  async save(nonce: string, tx: OAuthTransaction): Promise<void> {
+    const key = this.getKey(nonce);
+    const ttlMs = Math.max(1000, tx.expiresAt - Date.now());
+    await this.client.psetex(key, ttlMs, JSON.stringify(tx));
+  }
+
+  async get(nonce: string): Promise<OAuthTransaction | null> {
+    const key = this.getKey(nonce);
+    const raw = await this.client.get(key);
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw) as OAuthTransaction;
+    } catch {
+      return null;
+    }
+  }
+
+  async consume(nonce: string, now: number = Date.now()): Promise<OAuthConsumeResult> {
+    const key = this.getKey(nonce);
+    const resRaw = (await this.client.eval(
+      LUA_CONSUME_OAUTH_STATE,
+      1,
+      key,
+      now
+    )) as string;
+    try {
+      return JSON.parse(resRaw) as OAuthConsumeResult;
+    } catch (err) {
+      logger.error("[RedisOAuthTransactionStore] Failed to parse Lua consume result:", redactSecrets(String(err)));
+      return { status: "NOT_FOUND" };
+    }
+  }
+
+  async clear(): Promise<void> {
+    const keys = await this.client.keys(`${this.keyPrefix}*`);
+    if (keys.length > 0) {
+      await this.client.del(...keys);
+    }
+  }
 }
 
 /**
- * In-memory registry for one-time OAuth transactions/nonces.
- * Provides replay protection, tenant binding, and admin session verification.
+ * In-memory fallback store for standalone testing or development without Redis.
  */
-export class OAuthTransactionStore {
-  private static store = new Map<string, OAuthTransaction>();
+export class MemoryOAuthTransactionStore implements IOAuthTransactionStore {
+  private store = new Map<string, OAuthTransaction>();
 
-  static save(nonce: string, tx: OAuthTransaction): void {
-    // Purge expired entries on each write
+  async save(nonce: string, tx: OAuthTransaction): Promise<void> {
     const now = Date.now();
-    for (const [key, val] of this.store.entries()) {
-      if (now > val.expiresAt) {
-        this.store.delete(key);
+    for (const [k, v] of this.store.entries()) {
+      if (now > v.expiresAt) {
+        this.store.delete(k);
       }
     }
     this.store.set(nonce, tx);
   }
 
-  static get(nonce: string): OAuthTransaction | undefined {
-    return this.store.get(nonce);
-  }
-
-  static consume(nonce: string): boolean {
+  async get(nonce: string): Promise<OAuthTransaction | null> {
     const tx = this.store.get(nonce);
-    if (!tx || tx.used) return false;
-    tx.used = true;
-    return true;
+    if (!tx) return null;
+    if (Date.now() > tx.expiresAt) {
+      this.store.delete(nonce);
+      return null;
+    }
+    return tx;
   }
 
-  static clear(): void {
+  async consume(nonce: string, now: number = Date.now()): Promise<OAuthConsumeResult> {
+    const tx = this.store.get(nonce);
+    if (!tx) return { status: "NOT_FOUND" };
+    if (tx.used) return { status: "ALREADY_USED", data: tx };
+    if (now > tx.expiresAt) {
+      this.store.delete(nonce);
+      return { status: "EXPIRED", data: tx };
+    }
+    tx.used = true;
+    tx.consumedAt = now;
+    return { status: "OK", data: tx };
+  }
+
+  async clear(): Promise<void> {
     this.store.clear();
   }
 }
 
 /**
- * Creates a signed state token encoding tenant, admin, and one-time nonce information.
- * Backward compatible with createOAuthState(tenantId, secret) from Phase 2.
+ * Global shared registry for one-time OAuth transactions/nonces.
+ * Delegates to Redis by default (or configured backend) for multi-instance production safety.
  */
-export function createOAuthState(
+export class OAuthTransactionStore {
+  private static backend: IOAuthTransactionStore | null = null;
+
+  static getBackend(): IOAuthTransactionStore {
+    if (!this.backend) {
+      try {
+        this.backend = new RedisOAuthTransactionStore();
+      } catch (err) {
+        logger.warn("[OAuthTransactionStore] Redis connection unavailable, falling back to memory store:", redactSecrets(String(err)));
+        this.backend = new MemoryOAuthTransactionStore();
+      }
+    }
+    return this.backend;
+  }
+
+  static setBackend(store: IOAuthTransactionStore | null): void {
+    this.backend = store;
+  }
+
+  static async save(nonce: string, tx: OAuthTransaction): Promise<void> {
+    return this.getBackend().save(nonce, tx);
+  }
+
+  static async get(nonce: string): Promise<OAuthTransaction | null> {
+    return this.getBackend().get(nonce);
+  }
+
+  static async consume(nonce: string, now?: number): Promise<OAuthConsumeResult> {
+    return this.getBackend().consume(nonce, now);
+  }
+
+  static async clear(): Promise<void> {
+    return this.getBackend().clear();
+  }
+}
+
+/**
+ * Creates a signed state token encoding tenant, admin, and one-time nonce information.
+ * Persists the transaction in the durable shared store.
+ */
+export async function createOAuthState(
   tenantId: string,
   adminUserIdOrSecret?: string,
   secret?: string
-): string {
+): Promise<string> {
   let adminUserId: string | undefined;
   let signingSecret: string | undefined;
 
@@ -111,8 +272,9 @@ export function createOAuthState(
   const timestamp = Date.now();
   const ttlMs = 15 * 60 * 1000; // 15-minute validity
 
-  // Register one-time transaction nonce
-  OAuthTransactionStore.save(nonce, {
+  // Register one-time transaction nonce into durable shared store
+  await OAuthTransactionStore.save(nonce, {
+    nonce,
     tenantId,
     adminUserId,
     createdAt: timestamp,
@@ -147,14 +309,15 @@ export interface VerifyOAuthStateResult {
 }
 
 /**
- * Validates the signed OAuth state token and atomically consumes its one-time transaction nonce.
+ * Validates the signed OAuth state token and atomically consumes its one-time transaction nonce
+ * from the shared durable store.
  * Prevents replay attacks, verifies HMAC signature, checks time expiration, and enforces tenant/admin binding.
  */
-export function verifyAndConsumeOAuthState(
+export async function verifyAndConsumeOAuthState(
   stateString: string,
   expectedAdminUserId?: string,
   secret?: string
-): VerifyOAuthStateResult {
+): Promise<VerifyOAuthStateResult> {
   if (!stateString || typeof stateString !== "string" || !stateString.includes(".")) {
     return { valid: false, reason: "MALFORMED" };
   }
@@ -192,18 +355,24 @@ export function verifyAndConsumeOAuthState(
       return { valid: false, reason: "EXPIRED" };
     }
 
-    // Look up one-time transaction in store
-    const tx = OAuthTransactionStore.get(parsed.nonce);
-    if (!tx) {
+    // Atomically consume nonce from shared durable store
+    const consumeRes = await OAuthTransactionStore.consume(parsed.nonce);
+
+    if (consumeRes.status === "NOT_FOUND") {
       return { valid: false, reason: "UNKNOWN_NONCE" };
     }
 
-    if (tx.used) {
+    if (consumeRes.status === "ALREADY_USED") {
       return { valid: false, reason: "REPLAYED" };
     }
 
-    if (Date.now() > tx.expiresAt) {
+    if (consumeRes.status === "EXPIRED") {
       return { valid: false, reason: "EXPIRED" };
+    }
+
+    const tx = consumeRes.data;
+    if (!tx) {
+      return { valid: false, reason: "UNKNOWN_NONCE" };
     }
 
     if (tx.tenantId !== parsed.tenantId) {
@@ -219,9 +388,6 @@ export function verifyAndConsumeOAuthState(
       return { valid: false, reason: "ADMIN_MISMATCH" };
     }
 
-    // Atomically consume nonce to prevent replay
-    OAuthTransactionStore.consume(parsed.nonce);
-
     return {
       valid: true,
       tenantId: parsed.tenantId,
@@ -236,10 +402,10 @@ export function verifyAndConsumeOAuthState(
  * Validates the signed OAuth state token and extracts the tenant ID.
  * (Backward compatible wrapper for verifyAndConsumeOAuthState)
  */
-export function verifyOAuthState(
+export async function verifyOAuthState(
   stateString: string,
   secret?: string
-): { valid: boolean; tenantId?: string; adminUserId?: string; reason?: string } {
+): Promise<{ valid: boolean; tenantId?: string; adminUserId?: string; reason?: string }> {
   return verifyAndConsumeOAuthState(stateString, undefined, secret);
 }
 
@@ -248,8 +414,8 @@ export function verifyOAuthState(
  * Requests offline access with prompt=consent to ensure a refresh token is returned.
  * Requests minimum scopes: gmail.send (dispatch only) and userinfo.email (verified address lookup).
  */
-export function generateGoogleAuthUrl(options: GoogleAuthUrlOptions): string {
-  const state = createOAuthState(options.tenantId, options.adminUserId, options.stateSecret);
+export async function generateGoogleAuthUrl(options: GoogleAuthUrlOptions): Promise<string> {
+  const state = await createOAuthState(options.tenantId, options.adminUserId, options.stateSecret);
 
   const params = new URLSearchParams({
     client_id: options.googleClientId,
@@ -288,7 +454,7 @@ export async function exchangeGoogleAuthCode(options: ExchangeCodeOptions): Prom
 
   if (!response.ok) {
     const errText = await response.text().catch(() => "");
-    throw new Error(`Google token exchange failed (${response.status}): ${errText}`);
+    throw new Error(`Google token exchange failed (${response.status}): ${redactSecrets(errText)}`);
   }
 
   const tokenData = (await response.json()) as {

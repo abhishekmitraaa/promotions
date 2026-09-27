@@ -44,6 +44,7 @@ import {
 } from "../src/lib/crypto";
 import { EmailService } from "../src/lib/services/email-service";
 import { prisma } from "../src/lib/prisma";
+import { closeRedisConnections } from "../src/lib/email/queue/connection";
 import { createSessionToken, hashPasswordForStorage, hashSessionToken, SESSION_COOKIE } from "../src/lib/auth";
 
 async function runPhase2Tests() {
@@ -286,12 +287,12 @@ async function runPhase2Tests() {
   // -------------------------------------------------------------------------
   // 9. OAuth State Generation & Verification (CSRF Protection)
   // -------------------------------------------------------------------------
-  const state = createOAuthState("tenant-123", "test-secret-32-chars-minimum-len");
-  const stateVerify = verifyOAuthState(state, "test-secret-32-chars-minimum-len");
+  const state = await createOAuthState("tenant-123", "test-secret-32-chars-minimum-len");
+  const stateVerify = await verifyOAuthState(state, "test-secret-32-chars-minimum-len");
   testAssert(stateVerify.valid === true && stateVerify.tenantId === "tenant-123", "OAuth state encodes and validates tenantId with HMAC signature");
 
   const tamperedState = `tamperedPayload.${state.split(".")[1]}`;
-  testAssert(verifyOAuthState(tamperedState, "test-secret-32-chars-minimum-len").valid === false, "Tampered OAuth state is rejected");
+  testAssert((await verifyOAuthState(tamperedState, "test-secret-32-chars-minimum-len")).valid === false, "Tampered OAuth state is rejected");
 
   // -------------------------------------------------------------------------
   // 10. EmailService Sender Validation & Delivery State
@@ -472,6 +473,7 @@ async function runPhase2Tests() {
     (prisma.userSession as any).findUnique = origFindUnique;
     (prisma.emailProviderConfig as any).findMany = origProviderFindMany;
     (prisma.emailSenderIdentity as any).findMany = origIdentityFindMany;
+    await closeRedisConnections();
   }
 
   // -------------------------------------------------------------------------
@@ -486,7 +488,11 @@ async function runPhase2Tests() {
   }
 }
 
-runPhase2Tests().catch((err) => {
-  console.error("Fatal error during Phase 2 verification:", err);
-  process.exit(1);
-});
+runPhase2Tests()
+  .then(() => {
+    process.exit(0);
+  })
+  .catch((err) => {
+    console.error("Fatal error during Phase 2 verification:", err);
+    process.exit(1);
+  });

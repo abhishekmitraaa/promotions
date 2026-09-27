@@ -41,7 +41,7 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ success: false, error: "ApiClient not found" }, { status: 404 });
     }
 
-    const authUrl = generateGoogleAuthUrl({
+    const authUrl = await generateGoogleAuthUrl({
       googleClientId,
       redirectUri,
       tenantId: clientId,
