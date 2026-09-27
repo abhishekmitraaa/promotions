@@ -260,7 +260,7 @@ export default function TemplatesPage() {
       const json = await res.json();
       if (res.ok && json.success) {
         setTestSendResult({
-          text: `Test email dispatched to ${json.data.sentTo} (Message ID: ${json.data.providerMessageId || "mock-ok"})`,
+          text: `Test email dispatched to ${json.data.sentTo} ${json.data.providerMessageId ? `(Message ID: ${json.data.providerMessageId})` : "(Dispatched)"}`,
         });
       } else {
         setTestSendResult({

@@ -10,10 +10,18 @@ export async function GET(req: NextRequest) {
 
   try {
     const { searchParams } = new URL(req.url);
-    const clientId = searchParams.get("clientId") || undefined;
+    let targetClientId = searchParams.get("clientId") || undefined;
+    if (!targetClientId) {
+      const defaultClient = await prisma.apiClient.findFirst({
+        where: { active: true },
+        orderBy: { createdAt: "asc" },
+        select: { id: true },
+      });
+      targetClientId = defaultClient?.id;
+    }
 
     const providers = await prisma.emailProviderConfig.findMany({
-      where: clientId ? { clientId } : undefined,
+      where: targetClientId ? { clientId: targetClientId } : undefined,
       select: {
         id: true,
         clientId: true,
@@ -49,8 +57,28 @@ export async function POST(req: NextRequest) {
     const body = await req.json();
     const { clientId, name, providerType, senderEmail, senderName, credentials, isDefault } = body;
 
-    if (!clientId) {
-      return NextResponse.json({ success: false, error: "clientId is required" }, { status: 400 });
+    let targetClientId = clientId;
+    if (!targetClientId) {
+      const defaultClient = await prisma.apiClient.findFirst({
+        where: { active: true },
+        orderBy: { createdAt: "asc" },
+        select: { id: true },
+      });
+      targetClientId = defaultClient?.id;
+    }
+    if (!targetClientId) {
+      const anyClient = await prisma.apiClient.findFirst({
+        orderBy: { createdAt: "asc" },
+        select: { id: true },
+      });
+      targetClientId = anyClient?.id;
+    }
+    if (!targetClientId) {
+      const created = await prisma.apiClient.create({
+        data: { name: "Default Organization", active: true },
+        select: { id: true },
+      });
+      targetClientId = created.id;
     }
 
     if (!providerType || !Object.values(EmailProviderType).includes(providerType)) {
@@ -82,7 +110,7 @@ export async function POST(req: NextRequest) {
     }
 
     // Verify tenant exists
-    const client = await prisma.apiClient.findUnique({ where: { id: clientId } });
+    const client = await prisma.apiClient.findUnique({ where: { id: targetClientId } });
     if (!client) {
       return NextResponse.json({ success: false, error: "ApiClient not found" }, { status: 404 });
     }
@@ -99,14 +127,14 @@ export async function POST(req: NextRequest) {
 
     if (isDefault) {
       await prisma.emailProviderConfig.updateMany({
-        where: { clientId, isDefault: true },
+        where: { clientId: targetClientId, isDefault: true },
         data: { isDefault: false },
       });
     }
 
     const providerConfig = await prisma.emailProviderConfig.create({
       data: {
-        clientId,
+        clientId: targetClientId,
         name: name || `${providerType} Provider`,
         providerType,
         status: EmailProviderStatus.ACTIVE,

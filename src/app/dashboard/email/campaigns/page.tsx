@@ -363,7 +363,7 @@ export default function CampaignsPage() {
       });
       const json = await res.json();
       if (res.ok && json.success) {
-        setTestSendStatus(`Test email successfully delivered to ${json.data.sentTo} (Message ID: ${json.data.providerMessageId || "mock-ok"})`);
+        setTestSendStatus(`Test email successfully delivered to ${json.data.sentTo} ${json.data.providerMessageId ? `(Message ID: ${json.data.providerMessageId})` : "(Dispatched)"}`);
       } else {
         setTestSendStatus(`Failed: ${json.error?.message || "Could not dispatch test email"}`);
       }

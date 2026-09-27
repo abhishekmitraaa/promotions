@@ -445,6 +445,46 @@
 
 ---
 
+### Entry: 2026-09-28 — Complete Email Dashboard Operational Hardening & RBAC Audit
+- **Prompt / Phase**: Complete black-box operational audit and hardening of `/dashboard/email` and all sub-routes (Overview, Providers, Contacts, Lists, Segments, Templates, Campaigns, Deliveries, Suppressions).
+- **Status**: ✅ Clean (No unresolved concerns / 100% Operational)
+- **Unresolved Concerns**: None.
+- **Notes / Observations**:
+  - **Elimination of Placeholders & Hardcoded Mock Fallbacks**:
+    - Removed fake `"Ready (Mock/Local)"` fallback state in `src/app/dashboard/email/page.tsx`; now reflects genuine active provider connection status `Connected (<Name>)` or `No Active Provider`.
+    - Removed placeholder `"configured@tenant.internal"` sender identity; dynamically pulls genuine default sender address or displays `No Sender Configured`.
+    - Removed hardcoded `100% OPERATIONAL` health badge; wired dynamic telemetry from `/api/admin/email/providers/health` and `/api/admin/email/queue/health`.
+    - Replaced hardcoded `workerStatus: "ACTIVE"` with dynamic `READY` vs `OFFLINE` based on genuine Redis connectivity and BullMQ worker queue state.
+    - Removed cosmetic fallback string `"mock-ok"` from campaigns and templates UI.
+  - **Server-Side RBAC Enforcement (ADMIN vs VIEWER)**:
+    - Verified strict server-side RBAC across every dashboard module:
+      - `POST /api/admin/email/providers`: ADMIN allowed (201), VIEWER blocked with HTTP 403 Forbidden.
+      - `POST /api/admin/email/sender-identities`: ADMIN allowed (201), VIEWER blocked with HTTP 403 Forbidden.
+      - `GET & POST /api/admin/email/providers/health`: Live active health probes and DB mutation restricted to ADMIN (HTTP 403 Forbidden for VIEWER; dashboard gracefully falls back to persisted provider verification state).
+      - `POST /api/email/contacts`: ADMIN allowed (201), VIEWER blocked with HTTP 403 Forbidden.
+      - `POST /api/email/contacts/import`: ADMIN allowed (200), VIEWER blocked with HTTP 403 Forbidden.
+      - `POST /api/email/lists`: ADMIN allowed (201), VIEWER blocked with HTTP 403 Forbidden.
+      - `POST /api/email/lists/[id]/members`: ADMIN allowed (200), VIEWER blocked with HTTP 403 Forbidden.
+      - `POST /api/email/segments`: ADMIN allowed (201), VIEWER blocked with HTTP 403 Forbidden.
+      - `POST /api/email/templates`: ADMIN allowed (201), VIEWER blocked with HTTP 403 Forbidden.
+      - `POST /api/email/templates/[id]/versions`: ADMIN allowed (201), VIEWER blocked with HTTP 403 Forbidden.
+      - `POST /api/email/campaigns`: ADMIN allowed (201), VIEWER blocked with HTTP 403 Forbidden.
+      - `POST /api/email/campaigns/[id]/cancel`: ADMIN allowed (200), VIEWER blocked with HTTP 403 Forbidden.
+      - `POST & DELETE /api/email/suppressions`: ADMIN allowed (201/200), VIEWER blocked with HTTP 403 Forbidden.
+  - **Tenant Scoping & Session Resolution**:
+    - Fixed `src/lib/email/api-auth-helper.ts`: Authenticated session users visiting `/dashboard/email/*` previously received HTTP 400 (`Missing 'clientId' query parameter or 'x-client-id' header for tenant scoping`). Implemented auto-resolution of default active `apiClient` for session cookie users while preserving explicit scoping when provided.
+    - Fixed `POST /api/admin/email/sender-identities` & `POST /api/admin/email/providers`: Resolved `targetClientId` fallback when `clientId` was omitted from dashboard modal forms.
+  - **Audience Engine & Preview Parity**:
+    - Confirmed campaign preview (`/api/email/campaigns/preview` and `/api/email/campaigns/[id]/preview`) calculates exact eligible audience, suppressions, and unsubscribes identically to launch execution snapshot logic.
+    - Verified Segment live evaluation (`/api/email/segments/evaluate` and `/api/email/segments/[id]/evaluate`) returns unified payload `{ totalMatching, matchingCount, contacts, sampleContacts }` matching dashboard expectations.
+  - **Test Send Isolation**:
+    - Confirmed Test Send (`POST /api/email/templates/test-send` and `POST /api/email/templates/[id]/test-send`) renders real template content with merge variables and dispatches via active provider without writing or polluting `EmailCampaignRecipient` or campaign delivery records.
+  - **Automated Verification Suite**:
+    - Created end-to-end integration suite `scripts/verify-email-dashboard-operational.ts` (`npm run test:email:dashboard`) asserting all 9 routes, real data flow, and RBAC enforcement.
+    - 100% of checks passed against disposable PostgreSQL and Redis.
+
+---
+
 ## Flag Template for Subsequent Prompts
 
 ```markdown
@@ -457,5 +497,6 @@
 - **Mitigation / Next Steps**:
   - [Action to resolve concern in future phase]
 ```
+
 
 

@@ -69,7 +69,12 @@ export async function POST(req: NextRequest) {
       lastName: typeof body.lastName === "string" ? body.lastName : undefined,
       metadata: typeof body.metadata === "object" && body.metadata !== null ? (body.metadata as Record<string, unknown>) : undefined,
       verified: typeof body.verified === "boolean" ? body.verified : undefined,
-      hasMarketingConsent: typeof body.hasMarketingConsent === "boolean" ? body.hasMarketingConsent : undefined,
+      hasMarketingConsent:
+        typeof body.hasMarketingConsent === "boolean"
+          ? body.hasMarketingConsent
+          : typeof body.marketingConsent === "boolean"
+          ? body.marketingConsent
+          : undefined,
       consentSource: typeof body.consentSource === "string" ? body.consentSource : undefined,
     });
 

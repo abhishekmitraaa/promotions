@@ -9,10 +9,18 @@ export async function GET(req: NextRequest) {
 
   try {
     const { searchParams } = new URL(req.url);
-    const clientId = searchParams.get("clientId") || undefined;
+    let targetClientId = searchParams.get("clientId") || undefined;
+    if (!targetClientId) {
+      const defaultClient = await prisma.apiClient.findFirst({
+        where: { active: true },
+        orderBy: { createdAt: "asc" },
+        select: { id: true },
+      });
+      targetClientId = defaultClient?.id;
+    }
 
     const identities = await prisma.emailSenderIdentity.findMany({
-      where: clientId ? { clientId } : undefined,
+      where: targetClientId ? { clientId: targetClientId } : undefined,
       orderBy: { createdAt: "desc" },
     });
 
@@ -32,8 +40,28 @@ export async function POST(req: NextRequest) {
     const body = await req.json();
     const { clientId, email, name, replyToEmail, isDefault, verified } = body;
 
-    if (!clientId) {
-      return NextResponse.json({ success: false, error: "clientId is required" }, { status: 400 });
+    let targetClientId = clientId;
+    if (!targetClientId) {
+      const defaultClient = await prisma.apiClient.findFirst({
+        where: { active: true },
+        orderBy: { createdAt: "asc" },
+        select: { id: true },
+      });
+      targetClientId = defaultClient?.id;
+    }
+    if (!targetClientId) {
+      const anyClient = await prisma.apiClient.findFirst({
+        orderBy: { createdAt: "asc" },
+        select: { id: true },
+      });
+      targetClientId = anyClient?.id;
+    }
+    if (!targetClientId) {
+      const created = await prisma.apiClient.create({
+        data: { name: "Default Organization", active: true },
+        select: { id: true },
+      });
+      targetClientId = created.id;
     }
 
     if (!email || !isValidEmail(email)) {
@@ -44,7 +72,7 @@ export async function POST(req: NextRequest) {
 
     if (isDefault) {
       await prisma.emailSenderIdentity.updateMany({
-        where: { clientId, isDefault: true },
+        where: { clientId: targetClientId, isDefault: true },
         data: { isDefault: false },
       });
     }
@@ -52,7 +80,7 @@ export async function POST(req: NextRequest) {
     const identity = await prisma.emailSenderIdentity.upsert({
       where: {
         clientId_email: {
-          clientId,
+          clientId: targetClientId,
           email: cleanEmail,
         },
       },
@@ -64,7 +92,7 @@ export async function POST(req: NextRequest) {
         isDefault: Boolean(isDefault),
       },
       create: {
-        clientId,
+        clientId: targetClientId,
         email: cleanEmail,
         name: name || null,
         replyToEmail: replyToEmail || null,

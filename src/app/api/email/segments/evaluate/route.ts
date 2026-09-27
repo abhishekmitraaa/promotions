@@ -27,7 +27,15 @@ export async function POST(req: NextRequest) {
   try {
     const limit = typeof body.limit === "number" ? body.limit : 20;
     const result = await EmailSegmentService.previewContacts(auth.clientId, body.criteria, { limit });
-    return NextResponse.json({ success: true, data: result });
+    return NextResponse.json({
+      success: true,
+      data: {
+        totalMatching: result.matchingCount,
+        matchingCount: result.matchingCount,
+        contacts: result.sampleContacts,
+        sampleContacts: result.sampleContacts,
+      },
+    });
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Error previewing segment";
     return NextResponse.json(

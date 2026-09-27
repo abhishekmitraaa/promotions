@@ -37,7 +37,12 @@ export async function POST(req: NextRequest) {
         lastName: typeof rec.lastName === "string" ? rec.lastName : undefined,
         metadata: typeof rec.metadata === "object" && rec.metadata !== null ? (rec.metadata as Record<string, unknown>) : undefined,
         verified: typeof rec.verified === "boolean" ? rec.verified : undefined,
-        hasMarketingConsent: typeof rec.hasMarketingConsent === "boolean" ? rec.hasMarketingConsent : undefined,
+        hasMarketingConsent:
+          typeof rec.hasMarketingConsent === "boolean"
+            ? rec.hasMarketingConsent
+            : typeof rec.marketingConsent === "boolean"
+            ? rec.marketingConsent
+            : undefined,
         consentSource: typeof rec.consentSource === "string" ? rec.consentSource : "BULK_IMPORT",
       };
     });

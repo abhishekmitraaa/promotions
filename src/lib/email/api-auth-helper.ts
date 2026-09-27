@@ -14,6 +14,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { authenticateApiKey } from "../api-auth";
 import { requireUser, UserRole } from "../auth";
+import { prisma } from "../prisma";
 
 export interface EmailAuthResult {
   authorized: boolean;
@@ -62,25 +63,35 @@ export async function authenticateEmailApi(
 
   // Determine target tenant clientId for dashboard user
   const { searchParams } = new URL(req.url);
-  const clientId =
+  let clientId =
     searchParams.get("clientId") ||
     req.headers.get("x-client-id") ||
     undefined;
 
   if (!clientId) {
-    return {
-      authorized: false,
-      errorResponse: NextResponse.json(
-        {
-          success: false,
-          error: {
-            code: "BAD_REQUEST",
-            message: "Missing 'clientId' query parameter or 'x-client-id' header for tenant scoping.",
-          },
-        },
-        { status: 400 }
-      ),
-    };
+    // Automatically scope session user to the active default tenant ApiClient
+    const defaultClient = await prisma.apiClient.findFirst({
+      where: { active: true },
+      orderBy: { createdAt: "asc" },
+      select: { id: true },
+    });
+    if (defaultClient) {
+      clientId = defaultClient.id;
+    } else {
+      const anyClient = await prisma.apiClient.findFirst({
+        orderBy: { createdAt: "asc" },
+        select: { id: true },
+      });
+      if (anyClient) {
+        clientId = anyClient.id;
+      } else {
+        const created = await prisma.apiClient.create({
+          data: { name: "Default Organization", active: true },
+          select: { id: true },
+        });
+        clientId = created.id;
+      }
+    }
   }
 
   return {

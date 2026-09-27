@@ -164,6 +164,8 @@ async function runPhase6Tests() {
       return null;
     };
 
+    (prisma as any).$transaction = async (cb: any) => typeof cb === "function" ? cb(prisma) : Promise.all(cb);
+
     (prisma.emailTemplate as any).findFirst = async ({ where }: any) => {
       for (const t of inMemoryTemplates.values()) {
         if (where.id && t.id !== where.id) continue;
