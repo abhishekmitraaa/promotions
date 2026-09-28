@@ -2,19 +2,40 @@ import { NextRequest, NextResponse } from "next/server";
 import { requireUser } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { generateGoogleAuthUrl } from "@/lib/email/providers/gmail/oauth";
+import { checkRateLimit, rateLimitResponse } from "@/lib/rate-limit";
 
 export async function GET(req: NextRequest) {
   // Only ADMIN can initiate Google OAuth connection
   const auth = await requireUser(req, "ADMIN");
   if (auth.response) return auth.response;
 
+  // Rate limit: 10 OAuth initiation requests per minute per admin
+  const rl = await checkRateLimit(`rl:oauth_init:${auth.user.id}`, 10, 60000, {
+    criticality: "HIGH",
+  });
+  if (!rl.success) {
+    return rateLimitResponse(
+      rl,
+      "Too many OAuth authorization requests. Please wait.",
+      "RATE_LIMITED"
+    );
+  }
+
   try {
     const { searchParams } = new URL(req.url);
-    const clientId = searchParams.get("clientId");
+    let clientId = searchParams.get("clientId");
     const googleClientId = searchParams.get("googleClientId") || process.env.GMAIL_CLIENT_ID;
     const redirectUri =
       searchParams.get("redirectUri") ||
-      `${process.env.APP_URL || "http://localhost:3000"}/api/admin/email/providers/google/callback`;
+      `${process.env.APP_URL || new URL(req.url).origin}/api/admin/email/providers/google/callback`;
+
+    // Resolve tenant: explicit clientId param or fallback to default registered client
+    if (!clientId) {
+      const defaultClient = await prisma.apiClient.findFirst({ orderBy: { createdAt: "asc" } });
+      if (defaultClient) {
+        clientId = defaultClient.id;
+      }
+    }
 
     if (!clientId) {
       return NextResponse.json({ success: false, error: "clientId is required" }, { status: 400 });
@@ -33,11 +54,21 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ success: false, error: "ApiClient not found" }, { status: 404 });
     }
 
-    const authUrl = generateGoogleAuthUrl({
+    const authUrl = await generateGoogleAuthUrl({
       googleClientId,
       redirectUri,
       tenantId: clientId,
+      adminUserId: auth.user.id,
     });
+
+    const wantsJson =
+      req.headers.get("accept")?.includes("application/json") ||
+      searchParams.get("format") === "json";
+
+    // If browser navigates directly without requesting JSON, perform HTTP redirect to Google
+    if (!wantsJson && req.headers.get("accept")?.includes("text/html")) {
+      return NextResponse.redirect(authUrl);
+    }
 
     return NextResponse.json({
       success: true,

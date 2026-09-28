@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { authenticateEmailApi } from "@/lib/email/api-auth-helper";
 import { EmailCampaignService } from "@/lib/services/email-campaign-service";
 import { EmailCampaignStatus, EmailType } from "@prisma/client";
-import { checkRateLimit } from "@/lib/rate-limit";
+import { checkRateLimit, rateLimitResponse } from "@/lib/rate-limit";
 import { EmailAuditLogger } from "@/lib/email/audit-logger";
 
 export async function GET(req: NextRequest) {
@@ -30,17 +30,14 @@ export async function POST(req: NextRequest) {
   const auth = await authenticateEmailApi(req, { requireAdminForMutations: true });
   if (!auth.authorized || !auth.clientId) return auth.errorResponse!;
 
-  const rl = await checkRateLimit(`create_cmp_${auth.clientId}`, 20, 60000);
+  const rl = await checkRateLimit(`create_cmp_${auth.clientId}`, 20, 60000, {
+    criticality: "HIGH",
+    syncToDb: true,
+  });
   if (!rl.success) {
-    return NextResponse.json(
-      {
-        success: false,
-        error: {
-          code: "RATE_LIMITED",
-          message: "Too many campaign creation requests. Please wait.",
-        },
-      },
-      { status: 429, headers: { "Retry-After": String(rl.resetSeconds) } }
+    return rateLimitResponse(
+      rl,
+      "Too many campaign creation requests. Please wait."
     );
   }
 

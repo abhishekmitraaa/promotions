@@ -17,6 +17,7 @@ import {
   EmailSendRequest,
   EmailSendResult,
   EmailSendError,
+  EmailProviderHealthResult,
 } from "../../types";
 import { buildGmailMime, base64UrlEncode } from "./mime";
 import { decryptProviderCredential } from "../../../crypto";
@@ -212,6 +213,45 @@ export class GmailProvider implements EmailProvider {
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : "Credential verification failed";
       return { valid: false, error: this.redactSecrets(msg) };
+    }
+  }
+
+  /**
+   * Performs an end-to-end health verification by testing token acquisition
+   * against the Google OAuth 2.0 token endpoint and measuring round-trip latency.
+   */
+  async checkHealth(): Promise<EmailProviderHealthResult> {
+    const checkedAt = new Date();
+    if (!this.credentials || !this.credentials.clientId || !this.credentials.refreshToken) {
+      return {
+        healthy: false,
+        error: "Missing required Gmail credentials (clientId or refreshToken)",
+        checkedAt,
+      };
+    }
+
+    const start = performance.now();
+    try {
+      await this.getAccessToken(true);
+      const latencyMs = Math.round(performance.now() - start);
+      return {
+        healthy: true,
+        latencyMs,
+        message: "Google Workspace / Gmail OAuth connection verified successfully",
+        checkedAt,
+        details: {
+          senderEmail: this.credentials.senderEmail || undefined,
+        },
+      };
+    } catch (err: unknown) {
+      const latencyMs = Math.round(performance.now() - start);
+      const rawMsg = err instanceof Error ? err.message : "Gmail health verification failed";
+      return {
+        healthy: false,
+        latencyMs,
+        error: this.redactSecrets(rawMsg),
+        checkedAt,
+      };
     }
   }
 

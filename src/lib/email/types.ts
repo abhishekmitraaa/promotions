@@ -183,6 +183,11 @@ export interface EmailSendRequest {
   idempotencyKey?: string;
 
   /**
+   * Association with a campaign (if dispatched from a campaign).
+   */
+  campaignId?: string;
+
+  /**
    * Association with a campaign recipient (if dispatched from a campaign).
    */
   campaignRecipientId?: string;
@@ -224,7 +229,19 @@ export interface EmailSendResult {
 }
 
 /**
- * Provider interface contract that future provider implementations must fulfill.
+ * Detailed provider health verification result.
+ */
+export interface EmailProviderHealthResult {
+  healthy: boolean;
+  latencyMs?: number;
+  message?: string;
+  error?: string;
+  checkedAt: Date;
+  details?: Record<string, unknown>;
+}
+
+/**
+ * Provider interface contract that provider implementations must fulfill.
  */
 export interface EmailProvider {
   readonly id: string;
@@ -237,7 +254,12 @@ export interface EmailProvider {
   send(request: EmailSendRequest): Promise<EmailSendResult>;
 
   /**
-   * Optional health or credential verification.
+   * Optional credential verification.
    */
   verifyCredentials?(): Promise<{ valid: boolean; error?: string }>;
+
+  /**
+   * Standardized provider health and connectivity check.
+   */
+  checkHealth?(): Promise<EmailProviderHealthResult>;
 }

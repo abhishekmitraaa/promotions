@@ -7,12 +7,13 @@ import { getRedisConnection } from "./connection";
 import {
   QUEUE_NAMES,
   TransactionalJobData,
+  PromotionalJobData,
   CampaignJobData,
   EmailEventJobData,
 } from "./types";
 
-let transactionalQueue: Queue<TransactionalJobData> | null = null;
-let campaignQueue: Queue<CampaignJobData> | null = null;
+let transactionalQueue: Queue<TransactionalJobData | PromotionalJobData> | null = null;
+let campaignQueue: Queue<CampaignJobData | PromotionalJobData> | null = null;
 let eventsQueue: Queue<EmailEventJobData> | null = null;
 
 function getBaseQueueOptions(): QueueOptions {
@@ -39,9 +40,9 @@ function getBaseQueueOptions(): QueueOptions {
 /**
  * Accessor for the transactional email queue.
  */
-export function getTransactionalQueue(): Queue<TransactionalJobData> {
+export function getTransactionalQueue(): Queue<TransactionalJobData | PromotionalJobData> {
   if (!transactionalQueue) {
-    transactionalQueue = new Queue<TransactionalJobData>(
+    transactionalQueue = new Queue<TransactionalJobData | PromotionalJobData>(
       QUEUE_NAMES.TRANSACTIONAL,
       getBaseQueueOptions()
     );
@@ -52,9 +53,9 @@ export function getTransactionalQueue(): Queue<TransactionalJobData> {
 /**
  * Accessor for the promotional campaign queue.
  */
-export function getCampaignQueue(): Queue<CampaignJobData> {
+export function getCampaignQueue(): Queue<CampaignJobData | PromotionalJobData> {
   if (!campaignQueue) {
-    campaignQueue = new Queue<CampaignJobData>(
+    campaignQueue = new Queue<CampaignJobData | PromotionalJobData>(
       QUEUE_NAMES.CAMPAIGN,
       getBaseQueueOptions()
     );

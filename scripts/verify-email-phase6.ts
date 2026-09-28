@@ -124,7 +124,12 @@ async function runPhase6Tests() {
   const origTemplateDelete = prisma.emailTemplate.delete;
 
   const origVersionFindUnique = prisma.emailTemplateVersion.findUnique;
+  const origVersionFindFirst = (prisma.emailTemplateVersion as any)?.findFirst;
   const origVersionCreate = prisma.emailTemplateVersion.create;
+
+  const origListFindFirst = (prisma.emailList as any)?.findFirst;
+  const origSegmentFindFirst = (prisma.emailSegment as any)?.findFirst;
+  const origSenderIdentityFindFirst = (prisma.emailSenderIdentity as any)?.findFirst;
 
   const origCampaignFindUnique = prisma.emailCampaign.findUnique;
   const origCampaignFindFirst = prisma.emailCampaign.findFirst;
@@ -135,11 +140,15 @@ async function runPhase6Tests() {
   const origRecipientFindUnique = prisma.emailCampaignRecipient.findUnique;
   const origRecipientFindMany = prisma.emailCampaignRecipient.findMany;
   const origRecipientCreate = prisma.emailCampaignRecipient.create;
+  const origRecipientCreateMany = (prisma.emailCampaignRecipient as any)?.createMany;
   const origRecipientUpdate = prisma.emailCampaignRecipient.update;
   const origRecipientUpdateMany = prisma.emailCampaignRecipient.updateMany;
-
   const origDeliveryCreate = prisma.emailDelivery.create;
+  const origDeliveryFindFirst = prisma.emailDelivery.findFirst;
+  const origDeliveryUpdate = prisma.emailDelivery.update;
+  const origDeliveryUpdateMany = prisma.emailDelivery.updateMany;
   const origSuppressionFindUnique = prisma.emailSuppression.findUnique;
+  const origSuppressionFindMany = prisma.emailSuppression.findMany;
   const origListMemberFindMany = prisma.emailListMember.findMany;
   const origContactFindMany = prisma.emailContact.findMany;
 
@@ -154,6 +163,8 @@ async function runPhase6Tests() {
       }
       return null;
     };
+
+    (prisma as any).$transaction = async (cb: any) => typeof cb === "function" ? cb(prisma) : Promise.all(cb);
 
     (prisma.emailTemplate as any).findFirst = async ({ where }: any) => {
       for (const t of inMemoryTemplates.values()) {
@@ -199,6 +210,37 @@ async function runPhase6Tests() {
       const template = inMemoryTemplates.get(v.templateId);
       return { ...v, template };
     };
+
+    (prisma.emailTemplateVersion as any).findFirst = async ({ where }: any) => {
+      for (const v of inMemoryVersions.values()) {
+        if (where.id && v.id !== where.id) continue;
+        if (where.template?.clientId) {
+          const t = inMemoryTemplates.get(v.templateId);
+          if (!t || t.clientId !== where.template.clientId) continue;
+        }
+        const template = inMemoryTemplates.get(v.templateId);
+        return { ...v, template };
+      }
+      return null;
+    };
+
+    if (prisma.emailList) {
+      (prisma.emailList as any).findFirst = async ({ where }: any) => {
+        return { id: where.id || "list-1", clientId: where.clientId || "tenant-alpha" };
+      };
+    }
+
+    if (prisma.emailSegment) {
+      (prisma.emailSegment as any).findFirst = async ({ where }: any) => {
+        return { id: where.id || "seg-1", clientId: where.clientId || "tenant-alpha" };
+      };
+    }
+
+    if (prisma.emailSenderIdentity) {
+      (prisma.emailSenderIdentity as any).findFirst = async ({ where }: any) => {
+        return { id: where.id || "sender-1", clientId: where.clientId || "tenant-alpha" };
+      };
+    }
 
     (prisma.emailTemplateVersion as any).create = async ({ data }: any) => {
       const id = `ver-${Date.now()}-${Math.random().toString(36).substring(7)}`;
@@ -260,9 +302,33 @@ async function runPhase6Tests() {
       return record;
     };
 
+    (prisma.emailCampaign as any).updateMany = async ({ where, data }: any) => {
+      let count = 0;
+      for (const c of inMemoryCampaigns.values()) {
+        if (where?.id && c.id !== where.id) continue;
+        if (where?.clientId && c.clientId !== where.clientId) continue;
+        if (where?.status?.in && !where.status.in.includes(c.status)) continue;
+        if (where?.status && typeof where.status === "string" && c.status !== where.status) continue;
+        Object.assign(c, data, { updatedAt: new Date() });
+        count++;
+      }
+      return { count };
+    };
+
     // Campaign Recipient mocks
     (prisma.emailCampaignRecipient as any).findUnique = async ({ where }: any) => {
       return inMemoryRecipients.get(where.id) || null;
+    };
+
+    (prisma.emailCampaignRecipient as any).findMany = async ({ where }: any) => {
+      const results: any[] = [];
+      for (const r of inMemoryRecipients.values()) {
+        if (where?.campaignId && r.campaignId !== where.campaignId) continue;
+        if (where?.status?.in && !where.status.in.includes(r.status)) continue;
+        if (where?.status && typeof where.status === "string" && r.status !== where.status) continue;
+        results.push(r);
+      }
+      return results;
     };
 
     (prisma.emailCampaignRecipient as any).create = async ({ data }: any) => {
@@ -270,6 +336,17 @@ async function runPhase6Tests() {
       const record = { id, ...data, createdAt: new Date(), updatedAt: new Date() };
       inMemoryRecipients.set(id, record);
       return record;
+    };
+
+    (prisma.emailCampaignRecipient as any).createMany = async ({ data }: any) => {
+      let count = 0;
+      for (const item of data) {
+        const id = `rcp-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+        const record = { id, ...item, createdAt: new Date(), updatedAt: new Date() };
+        inMemoryRecipients.set(id, record);
+        count++;
+      }
+      return { count };
     };
 
     (prisma.emailCampaignRecipient as any).update = async ({ where, data }: any) => {
@@ -289,12 +366,47 @@ async function runPhase6Tests() {
       return { count };
     };
 
+    (prisma.emailCampaignRecipient as any).count = async ({ where }: any) => {
+      let count = 0;
+      for (const r of inMemoryRecipients.values()) {
+        if (where?.campaignId && r.campaignId !== where.campaignId) continue;
+        if (where?.status?.in && !where.status.in.includes(r.status)) continue;
+        if (where?.status && typeof where.status === "string" && r.status !== where.status) continue;
+        count++;
+      }
+      return count;
+    };
+
     // Deliveries mock
+    (prisma.emailDelivery as any).findFirst = async ({ where }: any) => {
+      for (const d of inMemoryDeliveries.values()) {
+        if (where?.campaignRecipientId && d.campaignRecipientId !== where.campaignRecipientId) continue;
+        return d;
+      }
+      return null;
+    };
+
     (prisma.emailDelivery as any).create = async ({ data }: any) => {
       const id = `del-${Date.now()}-${Math.random().toString(36).substring(7)}`;
       const record = { id, ...data, createdAt: new Date() };
       inMemoryDeliveries.set(id, record);
       return record;
+    };
+
+    (prisma.emailDelivery as any).update = async ({ where, data }: any) => {
+      const record = inMemoryDeliveries.get(where.id);
+      if (record) Object.assign(record, data, { updatedAt: new Date() });
+      return record;
+    };
+
+    (prisma.emailDelivery as any).updateMany = async ({ where, data }: any) => {
+      let count = 0;
+      for (const d of inMemoryDeliveries.values()) {
+        if (where?.id && d.id !== where.id) continue;
+        Object.assign(d, data, { updatedAt: new Date() });
+        count++;
+      }
+      return { count };
     };
 
     // Suppression mock
@@ -304,6 +416,17 @@ async function runPhase6Tests() {
         if (s.clientId === clientId && s.normalizedEmail === normalizedEmail) return s;
       }
       return null;
+    };
+
+    (prisma.emailSuppression as any).findMany = async ({ where }: any) => {
+      const results: any[] = [];
+      const normalizedIn: string[] | undefined = where?.normalizedEmail?.in;
+      for (const s of inMemorySuppressions.values()) {
+        if (where?.clientId && s.clientId !== where.clientId) continue;
+        if (normalizedIn && !normalizedIn.includes(s.normalizedEmail)) continue;
+        results.push(s);
+      }
+      return results;
     };
 
     // List Members mock
@@ -443,9 +566,9 @@ async function runPhase6Tests() {
     inMemoryLists.set(audienceList.id, audienceList);
 
     // Add all 3 contacts as list members
-    inMemoryListMembers.set("m-1", { listId: audienceList.id, contactId: contactEligible.id, status: EmailSubscriptionStatus.SUBSCRIBED });
-    inMemoryListMembers.set("m-2", { listId: audienceList.id, contactId: contactNoConsent.id, status: EmailSubscriptionStatus.SUBSCRIBED });
-    inMemoryListMembers.set("m-3", { listId: audienceList.id, contactId: contactSuppressed.id, status: EmailSubscriptionStatus.SUBSCRIBED });
+    inMemoryListMembers.set("m-1", { id: "m-1", listId: audienceList.id, contactId: contactEligible.id, status: EmailSubscriptionStatus.SUBSCRIBED });
+    inMemoryListMembers.set("m-2", { id: "m-2", listId: audienceList.id, contactId: contactNoConsent.id, status: EmailSubscriptionStatus.SUBSCRIBED });
+    inMemoryListMembers.set("m-3", { id: "m-3", listId: audienceList.id, contactId: contactSuppressed.id, status: EmailSubscriptionStatus.SUBSCRIBED });
 
     // Link campaign to audience list
     await EmailCampaignService.updateCampaign("tenant-alpha", campaign1.id, {
@@ -636,9 +759,19 @@ async function runPhase6Tests() {
     (prisma.emailCampaignRecipient as any).updateMany = origRecipientUpdateMany;
 
     (prisma.emailDelivery as any).create = origDeliveryCreate;
+    (prisma.emailDelivery as any).findFirst = origDeliveryFindFirst;
+    (prisma.emailDelivery as any).update = origDeliveryUpdate;
+    (prisma.emailDelivery as any).updateMany = origDeliveryUpdateMany;
     (prisma.emailSuppression as any).findUnique = origSuppressionFindUnique;
+    if (origSuppressionFindMany) (prisma.emailSuppression as any).findMany = origSuppressionFindMany;
+    if (origRecipientCreateMany) (prisma.emailCampaignRecipient as any).createMany = origRecipientCreateMany;
     (prisma.emailListMember as any).findMany = origListMemberFindMany;
     (prisma.emailContact as any).findMany = origContactFindMany;
+
+    if (origVersionFindFirst) (prisma.emailTemplateVersion as any).findFirst = origVersionFindFirst;
+    if (origListFindFirst && prisma.emailList) (prisma.emailList as any).findFirst = origListFindFirst;
+    if (origSegmentFindFirst && prisma.emailSegment) (prisma.emailSegment as any).findFirst = origSegmentFindFirst;
+    if (origSenderIdentityFindFirst && prisma.emailSenderIdentity) (prisma.emailSenderIdentity as any).findFirst = origSenderIdentityFindFirst;
   }
 
   // ---------------------------------------------------------------------------

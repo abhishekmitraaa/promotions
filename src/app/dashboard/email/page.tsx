@@ -22,6 +22,10 @@ interface CampaignSummary {
   deliveredCount: number;
   bouncedCount: number;
   sentCount: number;
+  openRate?: number;
+  clickRate?: number;
+  uniqueOpens?: number;
+  uniqueClicks?: number;
 }
 
 interface QueueHealth {
@@ -45,10 +49,12 @@ export default function EmailDashboardPage() {
   });
   const [campaigns, setCampaigns] = useState<CampaignSummary[]>([]);
   const [providerConnected, setProviderConnected] = useState(false);
+  const [providerName, setProviderName] = useState<string | null>(null);
   const [senderIdentity, setSenderIdentity] = useState<string | null>(null);
+  const [providerHealth, setProviderHealth] = useState<string>("UNKNOWN");
   const [queueHealth, setQueueHealth] = useState<QueueHealth>({
     status: "HEALTHY",
-    workerStatus: "RUNNING",
+    workerStatus: "READY",
     transactionalWaiting: 0,
     campaignWaiting: 0,
     failedJobs: 0,
@@ -58,51 +64,63 @@ export default function EmailDashboardPage() {
   useEffect(() => {
     async function loadDashboard() {
       try {
-        // Fetch campaigns
+        // 1. Fetch authoritative analytics from backend
+        const analyticsRes = await fetch("/api/email/analytics");
+        if (analyticsRes.ok) {
+          const json = await analyticsRes.json();
+          if (json.data) {
+            setMetrics({
+              sent: json.data.sent || 0,
+              delivered: json.data.delivered || 0,
+              failed: json.data.failed || 0,
+              bounced: json.data.bounced || 0,
+              complaints: json.data.complaints || 0,
+              unsubscribed: json.data.unsubscribed || 0,
+              openRate: json.data.rates?.openRate ?? 0,
+              clickRate: json.data.rates?.clickRate ?? 0,
+            });
+          }
+        }
+
+        // 2. Fetch campaigns list
         const campRes = await fetch("/api/email/campaigns");
         if (campRes.ok) {
           const json = await campRes.json();
           if (json.data) {
             setCampaigns(json.data.slice(0, 5));
-
-            let totalSent = 0;
-            let totalDelivered = 0;
-            let totalBounced = 0;
-            let totalComplaints = 0;
-            let totalUnsubscribed = 0;
-
-            for (const c of json.data) {
-              totalSent += c.sentCount || 0;
-              totalDelivered += c.deliveredCount || 0;
-              totalBounced += c.bouncedCount || 0;
-              totalComplaints += c.complaintCount || 0;
-              totalUnsubscribed += c.unsubscribedCount || 0;
-            }
-
-            const openRate = totalDelivered > 0 ? 32.5 : 0; // heuristic baseline
-            const clickRate = totalDelivered > 0 ? 11.2 : 0;
-
-            setMetrics({
-              sent: totalSent,
-              delivered: totalDelivered,
-              failed: Math.max(0, totalSent - totalDelivered - totalBounced),
-              bounced: totalBounced,
-              complaints: totalComplaints,
-              unsubscribed: totalUnsubscribed,
-              openRate,
-              clickRate,
-            });
           }
         }
 
-        // Fetch provider status
+        // 3. Fetch provider status and live health
         const provRes = await fetch("/api/admin/email/providers");
         if (provRes.ok) {
           const json = await provRes.json();
           if (json.data && json.data.length > 0) {
-            const defaultProv = json.data.find((p: { isDefault?: boolean; status?: string; senderEmail?: string }) => p.isDefault) || json.data[0];
+            const defaultProv = json.data.find((p: { isDefault?: boolean; status?: string; senderEmail?: string; name?: string; id: string }) => p.isDefault) || json.data[0];
             setProviderConnected(defaultProv.status === "ACTIVE");
+            setProviderName(defaultProv.name || "Gmail Provider");
             setSenderIdentity(defaultProv.senderEmail || null);
+
+            // Probe live health for active default provider (ADMIN role; fallback to persisted state if VIEWER 403)
+            try {
+              const hRes = await fetch(`/api/admin/email/providers/health?id=${defaultProv.id}`);
+              if (hRes.ok) {
+                const hJson = await hRes.json();
+                setProviderHealth(hJson.data?.healthy ? "OPERATIONAL" : "DEGRADED");
+              } else if (hRes.status === 403) {
+                // Read-only / VIEWER session: use persisted verification state
+                setProviderHealth(defaultProv.status === "ACTIVE" ? (defaultProv.errorMessage ? "DEGRADED" : "OPERATIONAL") : "UNHEALTHY");
+              } else {
+                setProviderHealth("UNHEALTHY");
+              }
+            } catch {
+              setProviderHealth("OFFLINE");
+            }
+          } else {
+            setProviderConnected(false);
+            setProviderName(null);
+            setSenderIdentity(null);
+            setProviderHealth("NOT_CONFIGURED");
           }
         }
 
@@ -112,8 +130,8 @@ export default function EmailDashboardPage() {
           const json = await qRes.json();
           if (json.data) {
             setQueueHealth({
-              status: json.data.redisStatus === "ready" ? "HEALTHY" : "DEGRADED",
-              workerStatus: "ACTIVE",
+              status: json.data.status || (json.data.redis?.connected ? "HEALTHY" : "DEGRADED"),
+              workerStatus: json.data.redis?.connected ? "READY" : "OFFLINE",
               transactionalWaiting: json.data.queues?.transactional?.waiting || 0,
               campaignWaiting: json.data.queues?.campaign?.waiting || 0,
               failedJobs:
@@ -121,6 +139,12 @@ export default function EmailDashboardPage() {
                 (json.data.queues?.campaign?.failed || 0),
             });
           }
+        } else {
+          setQueueHealth((prev) => ({
+            ...prev,
+            status: "OFFLINE",
+            workerStatus: "OFFLINE",
+          }));
         }
       } catch {
         // Safe fallback in offline mode
@@ -164,6 +188,37 @@ export default function EmailDashboardPage() {
             Templates
           </Link>
         </div>
+      </div>
+
+      {/* Top Navigation Submodule Tabs */}
+      <div className="flex flex-wrap items-center gap-2 border-b border-zinc-800 pb-3 text-xs">
+        <Link href="/dashboard/email" className="px-3 py-1.5 rounded-lg bg-sky-500/10 text-sky-400 font-semibold border border-sky-500/20">
+          Overview
+        </Link>
+        <Link href="/dashboard/email/campaigns" className="px-3 py-1.5 rounded-lg bg-zinc-900 text-zinc-300 hover:text-white border border-zinc-800 transition">
+          Campaigns
+        </Link>
+        <Link href="/dashboard/email/templates" className="px-3 py-1.5 rounded-lg bg-zinc-900 text-zinc-300 hover:text-white border border-zinc-800 transition">
+          Templates
+        </Link>
+        <Link href="/dashboard/email/contacts" className="px-3 py-1.5 rounded-lg bg-zinc-900 text-zinc-300 hover:text-white border border-zinc-800 transition">
+          Contacts & Consent
+        </Link>
+        <Link href="/dashboard/email/lists" className="px-3 py-1.5 rounded-lg bg-zinc-900 text-zinc-300 hover:text-white border border-zinc-800 transition">
+          Lists
+        </Link>
+        <Link href="/dashboard/email/segments" className="px-3 py-1.5 rounded-lg bg-zinc-900 text-zinc-300 hover:text-white border border-zinc-800 transition">
+          Segments
+        </Link>
+        <Link href="/dashboard/email/deliveries" className="px-3 py-1.5 rounded-lg bg-zinc-900 text-zinc-300 hover:text-white border border-zinc-800 transition">
+          Deliveries
+        </Link>
+        <Link href="/dashboard/email/providers" className="px-3 py-1.5 rounded-lg bg-zinc-900 text-zinc-300 hover:text-white border border-zinc-800 transition">
+          Providers
+        </Link>
+        <Link href="/dashboard/email/suppressions" className="px-3 py-1.5 rounded-lg bg-zinc-900 text-zinc-300 hover:text-white border border-zinc-800 transition">
+          Suppressions
+        </Link>
       </div>
 
       {/* KPI Cards Grid */}
@@ -218,21 +273,27 @@ export default function EmailDashboardPage() {
           <div className="mt-4 space-y-3">
             <div className="flex items-center justify-between text-sm py-1 border-b border-zinc-800/60">
               <span className="text-zinc-400">Connection State:</span>
-              <span className="flex items-center gap-1.5 font-medium text-emerald-400">
-                <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-                {providerConnected ? "Connected (Gmail / Workspace)" : "Ready (Mock/Local)"}
+              <span className={`flex items-center gap-1.5 font-medium ${providerConnected ? "text-emerald-400" : "text-amber-400"}`}>
+                <span className={`w-2 h-2 rounded-full ${providerConnected ? "bg-emerald-500 animate-pulse" : "bg-amber-500"}`}></span>
+                {providerConnected ? `Connected (${providerName || "Gmail"})` : "No Active Provider"}
               </span>
             </div>
             <div className="flex items-center justify-between text-sm py-1 border-b border-zinc-800/60">
               <span className="text-zinc-400">Default Sender:</span>
               <span className="font-mono text-xs text-zinc-300">
-                {senderIdentity || "configured@tenant.internal"}
+                {senderIdentity || "No Sender Configured"}
               </span>
             </div>
             <div className="flex items-center justify-between text-sm py-1">
               <span className="text-zinc-400">Provider Health:</span>
-              <span className="text-xs font-semibold px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-                100% OPERATIONAL
+              <span className={`text-xs font-semibold px-2 py-0.5 rounded border ${
+                providerHealth === "OPERATIONAL"
+                  ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
+                  : providerHealth === "NOT_CONFIGURED"
+                  ? "bg-zinc-800 text-zinc-400 border-zinc-700"
+                  : "bg-rose-500/10 text-rose-400 border-rose-500/20"
+              }`}>
+                {providerHealth === "OPERATIONAL" ? "OPERATIONAL" : providerHealth === "NOT_CONFIGURED" ? "NOT CONFIGURED" : providerHealth}
               </span>
             </div>
           </div>
@@ -247,8 +308,18 @@ export default function EmailDashboardPage() {
           <div className="mt-4 space-y-3">
             <div className="flex items-center justify-between text-sm py-1 border-b border-zinc-800/60">
               <span className="text-zinc-400">Queue Health:</span>
-              <span className="text-xs font-semibold px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+              <span className={`text-xs font-semibold px-2 py-0.5 rounded border ${
+                queueHealth.status === "HEALTHY"
+                  ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
+                  : "bg-rose-500/10 text-rose-400 border-rose-500/20"
+              }`}>
                 {queueHealth.status}
+              </span>
+            </div>
+            <div className="flex items-center justify-between text-sm py-1 border-b border-zinc-800/60">
+              <span className="text-zinc-400">Worker Status:</span>
+              <span className={`font-mono text-xs font-medium ${queueHealth.workerStatus === "READY" ? "text-emerald-400" : "text-amber-400"}`}>
+                {queueHealth.workerStatus}
               </span>
             </div>
             <div className="flex items-center justify-between text-sm py-1 border-b border-zinc-800/60">
@@ -309,10 +380,10 @@ export default function EmailDashboardPage() {
                     <td className="px-5 py-3.5 text-emerald-400">{camp.deliveredCount}</td>
                     <td className="px-5 py-3.5 text-amber-400">{camp.bouncedCount}</td>
                     <td className="px-5 py-3.5 text-sky-400">
-                      {camp.deliveredCount > 0 ? "35%" : "0%"}
+                      {camp.openRate !== undefined ? `${camp.openRate}%` : "0%"}
                     </td>
                     <td className="px-5 py-3.5 text-indigo-400">
-                      {camp.deliveredCount > 0 ? "12%" : "0%"}
+                      {camp.clickRate !== undefined ? `${camp.clickRate}%` : "0%"}
                     </td>
                   </tr>
                 ))

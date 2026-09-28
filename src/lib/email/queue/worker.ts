@@ -10,16 +10,21 @@
  * 6. Updates database delivery state (PROCESSING -> SENT or FAILED).
  * 7. Error classification: transient errors trigger BullMQ backoff retry; permanent errors throw UnrecoverableError.
  * 8. Strict credential scrubbing: zero secrets or tokens in worker logs.
+ * 9. Production telemetry tracking and failure handling.
  */
 
 import { Worker, Job, UnrecoverableError } from "bullmq";
 import { prisma } from "../../prisma";
 import { EmailDelivery, EmailDeliveryStatus, EmailProviderType } from "@prisma/client";
 import { createWorkerRedisConnection } from "./connection";
-import { QUEUE_NAMES, TransactionalJobData, RetryableEmailError, isRetryableError } from "./types";
+import { QUEUE_NAMES, TransactionalJobData, PromotionalJobData, JOB_NAMES, RetryableEmailError, isRetryableError } from "./types";
 import { providerRegistry } from "../registry";
 import { EmailProvider } from "../types";
 import { logger } from "../../logger";
+import { processPromotionalDeliveryJob } from "./promotional-delivery-worker";
+import { workerTelemetry } from "./telemetry";
+
+export { processPromotionalDeliveryJob };
 
 export interface EmailWorkerOptions {
   connection?: ReturnType<typeof createWorkerRedisConnection>;
@@ -35,6 +40,7 @@ export async function processTransactionalJob(
   options?: { providerOverride?: EmailProvider }
 ) {
   const { deliveryId, clientId } = job.data;
+  const startTimeMs = workerTelemetry.recordJobStart();
   logger.info(`[Worker:Transactional] Processing job ${job.id} for delivery ${deliveryId} (tenant: ${clientId})`);
 
   // 1. Load Authoritative Delivery Record
@@ -45,11 +51,17 @@ export async function processTransactionalJob(
     });
   } catch (err) {
     logger.error(`[Worker:Transactional] DB query failed for delivery ${deliveryId}:`, err);
+    const dbErr = new RetryableEmailError(
+      `Database query failed for delivery '${deliveryId}': ${err instanceof Error ? err.message : String(err)}`
+    );
+    workerTelemetry.recordJobFailure(startTimeMs, dbErr);
+    throw dbErr;
   }
 
   if (!delivery) {
-    // Permanent failure: record does not exist
-    throw new UnrecoverableError(`Authoritative EmailDelivery '${deliveryId}' not found.`);
+    const notFoundErr = new UnrecoverableError(`Authoritative EmailDelivery '${deliveryId}' not found.`);
+    workerTelemetry.recordJobFailure(startTimeMs, notFoundErr);
+    throw notFoundErr;
   }
 
   // 2. Stale Delivery Guard: If already SENT or DELIVERED, ignore stale retry!
@@ -58,6 +70,7 @@ export async function processTransactionalJob(
     delivery.status === EmailDeliveryStatus.DELIVERED
   ) {
     logger.info(`[Worker:Transactional] Delivery ${deliveryId} is already ${delivery.status}. Skipping stale execution.`);
+    workerTelemetry.recordJobSkipped();
     return {
       skipped: true,
       reason: "ALREADY_COMPLETED",
@@ -78,8 +91,12 @@ export async function processTransactionalJob(
         lastAttemptAt: new Date(),
       },
     });
-  } catch {
-    // If table not yet migrated, continue processing
+  } catch (err) {
+    const dbErr = new RetryableEmailError(
+      `Failed to transition delivery '${delivery.id}' to PROCESSING: ${err instanceof Error ? err.message : String(err)}`
+    );
+    workerTelemetry.recordJobFailure(startTimeMs, dbErr);
+    throw dbErr;
   }
 
   // 4. Verify Recipient Suppression
@@ -93,7 +110,7 @@ export async function processTransactionalJob(
 
     if (isSuppressed) {
       await prisma.emailDelivery.updateMany({
-        where: { id: delivery.id },
+        where: { id: delivery.id, status: EmailDeliveryStatus.PROCESSING },
         data: {
           status: EmailDeliveryStatus.FAILED,
           errorCode: "RECIPIENT_SUPPRESSED",
@@ -102,8 +119,9 @@ export async function processTransactionalJob(
         },
       });
 
-      // Permanent error: Do NOT retry suppressed recipients
-      throw new UnrecoverableError(`Recipient '${delivery.to}' is suppressed.`);
+      const suppErr = new UnrecoverableError(`Recipient '${delivery.to}' is suppressed.`);
+      workerTelemetry.recordJobFailure(startTimeMs, suppErr);
+      throw suppErr;
     }
   } catch (err) {
     if (err instanceof UnrecoverableError) throw err;
@@ -125,9 +143,8 @@ export async function processTransactionalJob(
       providerSenderEmail = resolved.senderEmail;
     } catch (resolveErr) {
       const msg = resolveErr instanceof Error ? resolveErr.message : "Provider resolution failed";
-      // Provider unconfigured or invalid is a permanent error requiring admin intervention
       await prisma.emailDelivery.updateMany({
-        where: { id: delivery.id },
+        where: { id: delivery.id, status: EmailDeliveryStatus.PROCESSING },
         data: {
           status: EmailDeliveryStatus.FAILED,
           errorCode: "PROVIDER_RESOLUTION_FAILED",
@@ -135,28 +152,45 @@ export async function processTransactionalJob(
           failedAt: new Date(),
         },
       });
-      throw new UnrecoverableError(msg);
+      const unrecErr = new UnrecoverableError(msg);
+      workerTelemetry.recordJobFailure(startTimeMs, unrecErr);
+      throw unrecErr;
     }
   }
 
-  // 6. Execute Send via Resolved Provider
+  // 6. Execute Send via Resolved Provider with Authoritative Content
+  const outgoingHtml = delivery.htmlContent || undefined;
+  const outgoingText = delivery.textContent || undefined;
+
+  if (!outgoingHtml && !outgoingText) {
+    const emptyErr = new UnrecoverableError(
+      `Delivery '${delivery.id}' has no authoritative content (htmlContent and textContent are both empty).`
+    );
+    workerTelemetry.recordJobFailure(startTimeMs, emptyErr);
+    throw emptyErr;
+  }
+
   try {
     const sendResult = await provider.send({
       clientId: delivery.clientId,
       type: "TRANSACTIONAL",
       to: delivery.to,
       from: delivery.from || providerSenderEmail || "system@whatsapphub.internal",
+      replyTo: delivery.replyTo || undefined,
       subject: delivery.subject,
-      html: `<p>${delivery.subject}</p>`,
-      text: delivery.subject,
+      html: outgoingHtml,
+      text: outgoingText,
       transactionalReference: delivery.transactionalReference || undefined,
     });
 
     if (sendResult.accepted) {
-      // 7. Persist Success Delivery State
+      // 7. Persist Success Delivery State (Monotonic integrity: never downgrade if already SENT or DELIVERED)
       try {
         await prisma.emailDelivery.updateMany({
-          where: { id: delivery.id },
+          where: {
+            id: delivery.id,
+            status: { in: [EmailDeliveryStatus.PROCESSING, EmailDeliveryStatus.QUEUED] },
+          },
           data: {
             status: EmailDeliveryStatus.SENT,
             providerType,
@@ -170,7 +204,15 @@ export async function processTransactionalJob(
         // Table fallback
       }
 
-      logger.info(`[Worker:Transactional] Successfully sent delivery ${deliveryId} via ${sendResult.providerName} (messageId: ${sendResult.providerMessageId})`);
+      workerTelemetry.recordJobSuccess(startTimeMs, {
+        deliveryId,
+        recipient: delivery.to,
+        providerType,
+      });
+
+      logger.info(
+        `[Worker:Transactional] Successfully sent delivery ${deliveryId} via ${sendResult.providerName} (messageId: ${sendResult.providerMessageId})`
+      );
       return {
         success: true,
         deliveryId,
@@ -185,7 +227,10 @@ export async function processTransactionalJob(
 
     try {
       await prisma.emailDelivery.updateMany({
-        where: { id: delivery.id },
+        where: {
+          id: delivery.id,
+          status: { in: [EmailDeliveryStatus.PROCESSING, EmailDeliveryStatus.QUEUED] },
+        },
         data: {
           status: retryable ? EmailDeliveryStatus.PROCESSING : EmailDeliveryStatus.FAILED,
           errorCode: error?.code || "DISPATCH_FAILED",
@@ -198,11 +243,19 @@ export async function processTransactionalJob(
     }
 
     if (retryable) {
-      logger.warn(`[Worker:Transactional] Transient failure for delivery ${deliveryId}: ${error?.message}. Triggering BullMQ retry.`);
-      throw new RetryableEmailError(error?.message || "Transient send failure", error?.code);
+      logger.warn(
+        `[Worker:Transactional] Transient failure for delivery ${deliveryId}: ${error?.message}. Triggering BullMQ retry.`
+      );
+      const retryErr = new RetryableEmailError(error?.message || "Transient send failure", error?.code);
+      workerTelemetry.recordJobFailure(startTimeMs, retryErr);
+      throw retryErr;
     } else {
-      logger.error(`[Worker:Transactional] Permanent failure for delivery ${deliveryId}: ${error?.message}. Failing job immediately.`);
-      throw new UnrecoverableError(error?.message || "Permanent delivery rejection");
+      logger.error(
+        `[Worker:Transactional] Permanent failure for delivery ${deliveryId}: ${error?.message}. Failing job immediately.`
+      );
+      const permErr = new UnrecoverableError(error?.message || "Permanent delivery rejection");
+      workerTelemetry.recordJobFailure(startTimeMs, permErr);
+      throw permErr;
     }
   } catch (sendErr) {
     if (sendErr instanceof UnrecoverableError || sendErr instanceof RetryableEmailError) {
@@ -215,7 +268,10 @@ export async function processTransactionalJob(
 
     try {
       await prisma.emailDelivery.updateMany({
-        where: { id: delivery.id },
+        where: {
+          id: delivery.id,
+          status: { in: [EmailDeliveryStatus.PROCESSING, EmailDeliveryStatus.QUEUED] },
+        },
         data: {
           status: retryable ? EmailDeliveryStatus.PROCESSING : EmailDeliveryStatus.FAILED,
           errorCode: "PROVIDER_EXCEPTION",
@@ -227,11 +283,9 @@ export async function processTransactionalJob(
       // Table fallback
     }
 
-    if (retryable) {
-      throw new RetryableEmailError(msg);
-    } else {
-      throw new UnrecoverableError(msg);
-    }
+    const finalErr = retryable ? new RetryableEmailError(msg) : new UnrecoverableError(msg);
+    workerTelemetry.recordJobFailure(startTimeMs, finalErr);
+    throw finalErr;
   }
 }
 
@@ -242,16 +296,24 @@ export function createEmailWorker(options?: EmailWorkerOptions): Worker {
   const connection = options?.connection || createWorkerRedisConnection();
   const concurrency = options?.concurrency || parseInt(process.env.EMAIL_WORKER_CONCURRENCY || "5", 10);
 
-  const worker = new Worker<TransactionalJobData>(
+  const worker = new Worker<TransactionalJobData | PromotionalJobData>(
     QUEUE_NAMES.TRANSACTIONAL,
     async (job) => {
-      return processTransactionalJob(job, {
+      if (job.name === JOB_NAMES.SEND_PROMOTIONAL) {
+        return processPromotionalDeliveryJob(job as Job<PromotionalJobData>, {
+          providerOverride: options?.providerOverride,
+        });
+      }
+      return processTransactionalJob(job as Job<TransactionalJobData>, {
         providerOverride: options?.providerOverride,
       });
     },
     {
       connection,
       concurrency,
+      lockDuration: 30000,
+      stalledInterval: 15000,
+      maxStalledCount: 2,
       limiter: {
         max: parseInt(process.env.EMAIL_QUEUE_MAX_RATE || "15", 10),
         duration: 1000, // 15 requests per second max
@@ -265,6 +327,11 @@ export function createEmailWorker(options?: EmailWorkerOptions): Worker {
 
   worker.on("failed", (job, err) => {
     logger.error(`[Worker:Transactional] Job ${job?.id} failed with error: ${err.message}`);
+  });
+
+  worker.on("stalled", (jobId) => {
+    workerTelemetry.recordJobStalled();
+    logger.warn(`[Worker:Transactional] Job ${jobId} stalled and will be reclaimed by BullMQ`);
   });
 
   worker.on("error", (err) => {

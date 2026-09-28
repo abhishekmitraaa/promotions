@@ -1,32 +1,72 @@
 -- CreateEnum
-CREATE TYPE "EmailProviderType" AS ENUM ('GMAIL', 'SES', 'SMTP', 'MOCK');
+DO $$ BEGIN
+  CREATE TYPE "EmailProviderType" AS ENUM ('GMAIL', 'SES', 'SMTP', 'MOCK');
+EXCEPTION
+  WHEN duplicate_object THEN null;
+END $$;
 
 -- CreateEnum
-CREATE TYPE "EmailProviderStatus" AS ENUM ('ACTIVE', 'INACTIVE', 'FAILED');
+DO $$ BEGIN
+  CREATE TYPE "EmailProviderStatus" AS ENUM ('ACTIVE', 'INACTIVE', 'FAILED');
+EXCEPTION
+  WHEN duplicate_object THEN null;
+END $$;
 
 -- CreateEnum
-CREATE TYPE "EmailType" AS ENUM ('TRANSACTIONAL', 'PROMOTIONAL');
+DO $$ BEGIN
+  CREATE TYPE "EmailType" AS ENUM ('TRANSACTIONAL', 'PROMOTIONAL');
+EXCEPTION
+  WHEN duplicate_object THEN null;
+END $$;
 
 -- CreateEnum
-CREATE TYPE "EmailContactStatus" AS ENUM ('SUBSCRIBED', 'UNSUBSCRIBED', 'BOUNCED', 'COMPLAINED', 'SUPPRESSED', 'PENDING');
+DO $$ BEGIN
+  CREATE TYPE "EmailContactStatus" AS ENUM ('SUBSCRIBED', 'UNSUBSCRIBED', 'BOUNCED', 'COMPLAINED', 'SUPPRESSED', 'PENDING');
+EXCEPTION
+  WHEN duplicate_object THEN null;
+END $$;
 
 -- CreateEnum
-CREATE TYPE "EmailSubscriptionStatus" AS ENUM ('SUBSCRIBED', 'UNSUBSCRIBED', 'PENDING');
+DO $$ BEGIN
+  CREATE TYPE "EmailSubscriptionStatus" AS ENUM ('SUBSCRIBED', 'UNSUBSCRIBED', 'PENDING');
+EXCEPTION
+  WHEN duplicate_object THEN null;
+END $$;
 
 -- CreateEnum
-CREATE TYPE "EmailTemplateType" AS ENUM ('TRANSACTIONAL', 'PROMOTIONAL');
+DO $$ BEGIN
+  CREATE TYPE "EmailTemplateType" AS ENUM ('TRANSACTIONAL', 'PROMOTIONAL');
+EXCEPTION
+  WHEN duplicate_object THEN null;
+END $$;
 
 -- CreateEnum
-CREATE TYPE "EmailCampaignStatus" AS ENUM ('DRAFT', 'SCHEDULED', 'RUNNING', 'PAUSED', 'COMPLETED', 'FAILED', 'CANCELLED');
+DO $$ BEGIN
+  CREATE TYPE "EmailCampaignStatus" AS ENUM ('DRAFT', 'SCHEDULED', 'RUNNING', 'PAUSED', 'COMPLETED', 'FAILED', 'CANCELLED');
+EXCEPTION
+  WHEN duplicate_object THEN null;
+END $$;
 
 -- CreateEnum
-CREATE TYPE "EmailDeliveryStatus" AS ENUM ('QUEUED', 'PROCESSING', 'SENT', 'DELIVERED', 'BOUNCED', 'COMPLAINED', 'FAILED');
+DO $$ BEGIN
+  CREATE TYPE "EmailDeliveryStatus" AS ENUM ('QUEUED', 'PROCESSING', 'SENT', 'DELIVERED', 'BOUNCED', 'COMPLAINED', 'FAILED');
+EXCEPTION
+  WHEN duplicate_object THEN null;
+END $$;
 
 -- CreateEnum
-CREATE TYPE "EmailEventType" AS ENUM ('SENT', 'DELIVERED', 'OPENED', 'CLICKED', 'BOUNCED', 'COMPLAINT', 'UNSUBSCRIBED', 'FAILED');
+DO $$ BEGIN
+  CREATE TYPE "EmailEventType" AS ENUM ('SENT', 'DELIVERED', 'OPENED', 'CLICKED', 'BOUNCED', 'COMPLAINT', 'UNSUBSCRIBED', 'FAILED');
+EXCEPTION
+  WHEN duplicate_object THEN null;
+END $$;
 
 -- CreateEnum
-CREATE TYPE "EmailSuppressionReason" AS ENUM ('HARD_BOUNCE', 'COMPLAINT', 'UNSUBSCRIBED', 'MANUAL', 'INVALID');
+DO $$ BEGIN
+  CREATE TYPE "EmailSuppressionReason" AS ENUM ('HARD_BOUNCE', 'COMPLAINT', 'UNSUBSCRIBED', 'MANUAL', 'INVALID');
+EXCEPTION
+  WHEN duplicate_object THEN null;
+END $$;
 
 -- CreateTable
 CREATE TABLE "EmailProviderConfig" (

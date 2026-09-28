@@ -35,10 +35,11 @@ export async function GET(req: NextRequest, { params }: RouteParams) {
     const ip = req.headers.get("x-forwarded-for") || req.headers.get("x-real-ip") || undefined;
     const userAgent = req.headers.get("user-agent") || undefined;
 
-    // Record open asynchronously
-    EmailTrackingService.recordOpen(verification.deliveryId, { ip, userAgent }).catch(() => {
-      // Non-fatal
-    });
+    try {
+      await EmailTrackingService.recordOpen(verification.deliveryId, { ip, userAgent });
+    } catch {
+      // Non-fatal: pixel response must never fail
+    }
   }
 
   return new NextResponse(new Uint8Array(pixel), {

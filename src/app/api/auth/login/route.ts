@@ -1,12 +1,21 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { createSessionToken, hashSessionToken, SESSION_COOKIE, verifyPassword } from "@/lib/auth";
-import { checkRateLimit } from "@/lib/rate-limit";
+import { checkRateLimit, getClientIp, rateLimitResponse } from "@/lib/rate-limit";
 
 export async function POST(req: NextRequest) {
-  const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "unknown";
-  const rl = await checkRateLimit(`login:${ip}`, 10, 15 * 60 * 1000);
-  if (!rl.success) return NextResponse.json({ success: false, error: { code: "RATE_LIMITED", message: "Too many login attempts. Try again later." } }, { status: 429 });
+  const ip = getClientIp(req);
+  const ipRl = await checkRateLimit(`login:${ip}`, 10, 15 * 60 * 1000, {
+    criticality: "CRITICAL",
+    failClosed: true,
+    syncToDb: true,
+  });
+  if (!ipRl.success) {
+    return rateLimitResponse(
+      ipRl,
+      "Too many login attempts from this IP address. Please try again later."
+    );
+  }
 
   let body: unknown;
   try { body = await req.json(); } catch { return NextResponse.json({ success: false, error: { code: "BAD_REQUEST", message: "Invalid JSON body" } }, { status: 400 }); }
@@ -14,6 +23,19 @@ export async function POST(req: NextRequest) {
   const email = typeof bodyObj.email === "string" ? bodyObj.email.trim().toLowerCase() : "";
   const password = typeof bodyObj.password === "string" ? bodyObj.password : "";
   if (!email || !password) return NextResponse.json({ success: false, error: { code: "VALIDATION_ERROR", message: "Email and password are required" } }, { status: 400 });
+
+  // Account-level brute force protection: 25 attempts per 15 minutes per email
+  const acctRl = await checkRateLimit(`rl:acct:${email}:login`, 25, 15 * 60 * 1000, {
+    criticality: "CRITICAL",
+    failClosed: true,
+  });
+  if (!acctRl.success) {
+    return rateLimitResponse(
+      acctRl,
+      "Too many failed login attempts for this account. Please wait before trying again.",
+      "ACCOUNT_RATE_LIMITED"
+    );
+  }
 
   const user = await prisma.user.findUnique({ where: { email } });
   if (!user || !user.active || !(await verifyPassword(password, user.passwordHash))) {

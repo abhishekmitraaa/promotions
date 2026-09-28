@@ -1,23 +1,21 @@
 import { NextRequest, NextResponse } from "next/server";
-import { checkRateLimit } from "@/lib/rate-limit";
+import { checkRateLimit, getClientIp, rateLimitResponse } from "@/lib/rate-limit";
 import { AuthTokenService } from "@/lib/services/auth-token-service";
 import { normalizeEmail, isValidEmail } from "@/lib/email/normalization";
 
 export async function POST(req: NextRequest) {
-  const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "unknown";
+  const ip = getClientIp(req);
 
   // Rate limit: 5 requests per 15 minutes per IP
-  const ipRateLimit = await checkRateLimit(`forgot_pw_ip_${ip}`, 5, 15 * 60 * 1000);
+  const ipRateLimit = await checkRateLimit(`forgot_pw_ip_${ip}`, 5, 15 * 60 * 1000, {
+    criticality: "CRITICAL",
+    failClosed: true,
+    syncToDb: true,
+  });
   if (!ipRateLimit.success) {
-    return NextResponse.json(
-      {
-        success: false,
-        error: {
-          code: "RATE_LIMITED",
-          message: "Too many password reset attempts. Please try again later.",
-        },
-      },
-      { status: 429, headers: { "Retry-After": String(ipRateLimit.resetSeconds) } }
+    return rateLimitResponse(
+      ipRateLimit,
+      "Too many password reset attempts. Please try again later."
     );
   }
 
@@ -48,17 +46,16 @@ export async function POST(req: NextRequest) {
   const normalizedEmail = normalizeEmail(rawEmail);
 
   // Rate limit per normalized email (3 requests per 15 minutes)
-  const emailRateLimit = await checkRateLimit(`forgot_pw_email_${normalizedEmail}`, 3, 15 * 60 * 1000);
+  const emailRateLimit = await checkRateLimit(
+    `forgot_pw_email_${normalizedEmail}`,
+    3,
+    15 * 60 * 1000,
+    { criticality: "CRITICAL", failClosed: true, syncToDb: true }
+  );
   if (!emailRateLimit.success) {
-    return NextResponse.json(
-      {
-        success: false,
-        error: {
-          code: "RATE_LIMITED",
-          message: "Too many reset requests for this email. Please try again later.",
-        },
-      },
-      { status: 429, headers: { "Retry-After": String(emailRateLimit.resetSeconds) } }
+    return rateLimitResponse(
+      emailRateLimit,
+      "Too many reset requests for this email. Please try again later."
     );
   }
 

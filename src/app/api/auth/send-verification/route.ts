@@ -1,21 +1,22 @@
 import { NextRequest, NextResponse } from "next/server";
-import { checkRateLimit } from "@/lib/rate-limit";
+import { checkRateLimit, getClientIp, rateLimitResponse } from "@/lib/rate-limit";
 import { AuthTokenService } from "@/lib/services/auth-token-service";
 import { getAuthenticatedUser } from "@/lib/auth";
 import { isValidEmail, normalizeEmail } from "@/lib/email/normalization";
 
 export async function POST(req: NextRequest) {
-  const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "unknown";
+  const ip = getClientIp(req);
 
   // Rate limit: 5 verification dispatch requests per 15 minutes per IP
-  const rl = await checkRateLimit(`send_ver_ip_${ip}`, 5, 15 * 60 * 1000);
+  const rl = await checkRateLimit(`send_ver_ip_${ip}`, 5, 15 * 60 * 1000, {
+    criticality: "CRITICAL",
+    failClosed: true,
+    syncToDb: true,
+  });
   if (!rl.success) {
-    return NextResponse.json(
-      {
-        success: false,
-        error: { code: "RATE_LIMITED", message: "Too many verification requests. Please wait." },
-      },
-      { status: 429, headers: { "Retry-After": String(rl.resetSeconds) } }
+    return rateLimitResponse(
+      rl,
+      "Too many verification requests from this IP. Please wait."
     );
   }
 
@@ -48,6 +49,19 @@ export async function POST(req: NextRequest) {
   }
 
   const normalized = normalizeEmail(email);
+
+  // Rate limit: 3 requests per 15 minutes per email
+  const emailRl = await checkRateLimit(`send_ver_email_${normalized}`, 3, 15 * 60 * 1000, {
+    criticality: "CRITICAL",
+    failClosed: true,
+    syncToDb: true,
+  });
+  if (!emailRl.success) {
+    return rateLimitResponse(
+      emailRl,
+      "Too many verification requests for this email address. Please try again later."
+    );
+  }
 
   try {
     await AuthTokenService.sendVerificationEmail(normalized);

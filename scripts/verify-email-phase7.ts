@@ -119,10 +119,30 @@ function setupMockPrisma() {
     return store.events.find((e) => e.id === where.id) || null;
   };
 
+  (prisma.emailEvent.findFirst as any) = async ({ where }: any) => {
+    if (!where) return store.events[0] || null;
+    return (
+      store.events.find((e) => {
+        if (where.id && e.id !== where.id) return false;
+        if (where.clientId && e.clientId !== where.clientId) return false;
+        if (where.providerConfigId && e.providerConfigId !== where.providerConfigId) return false;
+        if (where.providerEventId && e.providerEventId !== where.providerEventId) return false;
+        return true;
+      }) || null
+    );
+  };
+
   (prisma.emailEvent.create as any) = async ({ data }: any) => {
     const newEvt = { id: `evt-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`, ...data };
     store.events.push(newEvt);
     return newEvt;
+  };
+
+  (prisma.emailEvent.update as any) = async ({ where, data }: any) => {
+    const evt = store.events.find((e) => e.id === where.id);
+    if (!evt) throw new Error("Event not found");
+    Object.assign(evt, data);
+    return evt;
   };
 
   (prisma.emailContact.findFirst as any) = async ({ where }: any) => {
@@ -224,11 +244,32 @@ function setupMockPrisma() {
     return camp;
   };
 
+  (prisma.emailCampaign.updateMany as any) = async ({ where, data }: any) => {
+    let count = 0;
+    for (const c of store.campaigns) {
+      if (where?.id && c.id !== where.id) continue;
+      if (where?.status?.in && !where.status.in.includes(c.status)) continue;
+      Object.assign(c, data);
+      count++;
+    }
+    return { count };
+  };
+
   (prisma.emailCampaignRecipient.update as any) = async ({ where, data }: any) => {
     const rcp = store.recipients.find((r) => r.id === where.id);
     if (!rcp) throw new Error("Recipient not found");
     Object.assign(rcp, data);
     return rcp;
+  };
+
+  (prisma.emailCampaignRecipient.count as any) = async ({ where }: any) => {
+    let count = 0;
+    for (const r of store.recipients) {
+      if (where?.campaignId && r.campaignId !== where.campaignId) continue;
+      if (where?.status?.in && !where.status.in.includes(r.status)) continue;
+      count++;
+    }
+    return count;
   };
 }
 
@@ -248,10 +289,12 @@ async function runPhase7Tests() {
   // -------------------------------------------------------------------------
   console.log("\n--- [1] Webhook Signature Verification ---");
   const rawBody = JSON.stringify({ event: "delivered", email: "user@example.com" });
-  const validSig = crypto.createHmac("sha256", secret).update(rawBody).digest("hex");
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  const validSig = crypto.createHmac("sha256", secret).update(`${timestamp}.${rawBody}`).digest("hex");
 
   const validHeaders = new Headers();
   validHeaders.set("x-webhook-signature", validSig);
+  validHeaders.set("x-webhook-timestamp", timestamp);
 
   const resValid = verifyHmacWebhookSignature(rawBody, validHeaders, secret);
   testAssert(resValid.valid === true, "Valid HMAC webhook signature accepted");
@@ -390,6 +433,7 @@ async function runPhase7Tests() {
   });
 
   const hardBounceEvent = {
+    clientId: tenantAlpha,
     providerType: EmailProviderType.MOCK,
     providerEventId: "evt-hard-bounce-1",
     eventType: EmailEventType.BOUNCED,
@@ -417,6 +461,7 @@ async function runPhase7Tests() {
   });
 
   const softBounceEvent = {
+    clientId: tenantAlpha,
     providerType: EmailProviderType.MOCK,
     providerEventId: "evt-soft-bounce-1",
     eventType: EmailEventType.BOUNCED,
@@ -446,6 +491,7 @@ async function runPhase7Tests() {
   });
 
   const complaintEvent = {
+    clientId: tenantAlpha,
     providerType: EmailProviderType.MOCK,
     providerEventId: "evt-complaint-1",
     eventType: EmailEventType.COMPLAINT,
@@ -589,6 +635,8 @@ async function runPhase7Tests() {
 
   if (failed > 0) {
     process.exit(1);
+  } else {
+    process.exit(0);
   }
 }
 

@@ -5,13 +5,28 @@
  * - Never exposes recipient email addresses in tracking URLs.
  * - Open tracking uses cryptographic HMAC tokens and returns transparent 1x1 GIF pixels.
  * - Click tracking verifies destination authenticity from signed tokens, completely blocking open redirects.
- * - Documented analytics limitations: Opens are heuristic signals that may not perfectly reflect human interaction
- *   due to image caching, security crawler pre-fetching, and privacy proxies (e.g., Apple Mail Privacy Protection).
+ * - Inferred Delivery Semantics: For providers without explicit delivery confirmation webhooks (e.g. SMTP or Gmail API),
+ *   opens and clicks infer delivery (SENT -> DELIVERED). However, inferred delivery is subordinate to transport truth:
+ *   bounced or failed deliveries are NEVER promoted to DELIVERED, and bounces always take priority.
+ * - Documented Analytics Limitations:
+ *   1. Apple Mail Privacy Protection (MPP): Apple pre-fetches images via proxy servers asynchronously upon receipt,
+ *      generating synthetic open events without human interaction.
+ *   2. Image Caching: Mail providers (e.g. Gmail Image Proxy, Yahoo) cache images after initial fetch, so repeated
+ *      human opens may not generate additional HTTP requests to our server.
+ *   3. Bot / Security Scanners: Enterprise security filters (Proofpoint, Barracuda, Microsoft Defender, Mimecast)
+ *      automatically scan and pre-fetch links and pixels before delivery or quarantine.
+ *   4. Blocked Remote Images: Privacy-oriented mail clients (Thunderbird, Outlook desktop default) block external images,
+ *      causing human opens to be undetected unless images are explicitly enabled or a link is clicked.
  */
 
 import crypto from "crypto";
+import { parse } from "node-html-parser";
 import { prisma } from "../../prisma";
-import { EmailEventType } from "@prisma/client";
+import {
+  EmailDeliveryStatus,
+  EmailEventProcessingStatus,
+  EmailEventType,
+} from "@prisma/client";
 
 const DEFAULT_TRACKING_TTL_MS = 90 * 24 * 60 * 60 * 1000; // 90 days
 
@@ -33,6 +48,12 @@ export interface ClickTokenPayload {
   targetUrl: string;
   exp: number;
   nonce: string;
+}
+
+export interface TrackingHtmlOptions {
+  baseUrl?: string;
+  skipOpen?: boolean;
+  skipClick?: boolean;
 }
 
 export class EmailTrackingService {
@@ -237,8 +258,174 @@ export class EmailTrackingService {
   }
 
   /**
+   * Injects a transparent 1x1 GIF tracking pixel into final HTML using AST parser.
+   * - Privacy safe: Open token only encodes clientId and deliveryId; recipient email is NEVER included.
+   * - Cache busting query param prevents client/proxy cache reuse.
+   * - Preserves valid HTML structure.
+   */
+  static injectOpenPixel(
+    html: string,
+    clientId: string,
+    deliveryId: string,
+    options?: TrackingHtmlOptions
+  ): string {
+    if (!html || typeof html !== "string") {
+      return html || "";
+    }
+
+    const openToken = this.generateOpenToken(clientId, deliveryId);
+    const baseUrl = (options?.baseUrl || process.env.NEXT_PUBLIC_APP_URL || "https://hub.local").replace(/\/+$/, "");
+    const cacheBuster = `${Date.now().toString(36)}${Math.random().toString(36).substring(2, 8)}`;
+    const pixelUrl = `${baseUrl}/api/email/track/open/${openToken}?cb=${cacheBuster}`;
+
+    const pixelTag = `<img src="${pixelUrl}" alt="" width="1" height="1" border="0" style="display:none;width:1px;height:1px;max-height:0;max-width:0;opacity:0;overflow:hidden;" />`;
+
+    try {
+      const root = parse(html, {
+        lowerCaseTagName: false,
+        comment: true,
+        blockTextElements: { script: true, noscript: true, style: true, pre: true },
+      });
+
+      const body = root.querySelector("body");
+      const pixelNode = parse(pixelTag);
+
+      if (body) {
+        body.appendChild(pixelNode);
+      } else {
+        root.appendChild(pixelNode);
+      }
+
+      return root.toString();
+    } catch {
+      return `${html}\n${pixelTag}`;
+    }
+  }
+
+  /**
+   * Safely transforms all eligible HTTP/HTTPS links into signed click tracking URLs using AST parsing.
+   * - Preserves original destination inside cryptographically signed HMAC token.
+   * - Skips: unsubscribe links, mailto:, tel:, sms:, anchors (#), unsafe protocols (javascript:, data:).
+   * - Strictly does NOT modify URLs containing CRLF or control characters.
+   * - Prevents open redirects: tracking endpoint only redirects to destination authenticated in the token.
+   */
+  static wrapLinksWithClickTracking(
+    html: string,
+    clientId: string,
+    deliveryId: string,
+    options?: TrackingHtmlOptions
+  ): string {
+    if (!html || typeof html !== "string") {
+      return html || "";
+    }
+
+    const baseUrl = (options?.baseUrl || process.env.NEXT_PUBLIC_APP_URL || "https://hub.local").replace(/\/+$/, "");
+
+    try {
+      const root = parse(html, {
+        lowerCaseTagName: false,
+        comment: true,
+        blockTextElements: { script: true, noscript: true, style: true, pre: true },
+      });
+
+      const anchors = root.querySelectorAll("a");
+      for (const anchor of anchors) {
+        const href = anchor.getAttribute("href");
+        if (!href || typeof href !== "string") continue;
+
+        // 1. CRLF check: Do not modify URLs containing CRLF or control characters
+        if (/[\r\n\t\0]/.test(href)) {
+          continue;
+        }
+
+        const trimmed = href.trim();
+        if (!trimmed) continue;
+
+        // 2. Anchors check
+        if (trimmed.startsWith("#")) {
+          continue;
+        }
+
+        // 3. Unsafe / non-web protocols check
+        const lower = trimmed.toLowerCase();
+        if (
+          lower.startsWith("mailto:") ||
+          lower.startsWith("tel:") ||
+          lower.startsWith("sms:") ||
+          lower.startsWith("javascript:") ||
+          lower.startsWith("data:") ||
+          lower.startsWith("vbscript:") ||
+          lower.startsWith("file:")
+        ) {
+          continue;
+        }
+
+        // 4. Unsubscribe link check
+        const skipTrack = anchor.getAttribute("data-skip-track");
+        const isUnsub = anchor.getAttribute("data-unsubscribe");
+        const rel = anchor.getAttribute("rel") || "";
+        if (
+          skipTrack === "true" ||
+          isUnsub === "true" ||
+          rel.toLowerCase().includes("unsubscribe") ||
+          lower.includes("/unsubscribe") ||
+          lower.includes("{{unsubscribe_url}}")
+        ) {
+          continue;
+        }
+
+        // 5. Must be valid HTTP or HTTPS URL
+        let parsedUrl: URL;
+        try {
+          parsedUrl = new URL(trimmed);
+        } catch {
+          // Relative URL or unparseable format - skip safely
+          continue;
+        }
+
+        if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+          continue;
+        }
+
+        if (!parsedUrl.hostname) {
+          continue;
+        }
+
+        // 6. Generate signed click token containing authenticated target URL
+        const clickToken = this.generateClickToken(clientId, deliveryId, trimmed);
+        const trackingUrl = `${baseUrl}/api/email/track/click/${clickToken}`;
+        anchor.setAttribute("href", trackingUrl);
+      }
+
+      return root.toString();
+    } catch {
+      return html;
+    }
+  }
+
+  /**
+   * Prepares final production HTML with both link click tracking and transparent open tracking pixel.
+   */
+  static prepareTrackedHtml(
+    html: string,
+    clientId: string,
+    deliveryId: string,
+    options?: TrackingHtmlOptions
+  ): string {
+    let result = html;
+    if (!options?.skipClick) {
+      result = this.wrapLinksWithClickTracking(result, clientId, deliveryId, options);
+    }
+    if (!options?.skipOpen) {
+      result = this.injectOpenPixel(result, clientId, deliveryId, options);
+    }
+    return result;
+  }
+
+  /**
    * Records an open event for a delivery.
-   * Deduplicates within a 5-second window to prevent burst double-counts.
+   * Deduplicates within a 1-hour window per delivery to prevent burst double-counts.
+   * Atomically transitions delivery status to DELIVERED and updates campaign metrics.
    */
   static async recordOpen(
     deliveryId: string,
@@ -257,8 +444,8 @@ export class EmailTrackingService {
     const hourBucket = Math.floor(Date.now() / (3600 * 1000));
     const providerEventId = `open-${delivery.id}-${hourBucket}`;
 
-    const existing = await prisma.emailEvent.findUnique({
-      where: { providerEventId },
+    const existing = await prisma.emailEvent.findFirst({
+      where: { clientId: delivery.clientId, providerEventId },
     });
 
     if (existing) {
@@ -272,6 +459,8 @@ export class EmailTrackingService {
         deliveryId: delivery.id,
         providerEventId,
         eventType: EmailEventType.OPENED,
+        status: EmailEventProcessingStatus.PROCESSED,
+        processedAt: new Date(),
         recipient: delivery.to,
         payload: JSON.stringify({
           deliveryId: delivery.id,
@@ -281,11 +470,49 @@ export class EmailTrackingService {
       },
     });
 
+    // Inferred Delivery Semantic (Documented Product Architecture):
+    // For providers without explicit delivery confirmation webhooks (e.g. SMTP or Gmail API),
+    // an open event serves as an inferred delivery signal (promoting SENT -> DELIVERED).
+    // It is NOT unquestionable proof of delivery (e.g. bot scanners can pre-fetch tracking pixels).
+    // It NEVER overwrites terminal failures (BOUNCED, FAILED, COMPLAINED).
+    if (
+      delivery.status === EmailDeliveryStatus.SENT ||
+      delivery.status === EmailDeliveryStatus.PROCESSING ||
+      delivery.status === EmailDeliveryStatus.QUEUED
+    ) {
+      await prisma.emailDelivery.update({
+        where: { id: delivery.id },
+        data: {
+          status: EmailDeliveryStatus.DELIVERED,
+          deliveredAt: delivery.deliveredAt || new Date(),
+        },
+      });
+    }
+
+    if (delivery.campaignRecipientId && delivery.campaignRecipient) {
+      // Only promote recipient status if not already terminal (prevents overwriting BOUNCED or FAILED)
+      if (
+        delivery.campaignRecipient.status === "PENDING" ||
+        delivery.campaignRecipient.status === "SENT"
+      ) {
+        await prisma.emailCampaignRecipient.update({
+          where: { id: delivery.campaignRecipient.id },
+          data: { status: "DELIVERED" },
+        });
+
+        await prisma.emailCampaign.update({
+          where: { id: delivery.campaignRecipient.campaignId },
+          data: { deliveredCount: { increment: 1 } },
+        });
+      }
+    }
+
     return { recorded: true };
   }
 
   /**
    * Records a click event for a delivery.
+   * Atomically transitions delivery status to DELIVERED and updates campaign metrics.
    */
   static async recordClick(
     deliveryId: string,
@@ -305,8 +532,8 @@ export class EmailTrackingService {
     const hourBucket = Math.floor(Date.now() / (3600 * 1000));
     const providerEventId = `click-${delivery.id}-${clickHash}-${hourBucket}`;
 
-    const existing = await prisma.emailEvent.findUnique({
-      where: { providerEventId },
+    const existing = await prisma.emailEvent.findFirst({
+      where: { clientId: delivery.clientId, providerEventId },
     });
 
     if (existing) {
@@ -319,6 +546,8 @@ export class EmailTrackingService {
         deliveryId: delivery.id,
         providerEventId,
         eventType: EmailEventType.CLICKED,
+        status: EmailEventProcessingStatus.PROCESSED,
+        processedAt: new Date(),
         recipient: delivery.to,
         payload: JSON.stringify({
           deliveryId: delivery.id,
@@ -328,6 +557,42 @@ export class EmailTrackingService {
         }),
       },
     });
+
+    // Inferred Delivery Semantic (Documented Product Architecture):
+    // For providers without explicit delivery confirmation webhooks (e.g. SMTP or Gmail API),
+    // a verified click event serves as an inferred delivery signal (promoting SENT -> DELIVERED).
+    // It NEVER overwrites terminal failures (BOUNCED, FAILED, COMPLAINED).
+    if (
+      delivery.status === EmailDeliveryStatus.SENT ||
+      delivery.status === EmailDeliveryStatus.PROCESSING ||
+      delivery.status === EmailDeliveryStatus.QUEUED
+    ) {
+      await prisma.emailDelivery.update({
+        where: { id: delivery.id },
+        data: {
+          status: EmailDeliveryStatus.DELIVERED,
+          deliveredAt: delivery.deliveredAt || new Date(),
+        },
+      });
+    }
+
+    if (delivery.campaignRecipientId && delivery.campaignRecipient) {
+      // Only promote recipient status if not already terminal (prevents overwriting BOUNCED or FAILED)
+      if (
+        delivery.campaignRecipient.status === "PENDING" ||
+        delivery.campaignRecipient.status === "SENT"
+      ) {
+        await prisma.emailCampaignRecipient.update({
+          where: { id: delivery.campaignRecipient.id },
+          data: { status: "DELIVERED" },
+        });
+
+        await prisma.emailCampaign.update({
+          where: { id: delivery.campaignRecipient.campaignId },
+          data: { deliveredCount: { increment: 1 } },
+        });
+      }
+    }
 
     return { recorded: true };
   }

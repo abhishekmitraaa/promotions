@@ -10,10 +10,18 @@ export async function GET(req: NextRequest) {
 
   try {
     const { searchParams } = new URL(req.url);
-    const clientId = searchParams.get("clientId");
+    let targetClientId = searchParams.get("clientId") || undefined;
+    if (!targetClientId) {
+      const defaultClient = await prisma.apiClient.findFirst({
+        where: { active: true },
+        orderBy: { createdAt: "asc" },
+        select: { id: true },
+      });
+      targetClientId = defaultClient?.id;
+    }
 
     const providers = await prisma.emailProviderConfig.findMany({
-      where: clientId ? { clientId } : undefined,
+      where: targetClientId ? { clientId: targetClientId } : undefined,
       select: {
         id: true,
         clientId: true,
@@ -49,16 +57,60 @@ export async function POST(req: NextRequest) {
     const body = await req.json();
     const { clientId, name, providerType, senderEmail, senderName, credentials, isDefault } = body;
 
-    if (!clientId) {
-      return NextResponse.json({ success: false, error: "clientId is required" }, { status: 400 });
+    let targetClientId = clientId;
+    if (!targetClientId) {
+      const defaultClient = await prisma.apiClient.findFirst({
+        where: { active: true },
+        orderBy: { createdAt: "asc" },
+        select: { id: true },
+      });
+      targetClientId = defaultClient?.id;
+    }
+    if (!targetClientId) {
+      const anyClient = await prisma.apiClient.findFirst({
+        orderBy: { createdAt: "asc" },
+        select: { id: true },
+      });
+      targetClientId = anyClient?.id;
+    }
+    if (!targetClientId) {
+      const created = await prisma.apiClient.create({
+        data: { name: "Default Organization", active: true },
+        select: { id: true },
+      });
+      targetClientId = created.id;
     }
 
     if (!providerType || !Object.values(EmailProviderType).includes(providerType)) {
       return NextResponse.json({ success: false, error: "Valid providerType is required" }, { status: 400 });
     }
 
+    // Explicitly reject unavailable providers (SES & SMTP)
+    if (providerType === EmailProviderType.SES || providerType === EmailProviderType.SMTP) {
+      return NextResponse.json(
+        {
+          success: false,
+          code: "PROVIDER_UNAVAILABLE",
+          error: `Email provider '${providerType}' is currently unavailable. The near-term production strategy is Gmail-only. Operational adapters for '${providerType}' are not implemented.`,
+        },
+        { status: 400 }
+      );
+    }
+
+    // Prohibit MOCK in production
+    if (providerType === EmailProviderType.MOCK && process.env.NODE_ENV === "production") {
+      return NextResponse.json(
+        {
+          success: false,
+          code: "MOCK_PROVIDER_FORBIDDEN",
+          error: "MOCK email provider is strictly restricted to test environments and is forbidden in production.",
+        },
+        { status: 400 }
+      );
+    }
+
     // Verify tenant exists
-    const client = await prisma.apiClient.findUnique({ where: { id: clientId } });
+    const client = await prisma.apiClient.findUnique({ where: { id: targetClientId } });
     if (!client) {
       return NextResponse.json({ success: false, error: "ApiClient not found" }, { status: 404 });
     }
@@ -75,14 +127,14 @@ export async function POST(req: NextRequest) {
 
     if (isDefault) {
       await prisma.emailProviderConfig.updateMany({
-        where: { clientId, isDefault: true },
+        where: { clientId: targetClientId, isDefault: true },
         data: { isDefault: false },
       });
     }
 
     const providerConfig = await prisma.emailProviderConfig.create({
       data: {
-        clientId,
+        clientId: targetClientId,
         name: name || `${providerType} Provider`,
         providerType,
         status: EmailProviderStatus.ACTIVE,
@@ -110,6 +162,50 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ success: true, data: providerConfig }, { status: 201 });
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Error creating email provider";
+    return NextResponse.json({ success: false, error: msg }, { status: 500 });
+  }
+}
+
+export async function PATCH(req: NextRequest) {
+  // Only ADMIN can mutate email providers
+  const auth = await requireUser(req, "ADMIN");
+  if (auth.response) return auth.response;
+
+  try {
+    const body = await req.json();
+    const { id, isDefault, status, clientId } = body;
+
+    if (!id) {
+      return NextResponse.json({ success: false, error: "id is required" }, { status: 400 });
+    }
+
+    const provider = await prisma.emailProviderConfig.findUnique({ where: { id } });
+    if (!provider) {
+      return NextResponse.json({ success: false, error: "Provider not found" }, { status: 404 });
+    }
+
+    if (clientId && provider.clientId !== clientId) {
+      return NextResponse.json({ success: false, error: "Forbidden: provider belongs to another tenant" }, { status: 403 });
+    }
+
+    if (isDefault) {
+      await prisma.emailProviderConfig.updateMany({
+        where: { clientId: provider.clientId, isDefault: true },
+        data: { isDefault: false },
+      });
+    }
+
+    const updated = await prisma.emailProviderConfig.update({
+      where: { id },
+      data: {
+        isDefault: isDefault !== undefined ? Boolean(isDefault) : undefined,
+        status: status || undefined,
+      },
+    });
+
+    return NextResponse.json({ success: true, data: updated });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Error updating provider";
     return NextResponse.json({ success: false, error: msg }, { status: 500 });
   }
 }

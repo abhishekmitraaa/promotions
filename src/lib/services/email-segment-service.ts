@@ -9,7 +9,7 @@
  */
 
 import { prisma } from "../prisma";
-import { EmailSegment, EmailContact } from "@prisma/client";
+import { EmailSegment, EmailContact, EmailContactStatus, Prisma } from "@prisma/client";
 
 export type SegmentOperator =
   | "equals"
@@ -30,9 +30,11 @@ export const ALLOWED_OPERATORS: readonly SegmentOperator[] = [
 
 export const ALLOWED_DIRECT_FIELDS: readonly string[] = [
   "marketingConsent",
+  "hasMarketingConsent",
   "verified",
   "status",
   "email",
+  "normalizedEmail",
   "firstName",
   "lastName",
 ] as const;
@@ -96,8 +98,9 @@ export class EmailSegmentService {
         }
       }
 
-      // Check operator allowlist
-      if (!ALLOWED_OPERATORS.includes(operator)) {
+      // Check operator allowlist (case-insensitive)
+      const normalizedOp = (operator || "").toLowerCase() as SegmentOperator;
+      if (!ALLOWED_OPERATORS.includes(normalizedOp)) {
         throw new Error(`Unsupported operator '${operator}'. Allowed operators: ${ALLOWED_OPERATORS.join(", ")}`);
       }
 
@@ -110,7 +113,7 @@ export class EmailSegmentService {
       }
 
       // Value type checks based on operator
-      if (operator === "in" || operator === "not_in") {
+      if (normalizedOp === "in" || normalizedOp === "not_in") {
         if (!Array.isArray(value) || value.length === 0) {
           throw new Error(`Operator '${operator}' requires a non-empty array value in condition ${i + 1}.`);
         }
@@ -119,7 +122,7 @@ export class EmailSegmentService {
       }
 
       // Specific field type checks
-      if (field === "marketingConsent" || field === "verified") {
+      if (field === "marketingConsent" || field === "hasMarketingConsent" || field === "verified") {
         if (typeof value !== "boolean" && value !== "true" && value !== "false") {
           throw new Error(`Field '${field}' must have a boolean value in condition ${i + 1}.`);
         }
@@ -131,7 +134,7 @@ export class EmailSegmentService {
       conditions: conditions.map((c) => ({
         field: c.field,
         operator: c.operator,
-        value: c.field === "marketingConsent" || c.field === "verified"
+        value: c.field === "marketingConsent" || c.field === "hasMarketingConsent" || c.field === "verified"
           ? String(c.value) === "true"
           : c.value,
       })),
@@ -167,16 +170,17 @@ export class EmailSegmentService {
     contact: EmailContact,
     metadata: Record<string, unknown>
   ): boolean {
-    const { field, operator, value } = condition;
+    const { field, value } = condition;
+    const operator = (condition.operator || "").toLowerCase();
     let actualValue: unknown;
 
-    if (field === "marketingConsent") {
+    if (field === "marketingConsent" || field === "hasMarketingConsent") {
       actualValue = contact.hasMarketingConsent;
     } else if (field === "verified") {
       actualValue = contact.verified;
     } else if (field === "status") {
       actualValue = contact.status;
-    } else if (field === "email") {
+    } else if (field === "email" || field === "normalizedEmail") {
       actualValue = contact.email;
     } else if (field === "firstName") {
       actualValue = contact.firstName || "";
@@ -234,7 +238,128 @@ export class EmailSegmentService {
   }
 
   /**
+   * Translates structured segment criteria into parameterized Prisma where clauses.
+   * Direct fields are converted into native Prisma filters.
+   * Attribute fields trigger pre-filters where practical and indicate attribute evaluation needed.
+   */
+  static buildPrismaWhereFromCriteria(
+    clientId: string,
+    criteria: SegmentCriteria
+  ): {
+    prismaWhere: Prisma.EmailContactWhereInput;
+    hasAttributeConditions: boolean;
+  } {
+    const isAnd = (criteria.conjunction || "AND") === "AND";
+    const directFilters: Prisma.EmailContactWhereInput[] = [];
+    let hasAttributeConditions = false;
+
+    for (const condition of criteria.conditions) {
+      const direct = this.translateConditionToPrisma(condition);
+      if (direct) {
+        directFilters.push(direct);
+      } else {
+        hasAttributeConditions = true;
+        if (isAnd) {
+          directFilters.push({ metadata: { not: null } });
+        }
+      }
+    }
+
+    let criteriaFilter: Prisma.EmailContactWhereInput = {};
+    if (isAnd) {
+      if (directFilters.length > 0) {
+        criteriaFilter = { AND: directFilters };
+      }
+    } else {
+      // OR conjunction
+      if (directFilters.length > 0 && !hasAttributeConditions) {
+        criteriaFilter = { OR: directFilters };
+      }
+    }
+
+    return {
+      prismaWhere: {
+        clientId,
+        ...criteriaFilter,
+      },
+      hasAttributeConditions,
+    };
+  }
+
+  private static translateConditionToPrisma(
+    condition: SegmentCondition
+  ): Prisma.EmailContactWhereInput | null {
+    const { field, value } = condition;
+    const operator = (condition.operator || "").toLowerCase();
+
+    if (field === "marketingConsent" || field === "hasMarketingConsent") {
+      const b = typeof value === "boolean" ? value : String(value) === "true";
+      if (operator === "equals") return { hasMarketingConsent: b };
+      if (operator === "not_equals") return { hasMarketingConsent: !b };
+      return null;
+    }
+
+    if (field === "verified") {
+      const b = typeof value === "boolean" ? value : String(value) === "true";
+      if (operator === "equals") return { verified: b };
+      if (operator === "not_equals") return { verified: !b };
+      return null;
+    }
+
+    if (field === "status") {
+      const s = value as EmailContactStatus;
+      if (operator === "equals") return { status: s };
+      if (operator === "not_equals") return { status: { not: s } };
+      if (operator === "in" && Array.isArray(value)) return { status: { in: value as EmailContactStatus[] } };
+      if (operator === "not_in" && Array.isArray(value)) return { status: { notIn: value as EmailContactStatus[] } };
+      return null;
+    }
+
+    if (field === "email" || field === "normalizedEmail") {
+      const str = String(value).trim();
+      if (operator === "equals") return { normalizedEmail: str.toLowerCase() };
+      if (operator === "not_equals") return { normalizedEmail: { not: str.toLowerCase() } };
+      if (operator === "contains") return { email: { contains: str, mode: "insensitive" } };
+      if (operator === "starts_with") return { email: { startsWith: str, mode: "insensitive" } };
+      if (operator === "in" && Array.isArray(value)) {
+        return { normalizedEmail: { in: value.map((v) => String(v).trim().toLowerCase()) } };
+      }
+      if (operator === "not_in" && Array.isArray(value)) {
+        return { normalizedEmail: { notIn: value.map((v) => String(v).trim().toLowerCase()) } };
+      }
+      return null;
+    }
+
+    if (field === "firstName") {
+      const str = String(value);
+      if (operator === "equals") return { firstName: { equals: str, mode: "insensitive" } };
+      if (operator === "not_equals") return { firstName: { not: str } };
+      if (operator === "contains") return { firstName: { contains: str, mode: "insensitive" } };
+      if (operator === "starts_with") return { firstName: { startsWith: str, mode: "insensitive" } };
+      if (operator === "in" && Array.isArray(value)) return { firstName: { in: value.map((v) => String(v)) } };
+      if (operator === "not_in" && Array.isArray(value)) return { firstName: { notIn: value.map((v) => String(v)) } };
+      return null;
+    }
+
+    if (field === "lastName") {
+      const str = String(value);
+      if (operator === "equals") return { lastName: { equals: str, mode: "insensitive" } };
+      if (operator === "not_equals") return { lastName: { not: str } };
+      if (operator === "contains") return { lastName: { contains: str, mode: "insensitive" } };
+      if (operator === "starts_with") return { lastName: { startsWith: str, mode: "insensitive" } };
+      if (operator === "in" && Array.isArray(value)) return { lastName: { in: value.map((v) => String(v)) } };
+      if (operator === "not_in" && Array.isArray(value)) return { lastName: { notIn: value.map((v) => String(v)) } };
+      return null;
+    }
+
+    // Attribute field: evaluated in batch / in-memory
+    return null;
+  }
+
+  /**
    * Previews matching contacts for a given criteria within a tenant.
+   * Uses database aggregation for direct queries and batched keyset pagination
+   * for complex criteria, avoiding loading the entire contact table into memory.
    */
   static async previewContacts(
     clientId: string,
@@ -244,17 +369,59 @@ export class EmailSegmentService {
     const validatedCriteria = this.validateCriteria(criteriaInput);
     const limit = Math.min(100, Math.max(1, options.limit || 20));
 
-    // Load tenant contacts
-    const contacts = await prisma.emailContact.findMany({
-      where: { clientId },
-      take: 1000, // Safe preview ceiling
-    });
+    const { prismaWhere, hasAttributeConditions } = this.buildPrismaWhereFromCriteria(
+      clientId,
+      validatedCriteria
+    );
 
-    const matching = contacts.filter((c) => this.evaluateContact(validatedCriteria, c));
+    // If pure direct criteria without attribute checks, use fast database count & take
+    if (!hasAttributeConditions) {
+      const [matchingCount, sampleContacts] = await Promise.all([
+        prisma.emailContact.count({ where: prismaWhere }),
+        prisma.emailContact.findMany({
+          where: prismaWhere,
+          orderBy: { id: "asc" },
+          take: limit,
+        }),
+      ]);
+
+      return {
+        matchingCount,
+        sampleContacts,
+      };
+    }
+
+    // Hybrid: batched cursor processing to avoid loading entire contact table
+    let matchingCount = 0;
+    const sampleContacts: EmailContact[] = [];
+    const BATCH_SIZE = 500;
+    let cursorId: string | undefined = undefined;
+
+    while (true) {
+      const batch: EmailContact[] = await prisma.emailContact.findMany({
+        where: prismaWhere,
+        orderBy: { id: "asc" },
+        take: BATCH_SIZE,
+        skip: cursorId ? 1 : 0,
+        cursor: cursorId ? { id: cursorId } : undefined,
+      });
+
+      if (batch.length === 0) break;
+      cursorId = batch[batch.length - 1].id;
+
+      for (const contact of batch) {
+        if (this.evaluateContact(validatedCriteria, contact)) {
+          matchingCount++;
+          if (sampleContacts.length < limit) {
+            sampleContacts.push(contact);
+          }
+        }
+      }
+    }
 
     return {
-      matchingCount: matching.length,
-      sampleContacts: matching.slice(0, limit),
+      matchingCount,
+      sampleContacts,
     };
   }
 

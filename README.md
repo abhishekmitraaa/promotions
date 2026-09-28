@@ -25,7 +25,7 @@ This service acts as a hardened, standardized abstraction layer between your ext
 - **Provider Webhooks (`/api/email/webhooks/:provider`)**: Cryptographic signature validation and idempotent event deduplication.
 
 ### Multi-Tenant Isolation & Admin RBAC
-- **9-Domain Tenant Isolation**: Strict `clientId` boundary across contacts, lists, segments, templates, campaigns, deliveries, providers, sender identities, and suppressions.
+- **13-Domain Tenant Isolation**: Strict `clientId` boundary across providers, sender identities, contacts, lists, segments, templates, campaigns, recipients, deliveries, events, suppressions, webhook correlation, and analytics.
 - **Server-Side RBAC**: `ADMIN` has full mutation access; `VIEWER` is strictly read-only with HTTP 403 enforcement.
 - **High-Impact Audit Logging**: Sensitive credentials (`refreshToken`, `clientSecret`, `apiKey`, `password`) are automatically redacted with `[REDACTED]`.
 
@@ -213,12 +213,29 @@ Response:
 
 ---
 
-## 🧪 Automated Testing & Verification
+## 🧪 Automated Testing & Certification
 
 Run the test suite verifying crypto operations, template parameters mapping, rate limiters, authentication & session security, Zod validators, and destructive-test safety guard logic:
 
 ```bash
 npm test
+```
+
+### Email Platform Certification Commands
+All email tests run strictly against disposable local infrastructure (`PostgreSQL` and `Redis`) and are blocked unconditionally from production Supabase:
+
+```bash
+# Master Certification Pass: Certifies Flows A through P end-to-end
+npm run test:email:certify
+
+# Comprehensive Email Suite (Domain, Providers, Queues, Campaigns, Scale, Security)
+npm run test:email
+
+# Granular Test Suites
+npm run test:email:queue      # BullMQ queue workers, retries, and failure states
+npm run test:email:campaign   # Campaign lifecycle, preview, and snapshots
+npm run test:email:audience   # Scalable audience engine, streaming cursors, advisory locks
+npm run test:email:security   # Public API schema, suppression, and multi-tenant isolation
 ```
 
 ### Safety Gate & Destructive Test Policy

@@ -338,4 +338,124 @@ For `PROMOTIONAL` emails:
 - **HTTP 404 Not Found**: Specified `templateId` or `senderId` does not exist in tenant.
 - **HTTP 429 Too Many Requests**: Rate limit exceeded.
 
+---
+
+## 9. Campaign Audience Preview
+
+`GET /api/email/campaigns/preview?listId=...&segmentId=...&type=PROMOTIONAL`
+`POST /api/email/campaigns/[id]/preview`
+
+Calculates accurate, uncapped audience candidate metrics before snapshot creation. Guaranteed to equal snapshot counts for the exact same point in time.
+
+### Success Response (HTTP 200 OK)
+```json
+{
+  "success": true,
+  "data": {
+    "totalCandidates": 1200,
+    "eligibleRecipients": 1000,
+    "suppressedCount": 50,
+    "unsubscribedCount": 100,
+    "invalidEmailCount": 50
+  }
+}
+```
+
+---
+
+## 10. Campaign & Template Test Send
+
+`POST /api/email/campaigns/[id]/test-send`
+`POST /api/email/templates/[id]/test-send`
+
+Sends an immediate test dispatch to an authorized administrator address. **CRITICAL**: Test sends bypass audience lists and create zero `EmailCampaignRecipient` rows in the database.
+
+### Request Payload
+```json
+{
+  "recipientEmail": "admin@yourcompany.com",
+  "variables": {
+    "firstName": "Admin",
+    "previewCode": "TEST-123"
+  }
+}
+```
+
+---
+
+## 11. Campaign Lifecycle (Send, Pause, Resume, Cancel)
+
+### Launch / Send Now
+`POST /api/email/campaigns/[id]/send`
+Snapshots eligible recipients with PostgreSQL advisory locks, freezes metadata attributes, transitions status to `RUNNING`, and enqueues recipient jobs.
+
+### Pause Campaign
+`POST /api/email/campaigns/[id]/pause`
+Transitions status to `PAUSED`. Workers skip incoming jobs for this campaign, preserving recipient states as `PENDING`.
+
+### Resume Campaign
+`POST /api/email/campaigns/[id]/resume`
+Transitions status back to `RUNNING` and requeues any unsent `PENDING` recipients. Already `SENT` recipients are skipped to guarantee zero duplicate sends.
+
+### Cancel Campaign
+`POST /api/email/campaigns/[id]/cancel`
+Transitions status to `CANCELLED`. Deletes any delayed BullMQ trigger jobs. Marks all unsent `PENDING` recipients as `CANCELLED`. Already transmitted `SENT` emails remain acknowledged and untouched.
+
+---
+
+## 12. Email Engagement Tracking
+
+### Open Tracking Pixel
+`GET /api/email/track/open/[token]`
+Serves a transparent 1x1 GIF (`image/gif`) with `Cache-Control: no-store, no-cache, must-revalidate`. Records an authoritative `EmailEvent` (`OPENED`) asynchronously.
+
+### Click Tracking & Safe Redirect
+`GET /api/email/track/click/[token]`
+Validates cryptographic HMAC token, verifies destination protocol (`http:` / `https:`), logs `EmailEvent` (`CLICKED`), and redirects via HTTP 302. Malicious schemes (e.g. `javascript:`) are strictly rejected with HTTP 400.
+
+---
+
+## 13. RFC 8058 One-Click Unsubscribe
+
+`POST /api/email/unsubscribe/[token]`
+
+One-click unsubscribe endpoint complying with RFC 8058.
+- Validates the time-bound token.
+- Updates `EmailContact.status` to `UNSUBSCRIBED` and revokes `hasMarketingConsent = false`.
+- Automatically adds an authoritative `EmailSuppression` entry (`reason = UNSUBSCRIBE`).
+- Rejects all future promotional sends to that address across the tenant.
+
+---
+
+## 14. Provider Delivery Webhooks
+
+`POST /api/email/webhooks/[provider]?configId=[providerConfigId]`
+
+Supported provider webhook endpoints: `gmail`, `ses` (inbound delivery telemetry only), `mock` (tests), `generic`.
+- **Mandatory Provider Config**: Must be bound to an active `EmailProviderConfig` via `?configId=...` or `X-Provider-Config-Id`.
+- **Signature Verification**: Validates HMAC-SHA256 signature in `X-Webhook-Signature` or AWS SNS certificate for SES events.
+- **Deduplication**: Replayed webhooks return HTTP 202 with `deduplicated: true`.
+- **Asynchronous Ingestion**: Enqueues event to `email-events` queue for worker processing. Returns HTTP 202 immediately.
+
+---
+
+## 15. Admin Email Provider & Health Management
+
+### List Configured Providers
+`GET /api/admin/email/providers`
+Requires `ADMIN` or `VIEWER` session. Omits encrypted credentials and secrets.
+
+### Create Provider Configuration
+`POST /api/admin/email/providers`
+Requires `ADMIN` session.
+- **Supported Provider**: `GMAIL` (Google Workspace / Gmail API via OAuth 2.0).
+- **Unavailable Providers**: `SES` and `SMTP` return HTTP 400 (`code: "PROVIDER_UNAVAILABLE"`).
+- **Test-Only Provider**: `MOCK` is strictly forbidden in production and returns HTTP 400 (`code: "MOCK_PROVIDER_FORBIDDEN"`).
+
+### Provider Health Verification
+`GET /api/admin/email/providers/health?id=[providerConfigId]`
+`POST /api/admin/email/providers/health`
+Requires `ADMIN` session.
+Executes live credential validation and connectivity check against the upstream provider endpoint, records `lastVerifiedAt` and latency metrics, and updates `errorMessage` upon failure without leaking credentials or tokens.
+
 

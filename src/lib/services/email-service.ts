@@ -159,6 +159,10 @@ export class EmailService {
         ? EmailDeliveryStatus.SENT
         : EmailDeliveryStatus.FAILED;
 
+      const resolvedReplyTo = request.replyTo
+        ? (typeof request.replyTo === "string" ? request.replyTo : request.replyTo.email)
+        : null;
+
       const delivery = await prisma.emailDelivery.create({
         data: {
           clientId: request.clientId,
@@ -169,7 +173,12 @@ export class EmailService {
           category: request.type,
           from: typeof resolvedFrom === "string" ? resolvedFrom : resolvedFrom.email,
           to: validatedToEmails.join(", "),
+          replyTo: resolvedReplyTo,
           subject: request.subject,
+          htmlContent: request.html || null,
+          textContent: request.text || null,
+          templateId: request.templateId || null,
+          templateVersionId: request.templateVersionId || null,
           status: deliveryStatus,
           attemptCount: 1,
           lastAttemptAt: new Date(),

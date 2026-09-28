@@ -13,6 +13,7 @@
 import { prisma } from "../../prisma";
 import { EmailDeliveryStatus, EmailProviderType } from "@prisma/client";
 import { getTransactionalQueue } from "./queues";
+export { getTransactionalQueue };
 import { JOB_NAMES, getTransactionalJobId } from "./types";
 import { isValidEmail, normalizeEmail } from "../normalization";
 import { EmailRecipientInput } from "../types";
@@ -126,7 +127,10 @@ export async function queueTransactionalEmail(
             category: "TRANSACTIONAL",
             from: typeof input.from === "string" ? input.from : (input.from?.email || "system@whatsapphub.internal"),
             to: normalizedTo,
+            replyTo: input.replyTo || null,
             subject,
+            htmlContent: html || null,
+            textContent: text || null,
             status: EmailDeliveryStatus.FAILED,
             attemptCount: 0,
             errorCode: "RECIPIENT_SUPPRESSED",
@@ -162,7 +166,10 @@ export async function queueTransactionalEmail(
         category: "TRANSACTIONAL",
         from: typeof input.from === "string" ? input.from : (input.from?.email || "system@whatsapphub.internal"),
         to: normalizedTo,
+        replyTo: input.replyTo || null,
         subject,
+        htmlContent: html || null,
+        textContent: text || null,
         status: EmailDeliveryStatus.QUEUED,
         attemptCount: 0,
         transactionalReference: input.transactionalReference || null,
@@ -174,21 +181,38 @@ export async function queueTransactionalEmail(
     // Graceful fallback in environments where EmailDelivery is not yet migrated
   }
 
-  // 5. Enqueue Job with Deterministic Custom Job ID
+  // 5. Enqueue Job with Deterministic Custom Job ID (Honest Queue Failure Contract)
   const jobId = getTransactionalJobId(deliveryRecordId);
   const queue = getTransactionalQueue();
 
-  await queue.add(
-    JOB_NAMES.SEND_TRANSACTIONAL,
-    {
-      deliveryId: deliveryRecordId,
-      clientId: input.clientId,
-      category: "TRANSACTIONAL",
-    },
-    {
-      jobId, // Custom Job ID prevents duplicate jobs in BullMQ
+  try {
+    await queue.add(
+      JOB_NAMES.SEND_TRANSACTIONAL,
+      {
+        deliveryId: deliveryRecordId,
+        clientId: input.clientId,
+        category: "TRANSACTIONAL",
+      },
+      {
+        jobId, // Custom Job ID prevents duplicate jobs in BullMQ
+      }
+    );
+  } catch (err: unknown) {
+    try {
+      await prisma.emailDelivery.updateMany({
+        where: { id: deliveryRecordId },
+        data: {
+          status: EmailDeliveryStatus.FAILED,
+          errorCode: "QUEUE_ENQUEUE_FAILED",
+          errorMessage: err instanceof Error ? err.message : "Failed to enqueue email dispatch job",
+          failedAt: new Date(),
+        },
+      });
+    } catch {
+      // Non-fatal if DB update fails
     }
-  );
+    throw err;
+  }
 
   return {
     queued: true,

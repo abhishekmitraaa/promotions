@@ -40,7 +40,11 @@ export async function POST(req: NextRequest) {
   // Layered distributed rate limiting:
   // 1. Per normalized destination phone (10 attempts / 60s)
   const normalizedPhone = normalizePhoneNumber(parseResult.data.to);
-  const phoneRateLimit = await checkRateLimit(`otp_ver_phone_${normalizedPhone}`, 10, 60000);
+  const phoneRateLimit = await checkRateLimit(`otp_ver_phone_${normalizedPhone}`, 10, 60000, {
+    criticality: "CRITICAL",
+    failClosed: true,
+    syncToDb: true,
+  });
   if (!phoneRateLimit.success) {
     return NextResponse.json(
       {
@@ -58,7 +62,11 @@ export async function POST(req: NextRequest) {
   }
 
   // 2. Per API Client tenant (200 attempts / 60s)
-  const clientRateLimit = await checkRateLimit(`otp_ver_client_${auth.clientId}`, 200, 60000);
+  const clientRateLimit = await checkRateLimit(`otp_ver_client_${auth.clientId}`, 200, 60000, {
+    criticality: "CRITICAL",
+    failClosed: true,
+    syncToDb: true,
+  });
   if (!clientRateLimit.success) {
     return NextResponse.json(
       {
@@ -78,7 +86,11 @@ export async function POST(req: NextRequest) {
   // 3. Per caller IP if present (30 attempts / 60s)
   const clientIp = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || req.headers.get("x-real-ip");
   if (clientIp) {
-    const ipRateLimit = await checkRateLimit(`otp_ver_ip_${clientIp}`, 30, 60000);
+    const ipRateLimit = await checkRateLimit(`otp_ver_ip_${clientIp}`, 30, 60000, {
+      criticality: "CRITICAL",
+      failClosed: true,
+      syncToDb: true,
+    });
     if (!ipRateLimit.success) {
       return NextResponse.json(
         {

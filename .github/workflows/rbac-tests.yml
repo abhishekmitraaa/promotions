@@ -18,6 +18,7 @@ jobs:
           POSTGRES_DB: whatsapp_hub
         ports:
           - 5432:5432
+          - 5433:5432
         options: >-
           --health-cmd "pg_isready -U postgres -d whatsapp_hub"
           --health-interval 5s
@@ -38,10 +39,16 @@ jobs:
       DATABASE_URL: postgresql://postgres:postgres@localhost:5432/whatsapp_hub
       DIRECT_URL: postgresql://postgres:postgres@localhost:5432/whatsapp_hub
       REDIS_URL: redis://localhost:6379
+      REDIS_HOST: localhost
+      REDIS_PORT: "6379"
       AUTH_SESSION_SECRET: rbac-ci-session-secret-32-characters-minimum
       API_KEY_PEPPER: rbac-ci-api-key-pepper-32-characters-min
       WEBHOOK_SECRET_ENCRYPTION_KEY: rbac-ci-webhook-key-32-characters-min
+      PROVIDER_CREDENTIAL_KEY: rbac-ci-cred-key-32-characters-min
+      EMAIL_TRACKING_SECRET: rbac-ci-tracking-secret-32-characters
       INTERNAL_WORKER_SECRET: rbac-ci-worker-secret-32-characters-min
+      GMAIL_CLIENT_ID: mock-google-client-id.apps.googleusercontent.com
+      GMAIL_CLIENT_SECRET: mock-google-client-secret
       ALLOW_DESTRUCTIVE_TESTS: "true"
 
     steps:

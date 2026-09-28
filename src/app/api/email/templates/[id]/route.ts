@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { authenticateEmailApi } from "@/lib/email/api-auth-helper";
 import { EmailTemplateService } from "@/lib/services/email-template-service";
+import { EmailTemplateType } from "@prisma/client";
 
 interface RouteParams {
   params: Promise<{ id: string }>;
@@ -25,6 +26,43 @@ export async function GET(req: NextRequest, { params }: RouteParams) {
     return NextResponse.json(
       { success: false, error: { code: "SERVER_ERROR", message: msg } },
       { status: 500 }
+    );
+  }
+}
+
+export async function PATCH(req: NextRequest, { params }: RouteParams) {
+  const { id } = await params;
+  // Mutation: strictly ADMIN only (VIEWER denied)
+  const auth = await authenticateEmailApi(req, { requireAdminForMutations: true });
+  if (!auth.authorized || !auth.clientId) return auth.errorResponse!;
+
+  let body: Record<string, unknown>;
+  try {
+    body = (await req.json()) as Record<string, unknown>;
+  } catch {
+    return NextResponse.json(
+      { success: false, error: { code: "BAD_REQUEST", message: "Invalid JSON body" } },
+      { status: 400 }
+    );
+  }
+
+  try {
+    const updated = await EmailTemplateService.updateTemplate(auth.clientId, id, {
+      name: typeof body.name === "string" ? body.name : undefined,
+      description: typeof body.description === "string" ? body.description : undefined,
+      type: typeof body.type === "string" && Object.values(EmailTemplateType).includes(body.type as EmailTemplateType)
+        ? (body.type as EmailTemplateType)
+        : undefined,
+      activeVersionId: typeof body.activeVersionId === "string" ? body.activeVersionId : undefined,
+    });
+
+    return NextResponse.json({ success: true, data: updated });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Failed to update template";
+    const status = msg.includes("not found") ? 404 : 400;
+    return NextResponse.json(
+      { success: false, error: { code: status === 404 ? "NOT_FOUND" : "BAD_REQUEST", message: msg } },
+      { status }
     );
   }
 }
