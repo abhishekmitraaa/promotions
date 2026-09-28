@@ -485,6 +485,36 @@
 
 ---
 
+### Entry: 2026-09-28 — Distributed Rate Limiting & Multi-Instance Email Abuse Protection
+- **Prompt / Phase**: Multi-Instance Email API Abuse Protection & Distributed Rate Limiting
+- **Status**: ✅ Clean
+- **Architecture & Hardening Completed**:
+  - **Durable Redis Sliding Window Limiter**: Replaced in-memory rate limiter with atomic Redis sliding-window Lua engine (`SLIDING_WINDOW_LUA`). Prevents instance hopping across distributed serverless nodes and concurrent bursts across instances.
+  - **Multi-Dimensional Abuse Defense**:
+    - **Tenant Quotas**: Independent bucket per tenant (`rl:tenant:{clientId}:{route}`). One tenant cannot exhaust another tenant's quota.
+    - **Client IP Tracking**: Durable IP tracking (`rl:ip:{route}:{ip}`). Stops cross-instance hopping.
+    - **Per-Recipient Throttling**: Restricts sending frequency to a single recipient (`rl:tenant:{clientId}:rcpt:{normalizedEmail}`, limit 10/min) to prevent inbox bombing and phishing amplification.
+    - **Account Brute-Force Protection**: Target account rate limiting on `/api/auth/login` (`rl:acct:{email}:login`, limit 25/15m) alongside IP rate limiting (10/15m) to defend against distributed credential-stuffing attacks.
+  - **Criticality Tiers & Failure Modes**:
+    - **`CRITICAL`** (Fail-Closed): Auth login, password reset, email verification, and OTP routes fail closed with HTTP `503 Service Unavailable` (`RATE_LIMITER_UNAVAILABLE` + `Retry-After: 5`) if Redis is offline.
+    - **`HIGH`** / **`STANDARD`** (Graceful Degradation): Public send, campaigns, test sends degrade to secondary PostgreSQL/memory persistence.
+    - **`LOW`** (Fail-Open): Inbound webhooks log alerts without dropping incoming provider callbacks.
+  - **Standardized Response Headers**: Full compliance with RFC 6585 and IETF rate-limit standards (`Retry-After`, `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`).
+  - **Operational Observability**: Exposed rate limiter health in `/api/health` and `/api/admin/email/queue/health` (`backend: "redis"`, `redisConnected`, `latencyMs`).
+  - **Comprehensive Verification**:
+    - `npm run test:ratelimit`: 4 simulated serverless nodes with 40 concurrent requests (exactly 10 allowed, 30 rejected), cross-tenant isolation, instance hopping defense, per-recipient throttling, fail-closed Redis simulations, and end-to-end API abuse rejections (100% pass).
+    - `npm run test:security`: 32 PASSED, 0 FAILED.
+    - `npm run test:email`: 19 email verification test suites passed cleanly (0 failed).
+    - `npm run test:phase2`: 26 PASSED, 0 FAILED (WhatsApp rate limits intact).
+    - `npm run test:guard`: 16 PASSED, 0 FAILED.
+    - `npm run test:rbac`: 21 PASSED, 0 FAILED.
+    - `npm run lint`: ESLint passed with 0 errors.
+    - `npx next build`: Turbopack production build succeeded with 0 errors across all 65 routes.
+- **Unresolved Concerns**: None.
+- **Mitigation / Next Steps**: Fully production ready for multi-instance horizontal scaling.
+
+---
+
 ## Flag Template for Subsequent Prompts
 
 ```markdown

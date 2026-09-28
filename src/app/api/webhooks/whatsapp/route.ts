@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { WebhookService } from "@/lib/services/webhook-service";
 import { WebhookPayload } from "@/lib/whatsapp/types";
+import { checkRateLimit, getClientIp, rateLimitResponse } from "@/lib/rate-limit";
 
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
@@ -24,6 +25,15 @@ export async function GET(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
+  const clientIp = getClientIp(req);
+  const rl = await checkRateLimit(`rl:webhook:whatsapp:${clientIp}`, 1200, 60000, {
+    criticality: "LOW",
+    failClosed: false,
+  });
+  if (!rl.success) {
+    return rateLimitResponse(rl, "WhatsApp webhook rate limit exceeded.");
+  }
+
   let rawBody = "";
   try {
     rawBody = await req.text();

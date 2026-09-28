@@ -3,29 +3,36 @@ import { authenticateApiKey } from "@/lib/api-auth";
 import { createMessageSchema } from "@/lib/validation/messages";
 import { MessageService } from "@/lib/services/message-service";
 import { MessageDirection, MessageStatus } from "@prisma/client";
-import { checkRateLimit } from "@/lib/rate-limit";
+import { checkRateLimit, getClientIp, rateLimitResponse } from "@/lib/rate-limit";
 
 export async function POST(req: NextRequest) {
   const auth = await authenticateApiKey(req);
   if (!auth.authenticated || !auth.clientId) return auth.errorResponse!;
 
+  const clientIp = getClientIp(req);
+
   // Distributed rate limiting per API key (60 messages per minute)
-  const rateLimit = await checkRateLimit(`msg_key_${auth.keyId || "anon"}`, 60, 60000);
+  const rateLimit = await checkRateLimit(`msg_key_${auth.keyId || "anon"}`, 60, 60000, {
+    criticality: "HIGH",
+    syncToDb: true,
+  });
   if (!rateLimit.success) {
-    return NextResponse.json(
-      {
-        success: false,
-        error: {
-          code: "RATE_LIMITED",
-          message: `Too many message dispatch requests. Rate limit exceeded. Retry in ${rateLimit.resetSeconds} seconds.`,
-        },
-      },
-      {
-        status: 429,
-        headers: {
-          "Retry-After": String(rateLimit.resetSeconds),
-        },
-      }
+    return rateLimitResponse(
+      rateLimit,
+      `Too many message dispatch requests. Rate limit exceeded. Retry in ${rateLimit.resetSeconds} seconds.`,
+      "RATE_LIMITED"
+    );
+  }
+
+  // IP rate limiting: 60 messages per minute
+  const ipLimit = await checkRateLimit(`rl:ip:${clientIp}:messages`, 60, 60000, {
+    criticality: "HIGH",
+  });
+  if (!ipLimit.success) {
+    return rateLimitResponse(
+      ipLimit,
+      `Too many message dispatch requests from IP address. Retry in ${ipLimit.resetSeconds} seconds.`,
+      "IP_RATE_LIMITED"
     );
   }
 
@@ -54,6 +61,20 @@ export async function POST(req: NextRequest) {
         },
       },
       { status: 400 }
+    );
+  }
+  // Per-recipient phone number rate limiting: 30 messages per minute
+  const rcptLimit = await checkRateLimit(
+    `rl:rcpt:${auth.clientId}:${parseResult.data.to}:messages`,
+    30,
+    60000,
+    { criticality: "HIGH" }
+  );
+  if (!rcptLimit.success) {
+    return rateLimitResponse(
+      rcptLimit,
+      `Too many messages dispatched to destination '${parseResult.data.to}'. Rate limit exceeded. Retry in ${rcptLimit.resetSeconds} seconds.`,
+      "RECIPIENT_RATE_LIMITED"
     );
   }
 

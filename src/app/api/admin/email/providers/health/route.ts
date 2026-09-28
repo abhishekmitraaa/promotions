@@ -3,6 +3,7 @@ import { requireUser } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { providerRegistry, ProviderUnavailableError, MockProviderForbiddenError } from "@/lib/email/registry";
 import { EmailProviderStatus, EmailProviderType } from "@prisma/client";
+import { checkRateLimit, rateLimitResponse } from "@/lib/rate-limit";
 
 /**
  * GET /api/admin/email/providers/health
@@ -16,6 +17,18 @@ import { EmailProviderStatus, EmailProviderType } from "@prisma/client";
 export async function GET(req: NextRequest) {
   const auth = await requireUser(req, "ADMIN");
   if (auth.response) return auth.response;
+
+  // Rate limit: 15 health probes per minute per admin to prevent hitting Google/external API limits
+  const rl = await checkRateLimit(`rl:health_probe:${auth.user.id}`, 15, 60000, {
+    criticality: "HIGH",
+  });
+  if (!rl.success) {
+    return rateLimitResponse(
+      rl,
+      "Too many provider health checks in a short window. Please wait.",
+      "RATE_LIMITED"
+    );
+  }
 
   try {
     const { searchParams } = new URL(req.url);
@@ -67,6 +80,18 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   const auth = await requireUser(req, "ADMIN");
   if (auth.response) return auth.response;
+
+  // Rate limit: 15 health probes per minute per admin
+  const rl = await checkRateLimit(`rl:health_probe:${auth.user.id}`, 15, 60000, {
+    criticality: "HIGH",
+  });
+  if (!rl.success) {
+    return rateLimitResponse(
+      rl,
+      "Too many provider health checks in a short window. Please wait.",
+      "RATE_LIMITED"
+    );
+  }
 
   try {
     const body = await req.json().catch(() => ({}));

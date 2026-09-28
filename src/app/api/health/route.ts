@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { isMetaConfigured } from "@/lib/env";
+import { getRateLimiterHealth } from "@/lib/rate-limit";
 
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
@@ -32,7 +33,8 @@ export async function GET(req: NextRequest) {
   }
 
   const metaConfigured = isMetaConfigured();
-  const isHealthy = dbStatus === "connected";
+  const rateLimitHealth = await getRateLimiterHealth();
+  const isHealthy = dbStatus === "connected" && rateLimitHealth.status !== "DOWN";
 
   return NextResponse.json(
     {
@@ -41,6 +43,7 @@ export async function GET(req: NextRequest) {
       uptimeSeconds: Math.floor(process.uptime()),
       services: {
         database: dbStatus,
+        rateLimiter: rateLimitHealth,
         metaCloudApi: metaConfigured ? "configured" : "unconfigured",
         webhookQueue: {
           pendingCount: pendingDeliveries,

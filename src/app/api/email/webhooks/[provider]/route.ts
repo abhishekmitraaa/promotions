@@ -15,6 +15,8 @@ import { EmailEventService } from "@/lib/services/email-event-service";
 import { NormalizedEmailWebhookEvent } from "@/lib/email/webhooks/types";
 import { logger } from "@/lib/logger";
 
+import { checkRateLimit, getClientIp, rateLimitResponse } from "@/lib/rate-limit";
+
 interface RouteParams {
   params: Promise<{ provider: string }>;
 }
@@ -22,6 +24,18 @@ interface RouteParams {
 export async function POST(req: NextRequest, { params }: RouteParams) {
   const { provider } = await params;
   const providerLower = provider.toLowerCase();
+
+  // Ingestion Rate Limit: 1,200 req / min per IP (protects against flood DoS while permitting batch webhook pushes)
+  const clientIp = getClientIp(req);
+  const webhookRl = await checkRateLimit(
+    `rl:webhook:${providerLower}:${clientIp}`,
+    1200,
+    60000,
+    { criticality: "LOW", failClosed: false }
+  );
+  if (!webhookRl.success) {
+    return rateLimitResponse(webhookRl, "Webhook ingestion rate limit exceeded.");
+  }
 
   const rawBody = await req.text();
   const headers = req.headers;

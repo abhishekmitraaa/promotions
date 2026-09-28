@@ -1,22 +1,20 @@
 import { NextRequest, NextResponse } from "next/server";
-import { checkRateLimit } from "@/lib/rate-limit";
+import { checkRateLimit, getClientIp, rateLimitResponse } from "@/lib/rate-limit";
 import { AuthTokenService } from "@/lib/services/auth-token-service";
 
 export async function POST(req: NextRequest) {
-  const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "unknown";
+  const ip = getClientIp(req);
 
   // Rate limit: 10 attempts per 15 minutes per IP
-  const rl = await checkRateLimit(`reset_pw_ip_${ip}`, 10, 15 * 60 * 1000);
+  const rl = await checkRateLimit(`reset_pw_ip_${ip}`, 10, 15 * 60 * 1000, {
+    criticality: "CRITICAL",
+    failClosed: true,
+    syncToDb: true,
+  });
   if (!rl.success) {
-    return NextResponse.json(
-      {
-        success: false,
-        error: {
-          code: "RATE_LIMITED",
-          message: "Too many password reset attempts. Please try again later.",
-        },
-      },
-      { status: 429, headers: { "Retry-After": String(rl.resetSeconds) } }
+    return rateLimitResponse(
+      rl,
+      "Too many password reset attempts. Please try again later."
     );
   }
 

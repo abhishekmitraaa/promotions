@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { authenticateApiKey } from "@/lib/api-auth";
-import { checkRateLimit } from "@/lib/rate-limit";
+import { checkRateLimit, getClientIp, rateLimitResponse } from "@/lib/rate-limit";
 import { publicEmailSendSchema } from "@/lib/validation/email";
 import { EmailTemplateService } from "@/lib/services/email-template-service";
 import { TemplateEngine } from "@/lib/email/template-engine";
@@ -27,23 +27,36 @@ export async function POST(req: NextRequest) {
 
   const clientId = auth.clientId;
 
-  // 2. Distributed Rate Limiting (60 requests per minute per API key)
-  const rateLimit = await checkRateLimit(`email_send_key_${auth.keyId || clientId}`, 60, 60000);
-  if (!rateLimit.success) {
-    return NextResponse.json(
-      {
-        success: false,
-        error: {
-          code: "RATE_LIMITED",
-          message: `Too many email dispatch requests. Retry in ${rateLimit.resetSeconds} seconds.`,
-        },
-      },
-      {
-        status: 429,
-        headers: {
-          "Retry-After": String(rateLimit.resetSeconds),
-        },
-      }
+  // 2. Distributed Multi-Dimensional Rate Limiting
+  const clientIp = getClientIp(req);
+
+  // Tenant / API Key Limit: 60 requests per minute
+  const tenantLimit = await checkRateLimit(
+    `email_send_key_${auth.keyId || clientId}`,
+    60,
+    60000,
+    { criticality: "HIGH", syncToDb: true }
+  );
+  if (!tenantLimit.success) {
+    return rateLimitResponse(
+      tenantLimit,
+      `Too many email dispatch requests for tenant. Retry in ${tenantLimit.resetSeconds} seconds.`,
+      "RATE_LIMITED"
+    );
+  }
+
+  // IP Limit: 60 requests per minute per IP (prevents instance-hopping floods)
+  const ipLimit = await checkRateLimit(
+    `rl:ip:${clientIp}:email_send`,
+    60,
+    60000,
+    { criticality: "HIGH" }
+  );
+  if (!ipLimit.success) {
+    return rateLimitResponse(
+      ipLimit,
+      `Too many email dispatch requests from IP address. Retry in ${ipLimit.resetSeconds} seconds.`,
+      "IP_RATE_LIMITED"
     );
   }
 
@@ -81,6 +94,21 @@ export async function POST(req: NextRequest) {
   const recipientEmail = typeof input.to === "string" ? input.to : input.to.email;
   const recipientName = typeof input.to === "object" ? input.to.name : undefined;
   const normalizedTo = normalizeEmail(recipientEmail);
+
+  // Per-Recipient Abuse Protection: 10 requests per minute per recipient
+  const recipientLimit = await checkRateLimit(
+    `rl:rcpt:${clientId}:${normalizedTo}:email_send`,
+    10,
+    60000,
+    { criticality: "HIGH" }
+  );
+  if (!recipientLimit.success) {
+    return rateLimitResponse(
+      recipientLimit,
+      `Too many email dispatch requests to recipient '${recipientEmail}'. Abuse protection limit reached. Retry in ${recipientLimit.resetSeconds} seconds.`,
+      "RECIPIENT_RATE_LIMITED"
+    );
+  }
 
   // 5. Marketing Safety Enforcement for PROMOTIONAL Emails
   if (input.type === "PROMOTIONAL") {

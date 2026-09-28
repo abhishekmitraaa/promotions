@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { authenticateEmailApi } from "@/lib/email/api-auth-helper";
 import { EmailTemplateService } from "@/lib/services/email-template-service";
-import { checkRateLimit } from "@/lib/rate-limit";
+import { checkRateLimit, getClientIp, rateLimitResponse } from "@/lib/rate-limit";
 
 interface RouteParams {
   params: Promise<{ id: string }>;
@@ -13,17 +13,29 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
   const auth = await authenticateEmailApi(req, { requireAdminForMutations: true });
   if (!auth.authorized || !auth.clientId) return auth.errorResponse!;
 
-  const rl = await checkRateLimit(`template_test_email_${auth.clientId}`, 10, 60000);
+  const clientIp = getClientIp(req);
+
+  // Tenant limit: 10 test sends per minute
+  const rl = await checkRateLimit(`template_test_email_${auth.clientId}`, 10, 60000, {
+    criticality: "HIGH",
+    syncToDb: true,
+  });
   if (!rl.success) {
-    return NextResponse.json(
-      {
-        success: false,
-        error: {
-          code: "RATE_LIMITED",
-          message: "Too many test email requests. Rate limit exceeded.",
-        },
-      },
-      { status: 429, headers: { "Retry-After": String(rl.resetSeconds) } }
+    return rateLimitResponse(
+      rl,
+      "Too many test email requests for this tenant. Rate limit exceeded."
+    );
+  }
+
+  // IP limit: 15 test sends per minute per IP
+  const ipRl = await checkRateLimit(`rl:ip:${clientIp}:test_send`, 15, 60000, {
+    criticality: "HIGH",
+  });
+  if (!ipRl.success) {
+    return rateLimitResponse(
+      ipRl,
+      "Too many test email requests from this IP address.",
+      "IP_RATE_LIMITED"
     );
   }
 
@@ -41,6 +53,22 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
     return NextResponse.json(
       { success: false, error: { code: "VALIDATION_ERROR", message: "'testEmail' is required" } },
       { status: 400 }
+    );
+  }
+
+  // Per-recipient test send abuse protection: 5 test emails per minute to same address
+  const normalizedTestEmail = body.testEmail.trim().toLowerCase();
+  const rcptRl = await checkRateLimit(
+    `rl:rcpt:${auth.clientId}:${normalizedTestEmail}:test_send`,
+    5,
+    60000,
+    { criticality: "HIGH" }
+  );
+  if (!rcptRl.success) {
+    return rateLimitResponse(
+      rcptRl,
+      `Too many test emails sent to '${body.testEmail}'. Please wait before sending more test emails to this address.`,
+      "RECIPIENT_RATE_LIMITED"
     );
   }
 

@@ -367,6 +367,7 @@ async function runPhase8Tests() {
   if (failed > 0) {
     process.exit(1);
   }
+  process.exit(0);
 }
 
 runPhase8Tests().catch((err) => {

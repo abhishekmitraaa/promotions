@@ -2,11 +2,24 @@ import { NextRequest, NextResponse } from "next/server";
 import { requireUser } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { generateGoogleAuthUrl } from "@/lib/email/providers/gmail/oauth";
+import { checkRateLimit, rateLimitResponse } from "@/lib/rate-limit";
 
 export async function GET(req: NextRequest) {
   // Only ADMIN can initiate Google OAuth connection
   const auth = await requireUser(req, "ADMIN");
   if (auth.response) return auth.response;
+
+  // Rate limit: 10 OAuth initiation requests per minute per admin
+  const rl = await checkRateLimit(`rl:oauth_init:${auth.user.id}`, 10, 60000, {
+    criticality: "HIGH",
+  });
+  if (!rl.success) {
+    return rateLimitResponse(
+      rl,
+      "Too many OAuth authorization requests. Please wait.",
+      "RATE_LIMITED"
+    );
+  }
 
   try {
     const { searchParams } = new URL(req.url);
