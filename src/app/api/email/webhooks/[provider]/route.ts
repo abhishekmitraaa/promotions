@@ -4,7 +4,7 @@ import { prisma } from "@/lib/prisma";
 import {
   verifyHmacWebhookSignature,
   verifyGmailPubSubWebhook,
-  verifyAwsSesWebhook,
+  verifyAwsSesWebhookAsync,
 } from "@/lib/email/webhooks/verifier";
 import {
   normalizeGenericEvent,
@@ -17,13 +17,47 @@ import { logger } from "@/lib/logger";
 
 import { checkRateLimit, getClientIp, rateLimitResponse } from "@/lib/rate-limit";
 
+import { redactSecrets } from "@/lib/crypto";
+
 interface RouteParams {
   params: Promise<{ provider: string }>;
 }
 
+const SUPPORTED_WEBHOOK_PROVIDERS = ["gmail", "ses", "mock", "generic"];
+
 export async function POST(req: NextRequest, { params }: RouteParams) {
   const { provider } = await params;
   const providerLower = provider.toLowerCase();
+
+  // Validate supported webhook endpoint provider
+  if (!SUPPORTED_WEBHOOK_PROVIDERS.includes(providerLower)) {
+    logger.warn(`[Webhook] Rejected unsupported provider endpoint: '${providerLower}'`);
+    return NextResponse.json(
+      {
+        success: false,
+        error: {
+          code: "UNSUPPORTED_PROVIDER",
+          message: `Unsupported webhook provider endpoint '${providerLower}'. Supported providers: ${SUPPORTED_WEBHOOK_PROVIDERS.join(", ")}`,
+        },
+      },
+      { status: 400 }
+    );
+  }
+
+  // MOCK provider forbidden in production environment
+  if (providerLower === "mock" && process.env.NODE_ENV === "production") {
+    logger.warn(`[Webhook] MOCK provider webhook rejected in production environment`);
+    return NextResponse.json(
+      {
+        success: false,
+        error: {
+          code: "MOCK_PROVIDER_FORBIDDEN",
+          message: "MOCK provider webhook endpoint is forbidden in production environment",
+        },
+      },
+      { status: 400 }
+    );
+  }
 
   // Ingestion Rate Limit: 1,200 req / min per IP (protects against flood DoS while permitting batch webhook pushes)
   const clientIp = getClientIp(req);
@@ -44,12 +78,13 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
   // 1. Mandatory Provider Configuration Binding & Tenant Resolution
   // Every email webhook MUST be associated with an exact, active EmailProviderConfig.
   // Webhooks are never accepted unbound.
-  const configId =
+  const rawConfigId =
     searchParams.get("configId") ||
     searchParams.get("providerConfigId") ||
     headers.get("x-provider-config-id");
+  const configId = rawConfigId?.trim();
 
-  if (!configId) {
+  if (!configId || configId.length === 0) {
     logger.warn(
       `[Webhook:${providerLower}] Rejected: Missing required provider configuration binding (configId)`
     );
@@ -78,16 +113,32 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
     },
   });
 
-  if (!providerConfig || providerConfig.status !== "ACTIVE") {
+  if (!providerConfig) {
     logger.warn(
-      `[Webhook:${providerLower}] Rejected: Provider configuration '${configId}' not found or inactive`
+      `[Webhook:${providerLower}] Rejected: Provider configuration '${configId}' not found`
     );
     return NextResponse.json(
       {
         success: false,
         error: {
           code: "INVALID_PROVIDER_CONFIG",
-          message: "Email provider configuration not found or inactive",
+          message: "Email provider configuration not found",
+        },
+      },
+      { status: 401 }
+    );
+  }
+
+  if (providerConfig.status !== "ACTIVE") {
+    logger.warn(
+      `[Webhook:${providerLower}] Rejected: Provider configuration '${configId}' is inactive`
+    );
+    return NextResponse.json(
+      {
+        success: false,
+        error: {
+          code: "INACTIVE_PROVIDER_CONFIG",
+          message: "Email provider configuration is inactive",
         },
       },
       { status: 401 }
@@ -100,9 +151,11 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
       ? EmailProviderType.GMAIL
       : providerLower === "ses"
       ? EmailProviderType.SES
-      : EmailProviderType.MOCK;
+      : providerLower === "mock"
+      ? EmailProviderType.MOCK
+      : null;
 
-  if (providerLower !== "generic" && providerConfig.providerType !== expectedType) {
+  if (expectedType && providerConfig.providerType !== expectedType) {
     logger.warn(
       `[Webhook:${providerLower}] Rejected: Provider configuration '${configId}' type ${providerConfig.providerType} does not match endpoint provider ${providerLower}`
     );
@@ -111,7 +164,7 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
         success: false,
         error: {
           code: "PROVIDER_TYPE_MISMATCH",
-          message: `Provider configuration '${configId}' type does not match provider endpoint '${providerLower}'`,
+          message: `Provider configuration '${configId}' type '${providerConfig.providerType}' does not match provider endpoint '${providerLower}'`,
         },
       },
       { status: 400 }
@@ -143,11 +196,26 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
     case "gmail": {
       const tokenQuery =
         searchParams.get("token") || searchParams.get("verification_token");
+      if (!tenantSecret && !process.env.GMAIL_WEBHOOK_VERIFICATION_TOKEN) {
+        logger.warn(
+          `[Webhook:gmail] Rejected: Provider configuration '${configId}' has no Pub/Sub verification token configured`
+        );
+        return NextResponse.json(
+          {
+            success: false,
+            error: {
+              code: "MISSING_WEBHOOK_SECRET",
+              message: "Google Pub/Sub verification token is not configured on this provider configuration",
+            },
+          },
+          { status: 401 }
+        );
+      }
       verification = verifyGmailPubSubWebhook(headers, tenantSecret, tokenQuery);
       break;
     }
     case "ses": {
-      verification = verifyAwsSesWebhook(rawBody, headers, tenantSecret);
+      verification = await verifyAwsSesWebhookAsync(rawBody, headers, tenantSecret);
       break;
     }
     case "mock":
@@ -168,14 +236,14 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
           { status: 401 }
         );
       }
-      verification = verifyHmacWebhookSignature(rawBody, headers, tenantSecret);
+      verification = verifyHmacWebhookSignature(rawBody, headers, tenantSecret, { requireTimestamp: true });
       break;
     }
   }
 
   if (!verification.valid) {
     logger.warn(
-      `[Webhook:${providerLower}] Signature verification rejected for config '${configId}': ${verification.error}`
+      `[Webhook:${providerLower}] Signature verification rejected for config '${configId}': ${redactSecrets(verification.error || "")}`
     );
     return NextResponse.json(
       {
@@ -219,7 +287,7 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
         success: false,
         error: {
           code: "INVALID_PAYLOAD",
-          message: `Failed to parse or normalize webhook payload: ${msg}`,
+          message: `Failed to parse or normalize webhook payload: ${redactSecrets(msg)}`,
         },
       },
       { status: 400 }
@@ -260,7 +328,8 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
       );
       results.push(result);
     } catch (procErr) {
-      const msg = procErr instanceof Error ? procErr.message : String(procErr);
+      const rawMsg = procErr instanceof Error ? procErr.message : String(procErr);
+      const msg = redactSecrets(rawMsg);
       if (msg.includes("AMBIGUOUS_TENANT_BINDING")) {
         logger.warn(`[Webhook:${providerLower}] ${msg}`);
         return NextResponse.json(
@@ -276,19 +345,47 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
         );
       }
 
-      logger.error(`[Webhook:${providerLower}] Error enqueuing event:`, procErr);
+      logger.error(`[Webhook:${providerLower}] Error enqueuing event: ${msg}`);
       results.push({
         success: false,
+        deduplicated: false,
         error: msg,
       });
     }
   }
 
+  const successful = results.filter((r) => r.success);
+  const failed = results.filter((r) => !r.success);
+
+  // Honest queue failure reporting: if events were received but queueing failed (and 0 succeeded),
+  // return HTTP 503 so upstream webhook providers know ingestion failed and retry!
+  if (results.length > 0 && successful.length === 0) {
+    logger.error(
+      `[Webhook:${providerLower}] All ${results.length} events failed to enqueue for config '${configId}'`
+    );
+    return NextResponse.json(
+      {
+        success: false,
+        error: {
+          code: "QUEUE_ERROR",
+          message: "Failed to enqueue webhook events for processing. Upstream retry required.",
+          details: results,
+        },
+      },
+      { status: 503 }
+    );
+  }
+
+  const queuedCount = successful.filter((r) => !("deduplicated" in r && r.deduplicated)).length;
+  const deduplicatedCount = successful.filter((r) => "deduplicated" in r && r.deduplicated).length;
+
   return NextResponse.json(
     {
       success: true,
       data: {
-        queued: results.length,
+        queued: queuedCount,
+        deduplicated: deduplicatedCount,
+        failed: failed.length,
         results,
       },
     },

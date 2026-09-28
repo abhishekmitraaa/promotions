@@ -28,7 +28,7 @@ process.env.API_KEY_PEPPER = "webhook-security-pepper-32-chars-min";
 import crypto from "crypto";
 import { NextRequest } from "next/server";
 import { prisma } from "../src/lib/prisma";
-import { closeAllQueues } from "../src/lib/email/queue/queues";
+import { closeAllQueues, getEventsQueue } from "../src/lib/email/queue/queues";
 import { POST as webhookRoute } from "../src/app/api/email/webhooks/[provider]/route";
 import {
   EmailEventService,
@@ -38,14 +38,19 @@ import {
   verifyHmacWebhookSignature,
   verifyGmailPubSubWebhook,
   verifyAwsSesWebhook,
+  verifyAwsSesWebhookAsync,
   buildSnsCanonicalString,
   setSnsCertCache,
   clearSnsCertCache,
+  isValidAwsCertUrl,
+  isPrivateIp,
+  fetchAwsSnsCertificate,
 } from "../src/lib/email/webhooks/verifier";
 import {
   normalizeGenericEvent,
   validateNormalizedEvent,
 } from "../src/lib/email/webhooks/normalizer";
+import { redactSecrets } from "../src/lib/crypto";
 import {
   EmailDeliveryStatus,
   EmailEventType,
@@ -995,6 +1000,490 @@ async function main() {
 
   assert(!serializedResponse.includes(mockSecretAlpha), "Webhook response never leaks tenant webhook secret");
   assert(!serializedResponse.includes("bogus-signature-12345"), "Webhook response does not echo sensitive signature values");
+
+  // ===========================================================================
+  // TEST 11: Hostile SSRF Defense & IP Classification Audit (Requirements 9 & 10)
+  // ===========================================================================
+  console.log("\n--- [11] Hostile SSRF Defense & IP Classification Audit ---");
+
+  // 11a. Malicious / Hostile AWS SigningCertURL Patterns
+  assert(isValidAwsCertUrl("https://sns.us-east-1.amazonaws.com:8443/cert.pem") === false, "SSRF: Port override (:8443) rejected");
+  assert(isValidAwsCertUrl("https://admin:pass@sns.us-east-1.amazonaws.com/cert.pem") === false, "SSRF: Userinfo credentials rejected");
+  assert(isValidAwsCertUrl("https://sns.us-east-1.amazonaws.com/../etc/passwd.pem") === false, "SSRF: Directory traversal (..) rejected");
+  assert(isValidAwsCertUrl("https://sns.us-east-1.amazonaws.com/%2e%2e/cert.pem") === false, "SSRF: URL-encoded traversal (%2e%2e) rejected");
+  assert(isValidAwsCertUrl("https://sns.us-east-1.amazonaws.com/cert.pem?leak=1") === false, "SSRF: Search parameters rejected");
+  assert(isValidAwsCertUrl("https://sns.us-east-1.amazonaws.com/cert.pem#frag") === false, "SSRF: Hash fragments rejected");
+  assert(isValidAwsCertUrl("http://sns.us-east-1.amazonaws.com/cert.pem") === false, "SSRF: Non-HTTPS (http://) rejected");
+  assert(isValidAwsCertUrl("https://evil-attacker.com/cert.pem") === false, "SSRF: Untrusted domain rejected");
+  assert(isValidAwsCertUrl("https://sns.us-east-1.amazonaws.com.evil.com/cert.pem") === false, "SSRF: Subdomain spoofing rejected");
+  assert(isValidAwsCertUrl("https://127.0.0.1/cert.pem") === false, "SSRF: Localhost IP rejected");
+  assert(isValidAwsCertUrl("https://169.254.169.254/cert.pem") === false, "SSRF: Cloud metadata IP rejected");
+  assert(isValidAwsCertUrl("https://sns.us-east-1.amazonaws.com/SimpleNotificationService-012345.pem") === true, "Valid AWS SNS cert URL accepted");
+  assert(isValidAwsCertUrl("https://sns.eu-central-1.amazonaws.com/cert.pem") === true, "Valid EU AWS SNS cert URL accepted");
+
+  // 11b. isPrivateIp Classification
+  assert(isPrivateIp("127.0.0.1") === true, "isPrivateIp: 127.0.0.1 classified as private");
+  assert(isPrivateIp("10.0.0.5") === true, "isPrivateIp: 10.0.0.5 (RFC 1918) classified as private");
+  assert(isPrivateIp("172.16.50.1") === true, "isPrivateIp: 172.16.50.1 (RFC 1918) classified as private");
+  assert(isPrivateIp("192.168.1.100") === true, "isPrivateIp: 192.168.1.100 (RFC 1918) classified as private");
+  assert(isPrivateIp("169.254.169.254") === true, "isPrivateIp: 169.254.169.254 (Cloud metadata) classified as private");
+  assert(isPrivateIp("100.64.0.1") === true, "isPrivateIp: 100.64.0.1 (Carrier NAT) classified as private");
+  assert(isPrivateIp("::1") === true, "isPrivateIp: ::1 (IPv6 loopback) classified as private");
+  assert(isPrivateIp("fe80::1") === true, "isPrivateIp: fe80::1 (IPv6 link-local) classified as private");
+  assert(isPrivateIp("fc00::1") === true, "isPrivateIp: fc00::1 (IPv6 unique-local) classified as private");
+  assert(isPrivateIp("::ffff:127.0.0.1") === true, "isPrivateIp: IPv4-mapped loopback classified as private");
+  assert(isPrivateIp("::ffff:169.254.169.254") === true, "isPrivateIp: IPv4-mapped metadata classified as private");
+  assert(isPrivateIp("8.8.8.8") === false, "isPrivateIp: 8.8.8.8 recognized as public routable");
+  assert(isPrivateIp("1.1.1.1") === false, "isPrivateIp: 1.1.1.1 recognized as public routable");
+
+  // 11c. fetchAwsSnsCertificate Rejection on Malicious Input
+  let fetchFailed = false;
+  try {
+    await fetchAwsSnsCertificate("https://evil.com/cert.pem");
+  } catch {
+    fetchFailed = true;
+  }
+  assert(fetchFailed, "fetchAwsSnsCertificate strictly throws on non-AWS cert URL");
+
+  // ===========================================================================
+  // TEST 12: Hostile Parameter & Endpoint Rejections (Requirement 2 & 10)
+  // ===========================================================================
+  console.log("\n--- [12] Hostile Parameter & Endpoint Rejections ---");
+
+  // 12a. Whitespace configId
+  const reqWhitespaceConfig = new NextRequest(
+    "http://localhost:3000/api/email/webhooks/mock?configId=%20%20",
+    {
+      method: "POST",
+      body: JSON.stringify({ eventType: "DELIVERED", recipient: "test@example.com" }),
+    }
+  );
+  const resWhitespaceConfig = await webhookRoute(reqWhitespaceConfig, {
+    params: Promise.resolve({ provider: "mock" }),
+  });
+  const dataWhitespaceConfig = await resWhitespaceConfig.json();
+  assert(resWhitespaceConfig.status === 400, "Whitespace configId rejected with HTTP 400");
+  assert(dataWhitespaceConfig.error?.code === "MISSING_PROVIDER_CONFIG", "Error code is MISSING_PROVIDER_CONFIG");
+
+  // 12b. Unsupported provider endpoint
+  const reqUnsupportedProvider = new NextRequest(
+    `http://localhost:3000/api/email/webhooks/malicious-provider?configId=${configAlphaMock.id}`,
+    {
+      method: "POST",
+      body: JSON.stringify({ eventType: "DELIVERED", recipient: "test@example.com" }),
+    }
+  );
+  const resUnsupportedProvider = await webhookRoute(reqUnsupportedProvider, {
+    params: Promise.resolve({ provider: "malicious-provider" }),
+  });
+  const dataUnsupportedProvider = await resUnsupportedProvider.json();
+  assert(resUnsupportedProvider.status === 400, "Unsupported provider endpoint rejected with HTTP 400");
+  assert(dataUnsupportedProvider.error?.code === "UNSUPPORTED_PROVIDER", "Error code is UNSUPPORTED_PROVIDER");
+
+  // 12c. Reverse provider mismatch (Gmail endpoint with SES config)
+  const reqReverseMismatch = new NextRequest(
+    `http://localhost:3000/api/email/webhooks/gmail?configId=${configAlphaSes.id}`,
+    {
+      method: "POST",
+      body: JSON.stringify({ eventType: "DELIVERED", recipient: "test@example.com" }),
+    }
+  );
+  const resReverseMismatch = await webhookRoute(reqReverseMismatch, {
+    params: Promise.resolve({ provider: "gmail" }),
+  });
+  const dataReverseMismatch = await resReverseMismatch.json();
+  assert(resReverseMismatch.status === 400, "SES config on Gmail endpoint rejected with HTTP 400");
+  assert(dataReverseMismatch.error?.code === "PROVIDER_TYPE_MISMATCH", "Error code is PROVIDER_TYPE_MISMATCH");
+
+  // 12d. Missing X-Webhook-Timestamp header on HMAC webhook (prevents infinite replay)
+  const hmacWithoutTimestampSig = crypto
+    .createHmac("sha256", mockSecretAlpha)
+    .update(JSON.stringify({ eventType: "DELIVERED", recipient: "test@example.com" }))
+    .digest("hex");
+  const reqNoTimestampHmac = new NextRequest(
+    `http://localhost:3000/api/email/webhooks/mock?configId=${configAlphaMock.id}`,
+    {
+      method: "POST",
+      headers: {
+        "x-webhook-signature": hmacWithoutTimestampSig,
+        // x-webhook-timestamp intentionally omitted
+      },
+      body: JSON.stringify({ eventType: "DELIVERED", recipient: "test@example.com" }),
+    }
+  );
+  const resNoTimestampHmac = await webhookRoute(reqNoTimestampHmac, {
+    params: Promise.resolve({ provider: "mock" }),
+  });
+  assert(resNoTimestampHmac.status === 401, "HMAC webhook without X-Webhook-Timestamp rejected with HTTP 401");
+
+  // 12e. Malformed JSON payload body
+  const reqMalformedJson = new NextRequest(
+    `http://localhost:3000/api/email/webhooks/mock?configId=${configAlphaMock.id}`,
+    {
+      method: "POST",
+      headers: {
+        "x-webhook-signature": "bogus-signature",
+        "x-webhook-timestamp": String(Math.floor(Date.now() / 1000)),
+      },
+      body: "{ not valid json syntax ...",
+    }
+  );
+  const resMalformedJson = await webhookRoute(reqMalformedJson, {
+    params: Promise.resolve({ provider: "mock" }),
+  });
+  assert(resMalformedJson.status === 401 || resMalformedJson.status === 400, "Malformed body rejected");
+
+  // 12f. MOCK provider forbidden in production environment
+  const originalEnv = process.env.NODE_ENV;
+  process.env.NODE_ENV = "production";
+  const reqMockInProd = new NextRequest(
+    `http://localhost:3000/api/email/webhooks/mock?configId=${configAlphaMock.id}`,
+    {
+      method: "POST",
+      body: JSON.stringify({ eventType: "DELIVERED", recipient: "test@example.com" }),
+    }
+  );
+  const resMockInProd = await webhookRoute(reqMockInProd, {
+    params: Promise.resolve({ provider: "mock" }),
+  });
+  const dataMockInProd = await resMockInProd.json();
+  process.env.NODE_ENV = originalEnv; // Restore immediately
+  assert(resMockInProd.status === 400, "MOCK provider rejected in production with HTTP 400");
+  assert(dataMockInProd.error?.code === "MOCK_PROVIDER_FORBIDDEN", "Error code is MOCK_PROVIDER_FORBIDDEN");
+
+  // ===========================================================================
+  // TEST 13: Full Event Matrix Verification (Requirement 7)
+  // ===========================================================================
+  console.log("\n--- [13] Full Event Matrix Verification (Bounce, Soft, Hard, Complaint, Delivered, Sent, Unsubscribe, Failed) ---");
+
+  // 13a. Soft Bounce vs Hard Bounce
+  const softBounceEmail = `soft-bounce-${testRunId}@test.com`;
+  const hardBounceEmail = `hard-bounce-${testRunId}@test.com`;
+
+  const contactSoft = await prisma.emailContact.create({
+    data: {
+      clientId: tenantAlpha.id,
+      email: softBounceEmail,
+      normalizedEmail: softBounceEmail.toLowerCase(),
+      status: EmailContactStatus.SUBSCRIBED,
+      hasMarketingConsent: true,
+    },
+  });
+
+  const contactHard = await prisma.emailContact.create({
+    data: {
+      clientId: tenantAlpha.id,
+      email: hardBounceEmail,
+      normalizedEmail: hardBounceEmail.toLowerCase(),
+      status: EmailContactStatus.SUBSCRIBED,
+      hasMarketingConsent: true,
+    },
+  });
+
+  const deliverySoft = await prisma.emailDelivery.create({
+    data: {
+      clientId: tenantAlpha.id,
+      providerType: EmailProviderType.MOCK,
+      providerMessageId: `msg-soft-${testRunId}`,
+      to: softBounceEmail,
+      from: "sender@example.com",
+      subject: "Soft Bounce Test",
+      status: EmailDeliveryStatus.SENT,
+      category: "PROMOTIONAL",
+    },
+  });
+
+  const deliveryHard = await prisma.emailDelivery.create({
+    data: {
+      clientId: tenantAlpha.id,
+      providerType: EmailProviderType.MOCK,
+      providerMessageId: `msg-hard-${testRunId}`,
+      to: hardBounceEmail,
+      from: "sender@example.com",
+      subject: "Hard Bounce Test",
+      status: EmailDeliveryStatus.SENT,
+      category: "PROMOTIONAL",
+    },
+  });
+
+  // Process SOFT BOUNCE
+  const softEvent = normalizeGenericEvent({
+    eventId: `evt-soft-${testRunId}`,
+    eventType: "BOUNCED",
+    bounceType: "SOFT_BOUNCE",
+    bounceReason: "Mailbox full - temporary failure",
+    providerMessageId: deliverySoft.providerMessageId,
+    recipient: softBounceEmail,
+  })[0];
+  await EmailEventService.recordAndEnqueueEvent(softEvent, configAlphaMock);
+  const softDbEvt = await prisma.emailEvent.findFirst({ where: { providerEventId: `evt-soft-${testRunId}` } });
+  await EmailEventService.processEventFromWorker(softDbEvt!.id);
+
+  const deliveryAfterSoft = await prisma.emailDelivery.findUnique({ where: { id: deliverySoft.id } });
+  assert(deliveryAfterSoft?.status === EmailDeliveryStatus.BOUNCED, "Soft bounce delivery transitioned to BOUNCED");
+
+  const contactAfterSoft = await prisma.emailContact.findUnique({ where: { id: contactSoft.id } });
+  assert(contactAfterSoft?.status === EmailContactStatus.SUBSCRIBED, "Soft bounce did NOT change contact status (remains SUBSCRIBED)");
+  assert(contactAfterSoft?.hasMarketingConsent === true, "Soft bounce did NOT revoke marketing consent");
+
+  const suppressionSoft = await prisma.emailSuppression.findFirst({
+    where: { clientId: tenantAlpha.id, email: softBounceEmail },
+  });
+  assert(suppressionSoft === null, "CRITICAL: Soft bounce did NOT create permanent suppression record");
+
+  // Process HARD BOUNCE
+  const hardEvent = normalizeGenericEvent({
+    eventId: `evt-hard-${testRunId}`,
+    eventType: "BOUNCED",
+    bounceType: "HARD_BOUNCE",
+    bounceReason: "Recipient address does not exist - permanent failure",
+    providerMessageId: deliveryHard.providerMessageId,
+    recipient: hardBounceEmail,
+  })[0];
+  await EmailEventService.recordAndEnqueueEvent(hardEvent, configAlphaMock);
+  const hardDbEvt = await prisma.emailEvent.findFirst({ where: { providerEventId: `evt-hard-${testRunId}` } });
+  await EmailEventService.processEventFromWorker(hardDbEvt!.id);
+
+  const deliveryAfterHard = await prisma.emailDelivery.findUnique({ where: { id: deliveryHard.id } });
+  assert(deliveryAfterHard?.status === EmailDeliveryStatus.BOUNCED, "Hard bounce delivery transitioned to BOUNCED");
+
+  const contactAfterHard = await prisma.emailContact.findUnique({ where: { id: contactHard.id } });
+  assert(contactAfterHard?.status === EmailContactStatus.BOUNCED, "Hard bounce marked contact status as BOUNCED");
+  assert(contactAfterHard?.hasMarketingConsent === false, "Hard bounce revoked marketing consent");
+
+  const suppressionHard = await prisma.emailSuppression.findFirst({
+    where: { clientId: tenantAlpha.id, email: hardBounceEmail },
+  });
+  assert(suppressionHard !== null, "CRITICAL: Hard bounce created authoritative permanent suppression record");
+  assert(suppressionHard?.reason === EmailSuppressionReason.HARD_BOUNCE, "Suppression reason is HARD_BOUNCE");
+
+  // 13b. Unsubscribe Event
+  const unsubEmail = `unsub-${testRunId}@test.com`;
+  const contactUnsub = await prisma.emailContact.create({
+    data: {
+      clientId: tenantAlpha.id,
+      email: unsubEmail,
+      normalizedEmail: unsubEmail.toLowerCase(),
+      status: EmailContactStatus.SUBSCRIBED,
+      hasMarketingConsent: true,
+    },
+  });
+
+  const unsubEvent = normalizeGenericEvent({
+    eventId: `evt-unsub-${testRunId}`,
+    eventType: "UNSUBSCRIBED",
+    recipient: unsubEmail,
+  })[0];
+  await EmailEventService.recordAndEnqueueEvent(unsubEvent, configAlphaMock);
+  const unsubDbEvt = await prisma.emailEvent.findFirst({ where: { providerEventId: `evt-unsub-${testRunId}` } });
+  await EmailEventService.processEventFromWorker(unsubDbEvt!.id);
+
+  const contactAfterUnsub = await prisma.emailContact.findUnique({ where: { id: contactUnsub.id } });
+  assert(contactAfterUnsub?.status === EmailContactStatus.UNSUBSCRIBED, "Contact marked UNSUBSCRIBED");
+  assert(contactAfterUnsub?.hasMarketingConsent === false, "Marketing consent revoked on unsubscribe");
+
+  const suppressionUnsub = await prisma.emailSuppression.findFirst({
+    where: { clientId: tenantAlpha.id, email: unsubEmail },
+  });
+  assert(suppressionUnsub !== null, "Authoritative suppression record created on unsubscribe");
+  assert(suppressionUnsub?.reason === EmailSuppressionReason.UNSUBSCRIBED, "Suppression reason is UNSUBSCRIBED");
+
+  // 13c. Delivery Failed Event
+  const failedEmail = `failed-${testRunId}@test.com`;
+  const deliveryFailed = await prisma.emailDelivery.create({
+    data: {
+      clientId: tenantAlpha.id,
+      providerType: EmailProviderType.MOCK,
+      providerMessageId: `msg-failed-${testRunId}`,
+      to: failedEmail,
+      from: "sender@example.com",
+      subject: "Failure Test",
+      status: EmailDeliveryStatus.SENT,
+      category: "PROMOTIONAL",
+    },
+  });
+
+  const failedEvent = normalizeGenericEvent({
+    eventId: `evt-failed-${testRunId}`,
+    eventType: "FAILED",
+    providerMessageId: deliveryFailed.providerMessageId,
+    recipient: failedEmail,
+    error: { code: "SMTP_550", message: "Relay access denied" },
+  })[0];
+  await EmailEventService.recordAndEnqueueEvent(failedEvent, configAlphaMock);
+  const failedDbEvt = await prisma.emailEvent.findFirst({ where: { providerEventId: `evt-failed-${testRunId}` } });
+  await EmailEventService.processEventFromWorker(failedDbEvt!.id);
+
+  const deliveryAfterFailed = await prisma.emailDelivery.findUnique({ where: { id: deliveryFailed.id } });
+  assert(deliveryAfterFailed?.status === EmailDeliveryStatus.FAILED, "Delivery transitioned to FAILED");
+
+  // ===========================================================================
+  // TEST 14: Terminal Delivery State Machine Monotonicity (Requirement 8)
+  // ===========================================================================
+  console.log("\n--- [14] Terminal State Monotonicity & Delivery State Transitions ---");
+
+  // 14a. Terminal BOUNCED cannot become DELIVERED
+  assert(
+    canTransitionDeliveryStatus(EmailDeliveryStatus.BOUNCED, EmailDeliveryStatus.DELIVERED) === false,
+    "CRITICAL: Terminal BOUNCED cannot become DELIVERED"
+  );
+
+  // 14b. Terminal FAILED cannot become DELIVERED
+  assert(
+    canTransitionDeliveryStatus(EmailDeliveryStatus.FAILED, EmailDeliveryStatus.DELIVERED) === false,
+    "CRITICAL: Terminal FAILED cannot become DELIVERED"
+  );
+
+  // 14c. Terminal COMPLAINED cannot become DELIVERED or BOUNCED
+  assert(
+    canTransitionDeliveryStatus(EmailDeliveryStatus.COMPLAINED, EmailDeliveryStatus.DELIVERED) === false,
+    "CRITICAL: Terminal COMPLAINED cannot become DELIVERED"
+  );
+  assert(
+    canTransitionDeliveryStatus(EmailDeliveryStatus.COMPLAINED, EmailDeliveryStatus.BOUNCED) === false,
+    "CRITICAL: Terminal COMPLAINED cannot become BOUNCED"
+  );
+
+  // 14d. Terminal BOUNCED delivery in DB stays BOUNCED even if out-of-order DELIVERED event arrives
+  const bounceDeliveryTest = await prisma.emailDelivery.create({
+    data: {
+      clientId: tenantAlpha.id,
+      providerType: EmailProviderType.MOCK,
+      providerMessageId: `msg-bounce-term-${testRunId}`,
+      to: `terminal-bounce-${testRunId}@test.com`,
+      from: "sender@example.com",
+      subject: "Terminal Bounce Monotonicity",
+      status: EmailDeliveryStatus.BOUNCED,
+      category: "PROMOTIONAL",
+    },
+  });
+
+  const outOfOrderDel = normalizeGenericEvent({
+    eventId: `evt-ooo-del-${testRunId}`,
+    eventType: "DELIVERED",
+    providerMessageId: bounceDeliveryTest.providerMessageId,
+    recipient: bounceDeliveryTest.to,
+  })[0];
+  await EmailEventService.recordAndEnqueueEvent(outOfOrderDel, configAlphaMock);
+  const oooDelDb = await prisma.emailEvent.findFirst({ where: { providerEventId: `evt-ooo-del-${testRunId}` } });
+  await EmailEventService.processEventFromWorker(oooDelDb!.id);
+
+  const deliveryAfterOoo = await prisma.emailDelivery.findUnique({ where: { id: bounceDeliveryTest.id } });
+  assert(deliveryAfterOoo?.status === EmailDeliveryStatus.BOUNCED, "CRITICAL: BOUNCED delivery remains BOUNCED after out-of-order DELIVERED event");
+
+  // ===========================================================================
+  // TEST 15: Event Persistence Before 202 & Honest Queue Failure (Requirements 5 & 6)
+  // ===========================================================================
+  console.log("\n--- [15] Event Persistence Before 202 & Honest Queue Failure Reporting ---");
+
+  // 15a. Event is persisted in DB before 202 is returned
+  const persistBefore202Id = `evt-persist-${testRunId}`;
+  const persistTimestamp = Math.floor(Date.now() / 1000);
+  const persistPayload = JSON.stringify({
+    eventId: persistBefore202Id,
+    eventType: "DELIVERED",
+    recipient: "persisted@example.com",
+  });
+  const persistHmac = crypto
+    .createHmac("sha256", mockSecretAlpha)
+    .update(`${persistTimestamp}.${persistPayload}`)
+    .digest("hex");
+
+  const reqPersistCheck = new NextRequest(
+    `http://localhost:3000/api/email/webhooks/mock?configId=${configAlphaMock.id}`,
+    {
+      method: "POST",
+      headers: {
+        "x-webhook-signature": persistHmac,
+        "x-webhook-timestamp": String(persistTimestamp),
+      },
+      body: persistPayload,
+    }
+  );
+  const resPersistCheck = await webhookRoute(reqPersistCheck, { params: Promise.resolve({ provider: "mock" }) });
+  assert(resPersistCheck.status === 202, "Webhook accepted with HTTP 202");
+
+  const dbEventPersisted = await prisma.emailEvent.findFirst({
+    where: { providerEventId: persistBefore202Id, providerConfigId: configAlphaMock.id },
+  });
+  assert(dbEventPersisted !== null, "CRITICAL: EmailEvent record exists in DB immediately upon 202 response");
+  assert(dbEventPersisted?.status === EmailEventProcessingStatus.RECEIVED, "Persisted EmailEvent is in RECEIVED state");
+
+  // 15b. Honest Queue Failure: Simulated Redis / Queue Error
+  // When BullMQ fails to enqueue, recordAndEnqueueEvent must NOT report success,
+  // the DB event must be marked FAILED, and route must return HTTP 503!
+  const queue = getEventsQueue();
+  const originalAdd = queue.add.bind(queue);
+
+  // Mock queue.add to simulate Redis connection crash
+  (queue as any).add = async () => {
+    throw new Error("Simulated Redis Connection Refused: ECONNREFUSED 127.0.0.1:6379");
+  };
+
+  const queueFailEventId = `evt-qfail-${testRunId}`;
+  const queueFailTimestamp = Math.floor(Date.now() / 1000);
+  const queueFailPayload = JSON.stringify({
+    eventId: queueFailEventId,
+    eventType: "DELIVERED",
+    recipient: "qfail@example.com",
+  });
+  const queueFailHmac = crypto
+    .createHmac("sha256", mockSecretAlpha)
+    .update(`${queueFailTimestamp}.${queueFailPayload}`)
+    .digest("hex");
+
+  const reqQueueFail = new NextRequest(
+    `http://localhost:3000/api/email/webhooks/mock?configId=${configAlphaMock.id}`,
+    {
+      method: "POST",
+      headers: {
+        "x-webhook-signature": queueFailHmac,
+        "x-webhook-timestamp": String(queueFailTimestamp),
+      },
+      body: queueFailPayload,
+    }
+  );
+
+  const resQueueFail = await webhookRoute(reqQueueFail, { params: Promise.resolve({ provider: "mock" }) });
+  const dataQueueFail = await resQueueFail.json();
+
+  // Restore original queue.add immediately
+  (queue as any).add = originalAdd;
+
+  assert(resQueueFail.status === 503, "CRITICAL: Queue failure returns HTTP 503 (Upstream retry required)");
+  assert(dataQueueFail.error?.code === "QUEUE_ERROR", "Error code is QUEUE_ERROR");
+
+  const dbEventQFail = await prisma.emailEvent.findFirst({
+    where: { providerEventId: queueFailEventId, providerConfigId: configAlphaMock.id },
+  });
+  assert(dbEventQFail !== null, "EmailEvent record was persisted prior to queue attempt");
+  assert(dbEventQFail?.status === EmailEventProcessingStatus.FAILED, "EmailEvent marked FAILED in database on queue failure");
+  assert(dbEventQFail?.errorCode === "QUEUE_ENQUEUE_FAILED", "EmailEvent errorCode is QUEUE_ENQUEUE_FAILED");
+
+  // ===========================================================================
+  // TEST 16: Comprehensive Secret Redaction & Log Sanitization Audit (Requirement 11)
+  // ===========================================================================
+  console.log("\n--- [16] Secret Redaction & Log Sanitization Audit ---");
+
+  // 16a. redactSecrets masks all sensitive patterns
+  const secretSampleApiKey = "API key whub_0123456789abcdef01234567 should be masked";
+  assert(redactSecrets(secretSampleApiKey).includes("[REDACTED_API_KEY]"), "redactSecrets masks whub_ API keys");
+  assert(!redactSecrets(secretSampleApiKey).includes("whub_0123456789abcdef01234567"), "API key value is completely scrubbed");
+
+  const secretSampleBearer = "Authorization: Bearer my-sensitive-jwt-token-12345";
+  assert(redactSecrets(secretSampleBearer).includes("Bearer [REDACTED]"), "redactSecrets masks Bearer tokens");
+  assert(!redactSecrets(secretSampleBearer).includes("my-sensitive-jwt-token-12345"), "Bearer token value is completely scrubbed");
+
+  const secretSampleDb = "postgresql://myuser:supersecretpass@localhost:5432/mydb";
+  assert(redactSecrets(secretSampleDb).includes("postgresql://myuser:[REDACTED]@localhost:5432/mydb"), "Database credentials masked");
+  assert(!redactSecrets(secretSampleDb).includes("supersecretpass"), "Database password completely scrubbed");
+
+  const secretSampleWebhookSecret = "webhookSecret=super-secret-key-value&tenantId=123";
+  assert(redactSecrets(secretSampleWebhookSecret).includes("webhookSecret=[REDACTED]"), "webhookSecret parameter masked");
+  assert(!redactSecrets(secretSampleWebhookSecret).includes("super-secret-key-value"), "webhookSecret value completely scrubbed");
+
+  const secretSampleSignature = "x-webhook-signature=deadbeef1234567890";
+  assert(redactSecrets(secretSampleSignature).includes("x-webhook-signature=[REDACTED]"), "Webhook signature parameter masked");
 
   // ---------------------------------------------------------------------------
   // CLEANUP

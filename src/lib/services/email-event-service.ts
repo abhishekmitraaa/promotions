@@ -337,14 +337,33 @@ export class EmailEventService {
         },
       });
     } catch (queueErr) {
+      const queueErrMsg = queueErr instanceof Error ? queueErr.message : String(queueErr);
       logger.warn(
-        `[EventService] Failed to enqueue event job for ${createdEvent.id}: ${queueErr instanceof Error ? queueErr.message : String(queueErr)}`
+        `[EventService] Failed to enqueue event job for ${createdEvent.id}: ${queueErrMsg}`
       );
 
       // In offline tests without Redis, optionally process synchronously if requested
       if (options?.syncFallback) {
         logger.info(`[EventService] Processing event synchronously via fallback`);
         await this.processEventFromWorker(createdEvent.id);
+      } else {
+        // Honest queue failure: update DB state and return visible failure
+        await prisma.emailEvent.update({
+          where: { id: createdEvent.id },
+          data: {
+            status: EmailEventProcessingStatus.FAILED,
+            errorCode: "QUEUE_ENQUEUE_FAILED",
+            errorMessage: `Failed to enqueue event job: ${queueErrMsg}`,
+          },
+        });
+
+        return {
+          success: false,
+          deduplicated: false,
+          eventId: createdEvent.id,
+          status: EmailEventProcessingStatus.FAILED,
+          error: `QUEUE_ENQUEUE_FAILED: ${queueErrMsg}`,
+        };
       }
     }
 

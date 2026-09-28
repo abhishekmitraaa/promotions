@@ -633,6 +633,47 @@
 - **Unresolved Concerns**: None.
 - **Mitigation / Next Steps**: Production SQL script prepared and documented for operator approval.
 
+### Entry: 2026-09-28 — Hostile Security Review of Email Webhooks
+- **Prompt / Phase**: Hostile security review of every Email webhook endpoint (`/api/email/webhooks/gmail`, `/api/email/webhooks/ses`, generic/mock paths).
+- **Status**: ✅ Clean (All 11 Requirements Hardened & 140 Adversarial Test Vectors Passing)
+- **Scope & Endpoints Audited**:
+  - `/api/email/webhooks/gmail`: Google Cloud Pub/Sub push subscription webhook.
+  - `/api/email/webhooks/ses`: AWS SNS / SES cryptographic webhook.
+  - `/api/email/webhooks/mock`: Mock provider webhook (strictly forbidden in production).
+  - `/api/email/webhooks/generic`: Generic provider webhook with HMAC-SHA256 signature.
+  - Any unsupported provider path (e.g. `/api/email/webhooks/*`): strictly rejected with HTTP 400 `UNSUPPORTED_PROVIDER`.
+- **Root Cause & Vulnerabilities Remediated**:
+  1. **HMAC Replay Protection**:
+     - `verifyHmacWebhookSignature` previously only checked timestamp `if (timestamp)`. If an attacker stripped `x-webhook-timestamp`, the HMAC was computed over raw body only, allowing infinite replays.
+     - **Fix**: Enforced `requireTimestamp: true` as the secure default. Missing or expired timestamps (> 300s skew) are strictly rejected with HTTP 401.
+  2. **SSRF Defense on AWS SNS `SigningCertURL`**:
+     - `new URL(url).hostname` alone does not protect against port injection, credentials, directory traversal, or metadata resolution.
+     - **Fix**: Hardened `isValidAwsCertUrl` to enforce HTTPS, no port override, no userinfo credentials, no search query/hash, strict AWS region hostname regex (`^sns\.[a-z0-9-]+\.amazonaws\.com$`), strict `.pem` path, and path traversal rejection (`..`, `%2e%2e`, `\0`).
+     - Added `isPrivateIp` IP range classification and `fetchAwsSnsCertificate` safe resolver blocking all RFC 1918, loopback, link-local, cloud metadata (`169.254.169.254`), and IPv4-mapped IPv6 ranges with `redirect: "error"`, 5s timeout, and 64KB response size limit.
+  3. **Silent Queue Enqueue Drops**:
+     - Previously, `recordAndEnqueueEvent` swallowed `queue.add()` failures and returned `{ success: true, status: RECEIVED }`, causing the route to return HTTP 202 even when events were never enqueued.
+     - **Fix**: When `queue.add()` fails (and fallback is false), the `EmailEvent` row in PostgreSQL is marked `status: FAILED` with `errorCode: "QUEUE_ENQUEUE_FAILED"`. If all events fail to enqueue, the route returns HTTP 503 `QUEUE_ERROR`, ensuring upstream webhook providers receive a transient failure status code and retry delivery.
+  4. **Strict Provider Configuration Binding & Tenant Resolution**:
+     - Webhooks must pass a valid, active `configId`. Missing, empty, or whitespace `configId` returns HTTP 400 `MISSING_PROVIDER_CONFIG`.
+     - Non-existent or inactive configs return HTTP 401 `INVALID_PROVIDER_CONFIG` / `INACTIVE_PROVIDER_CONFIG`.
+     - Provider type matching is strictly enforced (e.g. SES endpoint rejects Gmail config with HTTP 400 `PROVIDER_TYPE_MISMATCH`).
+     - Tenant identification never relies on recipient email alone; tenant ID is strictly derived from the verified `EmailProviderConfig`.
+     - Replays are deduplicated per provider configuration using `[providerConfigId, providerEventId]`.
+  5. **State Machine Monotonicity & Delivery Invariants**:
+     - Verified that terminal delivery states (`BOUNCED`, `FAILED`, `COMPLAINED`) cannot be overwritten or downgraded by out-of-order `DELIVERED` or `SENT` events.
+     - Verified that duplicate `DELIVERED`, `BOUNCED`, or `COMPLAINED` events do not double-increment campaign metrics.
+     - Verified that Soft Bounces update delivery status to `BOUNCED` but do NOT create permanent suppression or revoke contact marketing consent.
+     - Verified that Hard Bounces and Complaints create authoritative suppression records and revoke contact marketing consent.
+  6. **Secret Redaction in Logs**:
+     - Hardened `redactSecrets` in `src/lib/crypto.ts` to scrub API keys (`whub_`), Bearer tokens, database/Redis credentials, webhook secrets, and signatures from logs and error payloads.
+- **Verification Matrix**:
+  - `npm run test:email:webhooks` (`scripts/verify-email-webhook-security.ts`): 140 / 140 PASSED.
+  - `npm run test:email:security` (`scripts/verify-email-phase8.ts`): 30 / 30 PASSED.
+  - `npm run test:email:hardening` (`scripts/verify-email-hardening.ts`): 56 / 56 PASSED.
+  - `npm run test:email:events` (`scripts/verify-email-event-processing.ts`): 50 / 50 PASSED.
+- **Unresolved Concerns**: None.
+- **Mitigation / Next Steps**: All email webhook endpoints are hardened against hostile attacks, replay, SSRF, state tampering, and secret leakage.
+
 ---
 
 ## Flag Template for Subsequent Prompts
@@ -647,6 +688,7 @@
 - **Mitigation / Next Steps**:
   - [Action to resolve concern in future phase]
 ```
+
 
 
 

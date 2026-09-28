@@ -29,10 +29,10 @@ export function classifyBounce(
   const diag = (diagnosticCode || "").toLowerCase();
 
   // AWS SES / SendGrid explicit bounce type
-  if (subType === "PERMANENT" || subType === "UNDETERMINED_HARD") {
+  if (subType === "PERMANENT" || subType === "UNDETERMINED_HARD" || subType === "HARD_BOUNCE" || subType === "HARD") {
     return { type: "HARD_BOUNCE", reason: diagnosticCode || "Permanent hard bounce" };
   }
-  if (subType === "TRANSIENT" || subType === "MAILBOX_FULL" || subType === "MESSAGE_TOO_LARGE") {
+  if (subType === "TRANSIENT" || subType === "MAILBOX_FULL" || subType === "MESSAGE_TOO_LARGE" || subType === "SOFT_BOUNCE" || subType === "SOFT") {
     return { type: "SOFT_BOUNCE", reason: diagnosticCode || "Transient soft bounce" };
   }
 
@@ -137,11 +137,15 @@ export function normalizeGenericEvent(
 
   if (eventType === EmailEventType.BOUNCED) {
     const bounceObj = (payload.bounce as Record<string, unknown>) || {};
+    const rawBounceType = (payload.bounceType as string) || (bounceObj.type as string);
+    const rawBounceCode = (payload.bounceCode as string) || (bounceObj.code as string);
+    const rawBounceReason = (payload.bounceReason as string) || (bounceObj.description as string) || (bounceObj.reason as string);
+
     const classification = classifyBounce(
       providerType,
-      bounceObj.code ? String(bounceObj.code) : undefined,
-      bounceObj.type ? String(bounceObj.type) : undefined,
-      bounceObj.description ? String(bounceObj.description) : undefined
+      rawBounceCode ? String(rawBounceCode) : undefined,
+      rawBounceType ? String(rawBounceType) : undefined,
+      rawBounceReason ? String(rawBounceReason) : undefined
     );
     bounceType = classification.type;
     bounceReason = classification.reason;

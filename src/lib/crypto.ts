@@ -184,14 +184,26 @@ export function redactSecrets(text: string): string {
   clean = clean.replace(/ya29\.[a-zA-Z0-9_\-]+/g, "[REDACTED_ACCESS_TOKEN]");
   clean = clean.replace(/1\/\/[a-zA-Z0-9_\-]+/g, "[REDACTED_REFRESH_TOKEN]");
 
+  // Mask API keys
+  clean = clean.replace(/whub_[a-fA-F0-9]{24,}/g, "[REDACTED_API_KEY]");
+
+  // Mask database / redis connection credentials
+  clean = clean.replace(/:\/\/([^:@\s]+):([^@\s]+)@/g, "://$1:[REDACTED]@");
+
+  // Mask Bearer tokens
+  clean = clean.replace(/Bearer\s+[a-zA-Z0-9_\-\.=]+/gi, "Bearer [REDACTED]");
+
   // Mask key=value and query parameters
   clean = clean.replace(/(client_secret|clientSecret)=([^&\s"']+)/gi, "$1=[REDACTED]");
   clean = clean.replace(/(refresh_token|refreshToken)=([^&\s"']+)/gi, "$1=[REDACTED]");
   clean = clean.replace(/(access_token|accessToken)=([^&\s"']+)/gi, "$1=[REDACTED]");
+  clean = clean.replace(/(webhook_secret|webhookSecret|pubsubVerificationToken)=([^&\s"']+)/gi, "$1=[REDACTED]");
+  clean = clean.replace(/(signature|x-webhook-signature)=([^&\s"']+)/gi, "$1=[REDACTED]");
   clean = clean.replace(/(code)=([^&\s"']+)/gi, "$1=[REDACTED]");
   clean = clean.replace(/(apiKey|api_key)=([^&\s"']+)/gi, "$1=[REDACTED]");
   clean = clean.replace(/(password)=([^&\s"']+)/gi, "$1=[REDACTED]");
 
   return clean;
 }
+
 

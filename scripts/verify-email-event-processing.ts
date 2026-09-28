@@ -237,13 +237,15 @@ async function run() {
     eventType: "DELIVERED",
     recipient: "subscriber@example.com",
   });
+  const nowTs = Math.floor(Date.now() / 1000);
   const validSig = crypto
     .createHmac("sha256", tenantWebhookSecret)
-    .update(validWebhookPayload, "utf8")
+    .update(`${nowTs}.${validWebhookPayload}`, "utf8")
     .digest("hex");
 
   const headers = new Headers();
   headers.set("x-webhook-signature", validSig);
+  headers.set("x-webhook-timestamp", String(nowTs));
   const verifyRes = verifyHmacWebhookSignature(validWebhookPayload, headers, tenantWebhookSecret);
   assert(verifyRes.valid === true, "Webhook signature verified using tenant EmailProviderConfig secret");
 
