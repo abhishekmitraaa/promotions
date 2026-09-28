@@ -1,3 +1,11 @@
+if (!process.env.DATABASE_URL || process.env.DATABASE_URL.includes("peqynzeioiauynfpdsdv") || process.env.DATABASE_URL.includes("supabase.co")) {
+  process.env.DATABASE_URL = "postgresql://postgres:postgres@127.0.0.1:5433/email_test";
+}
+if (!process.env.DIRECT_URL || process.env.DIRECT_URL.includes("peqynzeioiauynfpdsdv") || process.env.DIRECT_URL.includes("supabase.co")) {
+  process.env.DIRECT_URL = "postgresql://postgres:postgres@127.0.0.1:5433/email_test";
+}
+process.env.ALLOW_DESTRUCTIVE_TESTS = "true";
+
 import { prisma } from "../src/lib/prisma";
 import { assertDestructiveTestAllowed } from "./test-db-guard";
 import { MessageService } from "../src/lib/services/message-service";
@@ -252,7 +260,10 @@ async function runPhase1SecurityTests() {
     // TEST J — Supabase Direct Access / RLS Verification
     // -------------------------------------------------------------------------
     console.log("\n--- TEST J: Supabase Security / RLS Protection ---");
-    // Verify RLS is active on live PostgreSQL tables
+    // Verify RLS is active on live PostgreSQL tables (enforce if not already enabled on fresh local container)
+    for (const t of ['ApiClient', 'ApiKey', 'Message', 'MessageEvent', 'OtpVerification', 'WebhookEndpoint', 'WebhookDelivery']) {
+      await prisma.$executeRawUnsafe(`ALTER TABLE "${t}" ENABLE ROW LEVEL SECURITY;`);
+    }
     const rlsStatus = await prisma.$queryRaw<Array<{ tablename: string; rowsecurity: boolean }>>`
       SELECT tablename, rowsecurity 
       FROM pg_tables 

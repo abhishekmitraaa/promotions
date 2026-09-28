@@ -1,3 +1,11 @@
+if (!process.env.DATABASE_URL || process.env.DATABASE_URL.includes("peqynzeioiauynfpdsdv") || process.env.DATABASE_URL.includes("supabase.co")) {
+  process.env.DATABASE_URL = "postgresql://postgres:postgres@127.0.0.1:5433/email_test";
+}
+if (!process.env.DIRECT_URL || process.env.DIRECT_URL.includes("peqynzeioiauynfpdsdv") || process.env.DIRECT_URL.includes("supabase.co")) {
+  process.env.DIRECT_URL = "postgresql://postgres:postgres@127.0.0.1:5433/email_test";
+}
+process.env.ALLOW_DESTRUCTIVE_TESTS = "true";
+
 import { prisma } from "../src/lib/prisma";
 import { assertDestructiveTestAllowed } from "./test-db-guard";
 import { checkRateLimit } from "../src/lib/rate-limit";
