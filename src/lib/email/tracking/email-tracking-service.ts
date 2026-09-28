@@ -5,8 +5,18 @@
  * - Never exposes recipient email addresses in tracking URLs.
  * - Open tracking uses cryptographic HMAC tokens and returns transparent 1x1 GIF pixels.
  * - Click tracking verifies destination authenticity from signed tokens, completely blocking open redirects.
- * - Documented analytics limitations: Opens are heuristic signals that may not perfectly reflect human interaction
- *   due to image caching, security crawler pre-fetching, and privacy proxies (e.g., Apple Mail Privacy Protection).
+ * - Inferred Delivery Semantics: For providers without explicit delivery confirmation webhooks (e.g. SMTP or Gmail API),
+ *   opens and clicks infer delivery (SENT -> DELIVERED). However, inferred delivery is subordinate to transport truth:
+ *   bounced or failed deliveries are NEVER promoted to DELIVERED, and bounces always take priority.
+ * - Documented Analytics Limitations:
+ *   1. Apple Mail Privacy Protection (MPP): Apple pre-fetches images via proxy servers asynchronously upon receipt,
+ *      generating synthetic open events without human interaction.
+ *   2. Image Caching: Mail providers (e.g. Gmail Image Proxy, Yahoo) cache images after initial fetch, so repeated
+ *      human opens may not generate additional HTTP requests to our server.
+ *   3. Bot / Security Scanners: Enterprise security filters (Proofpoint, Barracuda, Microsoft Defender, Mimecast)
+ *      automatically scan and pre-fetch links and pixels before delivery or quarantine.
+ *   4. Blocked Remote Images: Privacy-oriented mail clients (Thunderbird, Outlook desktop default) block external images,
+ *      causing human opens to be undetected unless images are explicitly enabled or a link is clicked.
  */
 
 import crypto from "crypto";
@@ -460,7 +470,11 @@ export class EmailTrackingService {
       },
     });
 
-    // An open event is authoritative proof of delivery: promote SENT -> DELIVERED
+    // Inferred Delivery Semantic (Documented Product Architecture):
+    // For providers without explicit delivery confirmation webhooks (e.g. SMTP or Gmail API),
+    // an open event serves as an inferred delivery signal (promoting SENT -> DELIVERED).
+    // It is NOT unquestionable proof of delivery (e.g. bot scanners can pre-fetch tracking pixels).
+    // It NEVER overwrites terminal failures (BOUNCED, FAILED, COMPLAINED).
     if (
       delivery.status === EmailDeliveryStatus.SENT ||
       delivery.status === EmailDeliveryStatus.PROCESSING ||
@@ -476,7 +490,11 @@ export class EmailTrackingService {
     }
 
     if (delivery.campaignRecipientId && delivery.campaignRecipient) {
-      if (delivery.campaignRecipient.status !== "DELIVERED") {
+      // Only promote recipient status if not already terminal (prevents overwriting BOUNCED or FAILED)
+      if (
+        delivery.campaignRecipient.status === "PENDING" ||
+        delivery.campaignRecipient.status === "SENT"
+      ) {
         await prisma.emailCampaignRecipient.update({
           where: { id: delivery.campaignRecipient.id },
           data: { status: "DELIVERED" },
@@ -540,7 +558,10 @@ export class EmailTrackingService {
       },
     });
 
-    // A click event is authoritative proof of delivery: promote SENT -> DELIVERED
+    // Inferred Delivery Semantic (Documented Product Architecture):
+    // For providers without explicit delivery confirmation webhooks (e.g. SMTP or Gmail API),
+    // a verified click event serves as an inferred delivery signal (promoting SENT -> DELIVERED).
+    // It NEVER overwrites terminal failures (BOUNCED, FAILED, COMPLAINED).
     if (
       delivery.status === EmailDeliveryStatus.SENT ||
       delivery.status === EmailDeliveryStatus.PROCESSING ||
@@ -556,7 +577,11 @@ export class EmailTrackingService {
     }
 
     if (delivery.campaignRecipientId && delivery.campaignRecipient) {
-      if (delivery.campaignRecipient.status !== "DELIVERED") {
+      // Only promote recipient status if not already terminal (prevents overwriting BOUNCED or FAILED)
+      if (
+        delivery.campaignRecipient.status === "PENDING" ||
+        delivery.campaignRecipient.status === "SENT"
+      ) {
         await prisma.emailCampaignRecipient.update({
           where: { id: delivery.campaignRecipient.id },
           data: { status: "DELIVERED" },

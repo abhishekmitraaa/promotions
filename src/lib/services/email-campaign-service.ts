@@ -27,6 +27,7 @@ import {
   EmailType,
   EmailTemplateVersion,
 } from "@prisma/client";
+import { computeAuthoritativeRates } from "./email-analytics-service";
 
 const VALID_TRANSITIONS: Record<EmailCampaignStatus, EmailCampaignStatus[]> = {
   [EmailCampaignStatus.DRAFT]: [
@@ -813,11 +814,18 @@ export class EmailCampaignService {
         if (recipientClicked) uniqueClicks++;
       }
 
-      const delivered = Math.max(camp.deliveredCount, uniqueOpens);
-      const openRate =
-        delivered > 0 ? Math.round((uniqueOpens / delivered) * 10000) / 100 : 0;
-      const clickRate =
-        delivered > 0 ? Math.round((uniqueClicks / delivered) * 10000) / 100 : 0;
+      const delivered = Math.max(camp.deliveredCount, uniqueOpens, uniqueClicks);
+      const sent = Math.max(camp.sentCount, delivered);
+
+      const rates = computeAuthoritativeRates({
+        sent,
+        delivered,
+        bounced: camp.bouncedCount,
+        complaints: camp.complaintCount,
+        unsubscribed: camp.unsubscribedCount,
+        uniqueOpens,
+        uniqueClicks,
+      });
 
       const rest = { ...camp };
       delete (rest as { recipients?: unknown }).recipients;
@@ -825,8 +833,8 @@ export class EmailCampaignService {
         ...rest,
         uniqueOpens,
         uniqueClicks,
-        openRate,
-        clickRate,
+        openRate: rates.openRate,
+        clickRate: rates.clickRate,
       };
     });
   }

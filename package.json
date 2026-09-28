@@ -32,6 +32,7 @@
     "test:email:events": "tsx scripts/verify-email-event-processing.ts",
     "test:email:tracking": "tsx scripts/verify-email-tracking-pipeline.ts",
     "test:email:webhooks": "tsx scripts/verify-email-webhook-security.ts",
+    "test:email:analytics": "tsx scripts/verify-email-analytics.ts",
     "test:email-phase2": "tsx scripts/verify-email-phase2.ts",
     "test:email-phase3": "tsx scripts/verify-email-phase3.ts",
     "test:email-phase4": "tsx scripts/verify-email-phase4.ts",

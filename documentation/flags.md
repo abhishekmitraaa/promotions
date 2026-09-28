@@ -674,6 +674,32 @@
 - **Unresolved Concerns**: None.
 - **Mitigation / Next Steps**: All email webhook endpoints are hardened against hostile attacks, replay, SSRF, state tampering, and secret leakage.
 
+### Entry: 2026-09-28 — Email Analytics System Audit & Authoritative Semantics
+- **Prompt / Phase**: Email Analytics System Audit & Hardening (Lifecycle Concept Separation, Inferred Delivery Semantics, Rate Invariants, Duplicate Defense, Technical Limitations Documentation)
+- **Status**: ✅ Clean (No unresolved concerns)
+- **Unresolved Concerns**: None.
+- **Notes / Observations**:
+  1. **Lifecycle Concept Separation**:
+     - Formally distinguished 8 core lifecycle concepts: Provider Accepted, Sent, Delivered, Bounced, Complaint, Open, Click, Unsubscribe.
+     - Documented the architecture in `docs/email-analytics-architecture.md`.
+  2. **Inferred Delivery Semantics & Transport Precedence**:
+     - Documented product semantics for providers without explicit delivery confirmation webhooks (e.g. SMTP or Gmail API): opens and clicks serve as inferred delivery signals (`SENT -> DELIVERED`).
+     - Hardened `EmailTrackingService.recordOpen` and `recordClick` so that inferred delivery NEVER mutates deliveries or recipients with terminal status (`BOUNCED`, `FAILED`, `COMPLAINED`).
+     - In `EmailAnalyticsService`, resolved delivery disposition so that `BOUNCED` and `FAILED` terminal states take absolute precedence over engagement. Fixed a critical flaw where `else if (recipientBounced)` was previously skipped when `recipientOpened` was true, which had masked bounces.
+  3. **Preservation of Historical Event Ledger**:
+     - All interactions (`OPENED`, `CLICKED`, `BOUNCED`, `COMPLAINT`, `DELIVERED`, `UNSUBSCRIBED`) are immutably persisted in `EmailEvent` with timestamp, client IP, user agent, payload, and status.
+  4. **Authoritative Metric & Rate Safeguards**:
+     - Implemented `computeAuthoritativeRates(metrics)` shared across `EmailAnalyticsService.getCampaignAnalytics`, `EmailAnalyticsService.getTenantAnalytics`, and `EmailCampaignService.listCampaigns`.
+     - Zero-division defense: denominators $\le 0$ return `0.0`.
+     - Impossible percentage defense: clamped to `[0.0, 100.0]`, preventing rates $> 100\%$ from scanner opens on unconfirmed deliveries.
+     - NaN/Infinity protection and 2 decimal place rounding.
+  5. **Inflation & Multi-Tenant Defenses**:
+     - Prevented duplicate event inflation via recipient-level uniqueness (`uniqueOpens`, `uniqueClicks`).
+     - Prevented duplicate recipient inflation from delivery retries.
+     - Enforced strict multi-tenant isolation on all database queries via `clientId`.
+  6. **Documented Technical Limitations**:
+     - Documented Apple Mail Privacy Protection (MPP), edge image caching (Gmail Proxy, Yahoo), automated security crawlers (Proofpoint, Barracuda, Defender), and blocked remote images in `docs/email-analytics-architecture.md` and code docstrings.
+
 ---
 
 ## Flag Template for Subsequent Prompts
