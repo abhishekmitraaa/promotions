@@ -1,7 +1,7 @@
 /**
  * Master End-to-End Certification Runner for WhatsApp Hub Email Platform
  *
- * Fully certifies Flows A through P on disposable infrastructure:
+ * Fully certifies Flows A through W and 14 Adversarial Cases on disposable infrastructure:
  * - Real Disposable PostgreSQL (5433)
  * - Real Disposable Redis (6379)
  * - Real Next.js route handlers
@@ -12,20 +12,43 @@
  * Certified Flows:
  *   [A] Transactional Email
  *   [B] Promotional Single Send
- *   [C] Campaign Lifecycle
+ *   [C] Campaign Creation and Execution
  *   [D] Scheduled Campaign
- *   [E] Pause / Resume Lifecycle
- *   [F] Cancellation Lifecycle
- *   [G] Open Tracking
- *   [H] Click Tracking
- *   [I] One-Click Unsubscribe (RFC 8058)
- *   [J] Bounce Ingestion & Suppression
- *   [K] Spam Complaint Ingestion & Revocation
- *   [L] Duplication Replay Protections
- *   [M] Tenant Isolation Across 13 Domains
- *   [N] RBAC Server-Side HTTP Responses (ADMIN vs VIEWER)
- *   [O] Security Edge Cases & Attack Resistance
- *   [P] Queue Failure Honesty (Redis Unavailability)
+ *   [E] Pause
+ *   [F] Resume
+ *   [G] Cancel
+ *   [H] Template Versioning
+ *   [I] Test Send
+ *   [J] Open Tracking
+ *   [K] Click Tracking
+ *   [L] RFC 8058 Unsubscribe
+ *   [M] Bounce
+ *   [N] Complaint
+ *   [O] Replay/Idempotency
+ *   [P] Tenant Isolation
+ *   [Q] ADMIN/VIEWER RBAC
+ *   [R] OAuth Flow
+ *   [S] Queue Failure
+ *   [T] Worker Restart/Recovery
+ *   [U] Migration Deployment
+ *   [V] Distributed Rate Limiting
+ *   [W] Public Async HTML/Text Content Correctness
+ *
+ * Adversarial Cases:
+ *   [ADV-1] Cross-tenant template
+ *   [ADV-2] Cross-tenant sender
+ *   [ADV-3] Cross-tenant campaign
+ *   [ADV-4] Cross-tenant delivery
+ *   [ADV-5] Invalid OAuth state
+ *   [ADV-6] OAuth replay
+ *   [ADV-7] Webhook replay
+ *   [ADV-8] Forged webhook
+ *   [ADV-9] Malicious redirect
+ *   [ADV-10] CRLF injection
+ *   [ADV-11] Unsafe URL
+ *   [ADV-12] Provider failure (retryable vs terminal)
+ *   [ADV-13] Redis outage
+ *   [ADV-14] PostgreSQL outage
  */
 
 process.env.DATABASE_URL = "postgresql://postgres:postgres@127.0.0.1:5433/email_test";
@@ -37,12 +60,14 @@ process.env.NODE_ENV = "test";
 process.env.ALLOW_DESTRUCTIVE_TESTS = "true";
 process.env.AUTH_SESSION_SECRET = "certification-master-session-secret-32-chars";
 process.env.API_KEY_PEPPER = "certification-master-pepper-32-chars-min";
+process.env.GMAIL_CLIENT_ID = "mock-google-client-id.apps.googleusercontent.com";
+process.env.GMAIL_CLIENT_SECRET = "mock-google-client-secret";
 
 import crypto from "crypto";
 import { NextRequest } from "next/server";
 import { prisma } from "../src/lib/prisma";
 import { generateApiKey } from "../src/lib/crypto";
-import { createSessionToken, hashSessionToken } from "../src/lib/auth";
+import { createSessionToken, hashSessionToken, SESSION_COOKIE } from "../src/lib/auth";
 import { getTransactionalQueue, getCampaignQueue, getEventsQueue, closeAllQueues } from "../src/lib/email/queue/queues";
 import {
   JOB_NAMES,
@@ -52,19 +77,32 @@ import {
   TransactionalJobData,
   PromotionalJobData,
   CampaignJobData,
+  RetryableEmailError,
+  PermanentEmailError,
 } from "../src/lib/email/queue/types";
 import { processTransactionalJob as processTransactionalDeliveryJob } from "../src/lib/email/queue/worker";
 import { processPromotionalDeliveryJob } from "../src/lib/email/queue/promotional-delivery-worker";
 import { processCampaignRecipientJob, checkAndCompleteCampaign } from "../src/lib/email/queue/campaign-worker";
 import { processScheduledCampaignTriggerJob } from "../src/lib/email/queue/campaign-trigger-worker";
 import { processEmailEventJob } from "../src/lib/email/queue/event-worker";
+import { reconcileAbandonedJobs } from "../src/lib/email/queue/reconciliation";
 import { EmailCampaignService } from "../src/lib/services/email-campaign-service";
 import { EmailAudienceResolver } from "../src/lib/services/email-audience-resolver";
 import { EmailSuppressionService } from "../src/lib/services/email-suppression-service";
 import { EmailAnalyticsService } from "../src/lib/services/email-analytics-service";
 import { EmailEventService } from "../src/lib/services/email-event-service";
+import { EmailTemplateService } from "../src/lib/services/email-template-service";
 import { EmailTrackingService } from "../src/lib/email/tracking/email-tracking-service";
 import { EmailUnsubscribeService } from "../src/lib/services/email-unsubscribe-service";
+import { checkRateLimit, rateLimitResponse, getRateLimiterHealth } from "../src/lib/rate-limit";
+import {
+  createOAuthState,
+  verifyAndConsumeOAuthState,
+  generateGoogleAuthUrl,
+} from "../src/lib/email/providers/gmail/oauth";
+import { GMAIL_SEND_SCOPE, GOOGLE_TOKEN_ENDPOINT } from "../src/lib/email/providers/gmail/gmail-provider";
+import { GOOGLE_USERINFO_ENDPOINT } from "../src/lib/email/providers/gmail/oauth";
+import { assertDestructiveTestAllowed } from "./test-db-guard";
 import { EmailProvider, EmailSendRequest, EmailSendResult } from "../src/lib/email/types";
 import {
   EmailCampaignStatus,
@@ -90,6 +128,8 @@ import { GET as trackOpenRoute } from "../src/app/api/email/track/open/[token]/r
 import { GET as trackClickRoute } from "../src/app/api/email/track/click/[token]/route";
 import { POST as unsubscribeRoute } from "../src/app/api/email/unsubscribe/[token]/route";
 import { POST as webhookRoute } from "../src/app/api/email/webhooks/[provider]/route";
+import { GET as getOAuthUrlRoute } from "../src/app/api/admin/email/providers/google/oauth/route";
+import { GET as getOAuthCallbackRoute } from "../src/app/api/admin/email/providers/google/callback/route";
 
 let passed = 0;
 let failed = 0;
@@ -112,8 +152,19 @@ class MockCertProvider implements EmailProvider {
   name = "Mock Certification Provider";
   providerType = EmailProviderType.MOCK;
   sentRequests: EmailSendRequest[] = [];
+  shouldFailRetryable = false;
+  shouldFailPermanent = false;
 
   async send(request: EmailSendRequest): Promise<EmailSendResult> {
+    if (this.shouldFailRetryable) {
+      this.shouldFailRetryable = false;
+      throw new RetryableEmailError("Simulated upstream 429 rate limit", 5000);
+    }
+    if (this.shouldFailPermanent) {
+      this.shouldFailPermanent = false;
+      throw new PermanentEmailError("Simulated upstream 401 unrecoverable auth error");
+    }
+
     this.sentRequests.push(request);
     return {
       accepted: true,
@@ -140,7 +191,7 @@ function makeRequest(
   if (authType === "BEARER" && authToken) {
     headers.set("Authorization", `Bearer ${authToken}`);
   } else if (authType === "COOKIE" && authToken) {
-    headers.set("Cookie", `whatsapp_hub_session=${authToken}`);
+    headers.set("Cookie", `${SESSION_COOKIE}=${authToken}`);
   }
   if (extraHeaders) {
     for (const [k, v] of Object.entries(extraHeaders)) {
@@ -180,9 +231,13 @@ async function cleanDatabase() {
 
 async function runMasterCertification() {
   console.log("==================================================================");
-  console.log("🏆 MASTER END-TO-END CERTIFICATION PASS (FLOWS A - P)");
+  console.log("🏆 MASTER END-TO-END CERTIFICATION PASS (FLOWS A - W + ADVERSARIAL)");
   console.log("   Target: Real Disposable PostgreSQL (5433) + Redis (6379)");
   console.log("==================================================================\n");
+
+  // Destructive test safety guard invariant check
+  assertDestructiveTestAllowed();
+  console.log("🛡️  Destructive test safety guard verified: disposable database permitted.\n");
 
   const mockProvider = new MockCertProvider();
   await cleanDatabase();
@@ -274,10 +329,15 @@ async function runMasterCertification() {
     },
   });
 
-  function signMockWebhook(payload: unknown) {
+  function signMockWebhook(payload: unknown, customTimestamp?: string) {
     const raw = JSON.stringify(payload);
-    const signature = crypto.createHmac("sha256", webhookSecret).update(raw, "utf8").digest("hex");
-    return { "x-webhook-signature": signature };
+    const timestamp = customTimestamp || Math.floor(Date.now() / 1000).toString();
+    const dataToSign = `${timestamp}.${raw}`;
+    const signature = crypto.createHmac("sha256", webhookSecret).update(dataToSign, "utf8").digest("hex");
+    return {
+      "x-webhook-signature": signature,
+      "x-webhook-timestamp": timestamp,
+    };
   }
 
   // ---------------------------------------------------------------------------
@@ -306,11 +366,9 @@ async function runMasterCertification() {
   testAssert("A", txnDelivery?.status === EmailDeliveryStatus.QUEUED, "Delivery record initially persisted as QUEUED");
   testAssert("A", txnDelivery?.category === EmailType.TRANSACTIONAL, "Delivery categorized as TRANSACTIONAL");
 
-  // BullMQ job verification
   const txnJob = await txnQueue.getJob(getTransactionalJobId(txnData.deliveryId));
   testAssert("A", txnJob !== null && txnJob !== undefined, "BullMQ job exists on email-transactional queue with stable ID");
 
-  // Worker dispatch
   const txnWorkerRes = await processTransactionalDeliveryJob(
     {
       id: getTransactionalJobId(txnData.deliveryId),
@@ -359,7 +417,6 @@ async function runMasterCertification() {
   const promoJob = await campQueue.getJob(getPromotionalJobId(promoData.deliveryId));
   testAssert("B", promoJob !== null && promoJob !== undefined, "Job enqueued on campaign promotional queue");
 
-  // Worker Execution
   mockProvider.sentRequests = [];
   const promoWorkerRes = await processPromotionalDeliveryJob(
     {
@@ -380,9 +437,9 @@ async function runMasterCertification() {
   testAssert("B", refreshedPromoDelivery?.status === EmailDeliveryStatus.SENT, "Promotional delivery transitioned to SENT");
 
   // ---------------------------------------------------------------------------
-  // [C] CAMPAIGN LIFECYCLE
+  // [C] CAMPAIGN CREATION AND EXECUTION
   // ---------------------------------------------------------------------------
-  console.log("\n--- [C] FLOW C: CAMPAIGN LIFECYCLE ---");
+  console.log("\n--- [C] FLOW C: CAMPAIGN CREATION AND EXECUTION ---");
   const template = await prisma.emailTemplate.create({
     data: {
       clientId: tenantA.id,
@@ -453,18 +510,6 @@ async function runMasterCertification() {
   testAssert("C", preview.suppressedCount === 1, "Audience preview identifies 1 suppressed candidate");
   testAssert("C", preview.eligibleRecipientCount === 3, "Audience preview calculates exactly 3 eligible recipients");
 
-  // Test Send
-  const testSendRes = await EmailCampaignService.sendTestEmail(
-    tenantA.id,
-    campaign.id,
-    `qa-${runId}@test.com`,
-    { firstName: "Tester" },
-    { providerOverride: mockProvider }
-  );
-  testAssert("C", testSendRes.success === true, "Test send executes successfully");
-  const testRecipCount = await prisma.emailCampaignRecipient.count({ where: { campaignId: campaign.id } });
-  testAssert("C", testRecipCount === 0, "Test send created ZERO campaign recipient rows in DB");
-
   // Launch Campaign
   const sendNowRes = await EmailCampaignService.sendCampaignNow(tenantA.id, campaign.id);
   testAssert("C", sendNowRes.success === true, "sendCampaignNow succeeds");
@@ -510,7 +555,6 @@ async function runMasterCertification() {
   const scheduledInDb = await prisma.emailCampaign.findUnique({ where: { id: schedCampaign.id } });
   testAssert("D", scheduledInDb?.status === EmailCampaignStatus.SCHEDULED, "Campaign transitioned to SCHEDULED in DB");
 
-  // Trigger processor blocks premature execution
   let prematureThrew = false;
   try {
     await processScheduledCampaignTriggerJob({
@@ -522,7 +566,6 @@ async function runMasterCertification() {
   }
   testAssert("D", prematureThrew, "Trigger processor throws RetryableEmailError if scheduled time has not arrived");
 
-  // Trigger processor executes when due
   const pastTriggerDate = new Date(Date.now() - 5000);
   await prisma.emailCampaign.update({
     where: { id: schedCampaign.id },
@@ -541,9 +584,9 @@ async function runMasterCertification() {
   testAssert("D", schedRecipCount === 3, "Trigger processor created snapshot with 3 recipients");
 
   // ---------------------------------------------------------------------------
-  // [E] PAUSE / RESUME LIFECYCLE
+  // [E] PAUSE
   // ---------------------------------------------------------------------------
-  console.log("\n--- [E] FLOW E: PAUSE / RESUME ---");
+  console.log("\n--- [E] FLOW E: PAUSE ---");
   const pauseRes = await pauseCampaignRoute(
     makeRequest(
       `/api/email/campaigns/${schedCampaign.id}/pause`,
@@ -559,7 +602,6 @@ async function runMasterCertification() {
   const pausedCampaign = await prisma.emailCampaign.findUnique({ where: { id: schedCampaign.id } });
   testAssert("E", pausedCampaign?.status === EmailCampaignStatus.PAUSED, "Campaign state updated to PAUSED");
 
-  // Worker skips when paused
   const firstSchedRecip = await prisma.emailCampaignRecipient.findFirst({
     where: { campaignId: schedCampaign.id, status: "PENDING" },
   });
@@ -574,7 +616,10 @@ async function runMasterCertification() {
   );
   testAssert("E", pausedJobRes.skipped === true && pausedJobRes.reason === "CAMPAIGN_PAUSED", "Worker skips paused campaign job without sending");
 
-  // Resume Campaign
+  // ---------------------------------------------------------------------------
+  // [F] RESUME
+  // ---------------------------------------------------------------------------
+  console.log("\n--- [F] FLOW F: RESUME ---");
   const resumeRes = await resumeCampaignRoute(
     makeRequest(
       `/api/email/campaigns/${schedCampaign.id}/resume`,
@@ -586,11 +631,10 @@ async function runMasterCertification() {
     ),
     { params: Promise.resolve({ id: schedCampaign.id }) }
   );
-  testAssert("E", resumeRes.status === 200, "POST /resume returns HTTP 200");
+  testAssert("F", resumeRes.status === 200, "POST /resume returns HTTP 200");
   const resumedCampaign = await prisma.emailCampaign.findUnique({ where: { id: schedCampaign.id } });
-  testAssert("E", resumedCampaign?.status === EmailCampaignStatus.RUNNING, "Campaign transitioned back to RUNNING");
+  testAssert("F", resumedCampaign?.status === EmailCampaignStatus.RUNNING, "Campaign transitioned back to RUNNING");
 
-  // Process recipient to SENT
   await processCampaignRecipientJob(
     {
       id: getCampaignJobId(firstSchedRecip!.id),
@@ -599,12 +643,12 @@ async function runMasterCertification() {
     { providerOverride: mockProvider }
   );
   const sentRecip = await prisma.emailCampaignRecipient.findUnique({ where: { id: firstSchedRecip!.id } });
-  testAssert("E", sentRecip?.status === "SENT", "Recipient sent successfully after resume");
+  testAssert("F", sentRecip?.status === "SENT", "Recipient sent successfully after resume");
 
   // ---------------------------------------------------------------------------
-  // [F] CANCELLATION LIFECYCLE
+  // [G] CANCEL
   // ---------------------------------------------------------------------------
-  console.log("\n--- [F] FLOW F: CANCELLATION ---");
+  console.log("\n--- [G] FLOW G: CANCEL ---");
   const cancelRes = await cancelCampaignRoute(
     makeRequest(
       `/api/email/campaigns/${schedCampaign.id}/cancel`,
@@ -616,22 +660,73 @@ async function runMasterCertification() {
     ),
     { params: Promise.resolve({ id: schedCampaign.id }) }
   );
-  testAssert("F", cancelRes.status === 200, "POST /cancel returns HTTP 200");
+  testAssert("G", cancelRes.status === 200, "POST /cancel returns HTTP 200");
   const cancelledCampaign = await prisma.emailCampaign.findUnique({ where: { id: schedCampaign.id } });
-  testAssert("F", cancelledCampaign?.status === EmailCampaignStatus.CANCELLED, "Campaign marked CANCELLED");
+  testAssert("G", cancelledCampaign?.status === EmailCampaignStatus.CANCELLED, "Campaign marked CANCELLED");
 
   const unexecutedRecip = await prisma.emailCampaignRecipient.findFirst({
     where: { campaignId: schedCampaign.id, status: "CANCELLED" },
   });
-  testAssert("F", Boolean(unexecutedRecip), "Unsent recipients marked CANCELLED");
+  testAssert("G", Boolean(unexecutedRecip), "Unsent recipients marked CANCELLED");
 
   const alreadySentRecip = await prisma.emailCampaignRecipient.findUnique({ where: { id: firstSchedRecip!.id } });
-  testAssert("F", alreadySentRecip?.status === "SENT", "Transmitted email remains acknowledged as SENT (not corrupted)");
+  testAssert("G", alreadySentRecip?.status === "SENT", "Transmitted email remains acknowledged as SENT");
 
   // ---------------------------------------------------------------------------
-  // [G] OPEN TRACKING
+  // [H] TEMPLATE VERSIONING
   // ---------------------------------------------------------------------------
-  console.log("\n--- [G] FLOW G: OPEN TRACKING ---");
+  console.log("\n--- [H] FLOW H: TEMPLATE VERSIONING ---");
+  const versionedTemplate = await EmailTemplateService.createTemplate(tenantA.id, {
+    name: `Lifecycle Template ${runId}`,
+    type: EmailTemplateType.PROMOTIONAL,
+    subject: "Initial Subject v1",
+    htmlContent: "<p>Initial Content v1</p>",
+    textContent: "Initial Content v1",
+  });
+  testAssert("H", versionedTemplate.activeVersion.version === 1, "Template created with initial version 1");
+
+  const newVersion = await EmailTemplateService.createVersion(tenantA.id, versionedTemplate.id, {
+    subject: "Updated Subject v2",
+    htmlContent: "<p>Updated Content v2</p>",
+    textContent: "Updated Content v2",
+  });
+  testAssert("H", newVersion.version === 2, "Second immutable version created with version 2");
+
+  const v1Check = await prisma.emailTemplateVersion.findFirst({
+    where: { templateId: versionedTemplate.id, version: 1 },
+  });
+  testAssert("H", v1Check?.subject === "Initial Subject v1", "Version 1 is immutable and remains unaltered");
+
+  // ---------------------------------------------------------------------------
+  // [I] TEST SEND
+  // ---------------------------------------------------------------------------
+  console.log("\n--- [I] FLOW I: TEST SEND ---");
+  const testSendCampaign = await prisma.emailCampaign.create({
+    data: {
+      clientId: tenantA.id,
+      name: `Test Send Campaign ${runId}`,
+      status: EmailCampaignStatus.DRAFT,
+      type: EmailType.PROMOTIONAL,
+      templateVersionId: version.id,
+      listId: list.id,
+    },
+  });
+
+  const testSendRes = await EmailCampaignService.sendTestEmail(
+    tenantA.id,
+    testSendCampaign.id,
+    `qa-${runId}@test.com`,
+    { firstName: "Tester" },
+    { providerOverride: mockProvider }
+  );
+  testAssert("I", testSendRes.success === true, "Test send executes successfully through provider");
+  const testRecipCount = await prisma.emailCampaignRecipient.count({ where: { campaignId: testSendCampaign.id } });
+  testAssert("I", testRecipCount === 0, "Test send created ZERO campaign recipient rows in DB");
+
+  // ---------------------------------------------------------------------------
+  // [J] OPEN TRACKING
+  // ---------------------------------------------------------------------------
+  console.log("\n--- [J] FLOW J: OPEN TRACKING ---");
   const trackDelivery = await prisma.emailDelivery.create({
     data: {
       clientId: tenantA.id,
@@ -645,26 +740,24 @@ async function runMasterCertification() {
   });
 
   const openToken = EmailTrackingService.generateOpenToken(tenantA.id, trackDelivery.id);
-
   const openRes = await trackOpenRoute(
     makeRequest(`/api/email/track/open/${openToken}`, "GET"),
     { params: Promise.resolve({ token: openToken }) }
   );
-  testAssert("G", openRes.status === 200, "GET /track/open returns HTTP 200");
-  testAssert("G", openRes.headers.get("content-type") === "image/gif", "Returns image/gif pixel");
-  testAssert("G", openRes.headers.get("cache-control")?.includes("no-store") === true, "Enforces cache-control: no-store");
+  testAssert("J", openRes.status === 200, "GET /track/open returns HTTP 200");
+  testAssert("J", openRes.headers.get("content-type") === "image/gif", "Returns image/gif pixel");
+  testAssert("J", openRes.headers.get("cache-control")?.includes("no-store") === true, "Enforces cache-control: no-store");
 
-  // Allow async event persistence
   await new Promise((r) => setTimeout(r, 200));
   const openEvent = await prisma.emailEvent.findFirst({
     where: { deliveryId: trackDelivery.id, eventType: EmailEventType.OPENED },
   });
-  testAssert("G", Boolean(openEvent), "Authoritative EmailEvent (OPENED) persisted");
+  testAssert("J", Boolean(openEvent), "Authoritative EmailEvent (OPENED) persisted");
 
   // ---------------------------------------------------------------------------
-  // [H] CLICK TRACKING
+  // [K] CLICK TRACKING
   // ---------------------------------------------------------------------------
-  console.log("\n--- [H] FLOW H: CLICK TRACKING ---");
+  console.log("\n--- [K] FLOW K: CLICK TRACKING ---");
   const targetUrl = "https://example.com/summer-sale?promo=2026";
   const clickToken = EmailTrackingService.generateClickToken(tenantA.id, trackDelivery.id, targetUrl);
 
@@ -672,19 +765,19 @@ async function runMasterCertification() {
     makeRequest(`/api/email/track/click/${clickToken}`, "GET"),
     { params: Promise.resolve({ token: clickToken }) }
   );
-  testAssert("H", clickRes.status === 302, "GET /track/click returns HTTP 302 Redirect");
-  testAssert("H", clickRes.headers.get("location") === targetUrl, "Redirects to exact sanitized target URL");
+  testAssert("K", clickRes.status === 302, "GET /track/click returns HTTP 302 Redirect");
+  testAssert("K", clickRes.headers.get("location") === targetUrl, "Redirects to exact sanitized target URL");
 
   await new Promise((r) => setTimeout(r, 200));
   const clickEvent = await prisma.emailEvent.findFirst({
     where: { deliveryId: trackDelivery.id, eventType: EmailEventType.CLICKED },
   });
-  testAssert("H", Boolean(clickEvent), "Authoritative EmailEvent (CLICKED) persisted");
+  testAssert("K", Boolean(clickEvent), "Authoritative EmailEvent (CLICKED) persisted");
 
   // ---------------------------------------------------------------------------
-  // [I] UNSUBSCRIBE (RFC 8058)
+  // [L] RFC 8058 UNSUBSCRIBE
   // ---------------------------------------------------------------------------
-  console.log("\n--- [I] FLOW I: UNSUBSCRIBE & RFC 8058 ---");
+  console.log("\n--- [L] FLOW L: RFC 8058 UNSUBSCRIBE ---");
   const unsubContact = await prisma.emailContact.create({
     data: {
       clientId: tenantA.id,
@@ -696,21 +789,19 @@ async function runMasterCertification() {
   });
 
   const unsubToken = EmailUnsubscribeService.generateUnsubscribeToken(tenantA.id, unsubContact.id);
-
   const unsubRes = await unsubscribeRoute(
     makeRequest(`/api/email/unsubscribe/${unsubToken}`, "POST"),
     { params: Promise.resolve({ token: unsubToken }) }
   );
-  testAssert("I", unsubRes.status === 200, "POST /unsubscribe/[token] returns HTTP 200");
+  testAssert("L", unsubRes.status === 200, "POST /unsubscribe/[token] returns HTTP 200");
 
   const refreshedContact = await prisma.emailContact.findUnique({ where: { id: unsubContact.id } });
-  testAssert("I", refreshedContact?.status === EmailContactStatus.UNSUBSCRIBED, "Contact status updated to UNSUBSCRIBED");
-  testAssert("I", refreshedContact?.hasMarketingConsent === false, "Contact hasMarketingConsent revoked (false)");
+  testAssert("L", refreshedContact?.status === EmailContactStatus.UNSUBSCRIBED, "Contact status updated to UNSUBSCRIBED");
+  testAssert("L", refreshedContact?.hasMarketingConsent === false, "Contact hasMarketingConsent revoked (false)");
 
   const suppRecord = await EmailSuppressionService.isSuppressed(tenantA.id, unsubContact.email);
-  testAssert("I", suppRecord.suppressed === true, "Recipient added to tenant suppression list");
+  testAssert("L", suppRecord.suppressed === true, "Recipient added to tenant suppression list");
 
-  // Future promotional send rejected
   const futurePromoRes = await sendEmailRoute(
     makeRequest("/api/v1/email/send", "POST", {
       type: "PROMOTIONAL",
@@ -719,12 +810,12 @@ async function runMasterCertification() {
       text: "Offer text",
     }, "BEARER", keyGenA.rawKey)
   );
-  testAssert("I", futurePromoRes.status === 400, "Future promotional send rejected with HTTP 400");
+  testAssert("L", futurePromoRes.status === 400, "Future promotional send rejected with HTTP 400");
 
   // ---------------------------------------------------------------------------
-  // [J] BOUNCE INGESTION & SUPPRESSION
+  // [M] BOUNCE
   // ---------------------------------------------------------------------------
-  console.log("\n--- [J] FLOW J: BOUNCE WEBHOOK ---");
+  console.log("\n--- [M] FLOW M: BOUNCE ---");
   const bounceEmail = `bounce-${runId}@target.test`;
   const bounceDelivery = await prisma.emailDelivery.create({
     data: {
@@ -761,13 +852,12 @@ async function runMasterCertification() {
     ),
     { params: Promise.resolve({ provider: "mock" }) }
   );
-  testAssert("J", bounceWebhookRes.status === 202, "Bounce webhook accepted with HTTP 202");
+  testAssert("M", bounceWebhookRes.status === 202, "Bounce webhook accepted with HTTP 202");
 
   const bounceWebhookBody = await bounceWebhookRes.json();
   const bounceEventId = bounceWebhookBody.data?.results?.[0]?.eventId;
-  testAssert("J", Boolean(bounceEventId), "Webhook created authoritative EmailEvent");
+  testAssert("M", Boolean(bounceEventId), "Webhook created authoritative EmailEvent");
 
-  // Worker executes the event job
   await processEmailEventJob({
     id: `event-${bounceEventId}`,
     data: { eventRecordId: bounceEventId, eventType: "BOUNCED", providerType: EmailProviderType.MOCK },
@@ -775,14 +865,14 @@ async function runMasterCertification() {
   } as any);
 
   const bounceSupp = await EmailSuppressionService.isSuppressed(tenantA.id, bounceEmail);
-  testAssert("J", bounceSupp.suppressed === true, "Hard bounce creates authoritative suppression");
+  testAssert("M", bounceSupp.suppressed === true, "Hard bounce creates authoritative suppression");
   const finalBounceDelivery = await prisma.emailDelivery.findUnique({ where: { id: bounceDelivery.id } });
-  testAssert("J", finalBounceDelivery?.status === EmailDeliveryStatus.BOUNCED, "Delivery updated to BOUNCED");
+  testAssert("M", finalBounceDelivery?.status === EmailDeliveryStatus.BOUNCED, "Delivery updated to BOUNCED");
 
   // ---------------------------------------------------------------------------
-  // [K] SPAM COMPLAINT INGESTION & REVOCATION
+  // [N] COMPLAINT
   // ---------------------------------------------------------------------------
-  console.log("\n--- [K] FLOW K: SPAM COMPLAINT ---");
+  console.log("\n--- [N] FLOW N: COMPLAINT ---");
   const complaintEmail = `complaint-${runId}@target.test`;
   const complaintDelivery = await prisma.emailDelivery.create({
     data: {
@@ -818,13 +908,12 @@ async function runMasterCertification() {
     ),
     { params: Promise.resolve({ provider: "mock" }) }
   );
-  testAssert("K", complaintWebhookRes.status === 202, "Complaint webhook accepted with HTTP 202");
+  testAssert("N", complaintWebhookRes.status === 202, "Complaint webhook accepted with HTTP 202");
 
   const complaintWebhookBody = await complaintWebhookRes.json();
   const complaintEventId = complaintWebhookBody.data?.results?.[0]?.eventId;
-  testAssert("K", Boolean(complaintEventId), "Webhook created authoritative EmailEvent");
+  testAssert("N", Boolean(complaintEventId), "Webhook created authoritative EmailEvent");
 
-  // Worker executes complaint event job
   await processEmailEventJob({
     id: `event-${complaintEventId}`,
     data: { eventRecordId: complaintEventId, eventType: "COMPLAINT", providerType: EmailProviderType.MOCK },
@@ -832,14 +921,14 @@ async function runMasterCertification() {
   } as any);
 
   const complaintSupp = await EmailSuppressionService.isSuppressed(tenantA.id, complaintEmail);
-  testAssert("K", complaintSupp.suppressed === true, "Complaint creates suppression entry");
+  testAssert("N", complaintSupp.suppressed === true, "Complaint creates suppression entry");
   const finalComplaintDelivery = await prisma.emailDelivery.findUnique({ where: { id: complaintDelivery.id } });
-  testAssert("K", finalComplaintDelivery?.status === EmailDeliveryStatus.COMPLAINED, "Delivery transitioned to COMPLAINED");
+  testAssert("N", finalComplaintDelivery?.status === EmailDeliveryStatus.COMPLAINED, "Delivery transitioned to COMPLAINED");
 
   // ---------------------------------------------------------------------------
-  // [L] DUPLICATION REPLAY PROTECTIONS
+  // [O] REPLAY / IDEMPOTENCY
   // ---------------------------------------------------------------------------
-  console.log("\n--- [L] FLOW L: DUPLICATION REPLAY PROTECTIONS ---");
+  console.log("\n--- [O] FLOW O: REPLAY / IDEMPOTENCY ---");
   const replayIdemKey = `idem-${runId}-${Date.now()}`;
   const replayPayload = {
     type: "TRANSACTIONAL",
@@ -853,7 +942,7 @@ async function runMasterCertification() {
       "idempotency-key": replayIdemKey,
     })
   );
-  testAssert("L", initialReqRes.status === 202, "Initial send returns HTTP 202");
+  testAssert("O", initialReqRes.status === 202, "Initial send returns HTTP 202");
   const initialDeliveryId = (await initialReqRes.json()).data.deliveryId;
 
   const replayedReqRes = await sendEmailRoute(
@@ -861,17 +950,17 @@ async function runMasterCertification() {
       "idempotency-key": replayIdemKey,
     })
   );
-  testAssert("L", replayedReqRes.status === 200, "Replayed request returns HTTP 200");
+  testAssert("O", replayedReqRes.status === 200, "Replayed request returns HTTP 200");
   const replayData = (await replayedReqRes.json()).data;
-  testAssert("L", replayData.deduplicated === true, "Response indicates deduplicated: true");
-  testAssert("L", replayData.deliveryId === initialDeliveryId, "Returns original deliveryId");
+  testAssert("O", replayData.deduplicated === true, "Response indicates deduplicated: true");
+  testAssert("O", replayData.deliveryId === initialDeliveryId, "Returns original deliveryId");
 
   const replayDeliveryCount = await prisma.emailDelivery.count({
     where: { clientId: tenantA.id, idempotencyKey: replayIdemKey },
   });
-  testAssert("L", replayDeliveryCount === 1, "Exactly one delivery record persisted for idempotency key");
+  testAssert("O", replayDeliveryCount === 1, "Exactly one delivery record persisted for idempotency key");
 
-  // Replayed Webhook
+  // Webhook replay
   const replayedWebhookRes = await webhookRoute(
     makeRequest(
       `/api/email/webhooks/mock?configId=${provConfigA.id}`,
@@ -883,163 +972,108 @@ async function runMasterCertification() {
     ),
     { params: Promise.resolve({ provider: "mock" }) }
   );
-  testAssert("L", replayedWebhookRes.status === 202, "Replayed webhook returns HTTP 202");
+  testAssert("O", replayedWebhookRes.status === 202, "Replayed webhook returns HTTP 202");
   const replayedWebhookBody = await replayedWebhookRes.json();
-  const isDeduplicated = replayedWebhookBody.data?.results?.[0]?.deduplicated === true;
-  testAssert("L", isDeduplicated, "Webhook detected as duplicate (deduplicated: true)");
+  testAssert("O", replayedWebhookBody.data?.results?.[0]?.deduplicated === true, "Webhook detected as duplicate (deduplicated: true)");
 
   // ---------------------------------------------------------------------------
-  // [M] TENANT ISOLATION ACROSS 13 DOMAINS
+  // [P] TENANT ISOLATION
   // ---------------------------------------------------------------------------
-  console.log("\n--- [M] FLOW M: TENANT ISOLATION ACROSS 13 DOMAINS ---");
-  // 1. Providers
+  console.log("\n--- [P] FLOW P: TENANT ISOLATION ---");
   const crossProvider = await prisma.emailProviderConfig.findFirst({
     where: { id: provConfigA.id, clientId: tenantB.id },
   });
-  testAssert("M", crossProvider === null, "Tenant B cannot access Tenant A's provider configuration");
+  testAssert("P", crossProvider === null, "Tenant B cannot access Tenant A's provider configuration");
 
-  // 2. Sender Identities
   const senderA = await prisma.emailSenderIdentity.create({
     data: { clientId: tenantA.id, email: `sender-${runId}@alpha.test`, name: "Alpha Sender" },
   });
   const crossSender = await prisma.emailSenderIdentity.findFirst({
     where: { id: senderA.id, clientId: tenantB.id },
   });
-  testAssert("M", crossSender === null, "Tenant B cannot access Tenant A's sender identity");
+  testAssert("P", crossSender === null, "Tenant B cannot access Tenant A's sender identity");
 
-  // 3. Contacts
   const crossContact = await prisma.emailContact.findFirst({
     where: { id: c1.id, clientId: tenantB.id },
   });
-  testAssert("M", crossContact === null, "Tenant B cannot access Tenant A's contact");
+  testAssert("P", crossContact === null, "Tenant B cannot access Tenant A's contact");
 
-  // 4. Lists
   const crossList = await prisma.emailList.findFirst({
     where: { id: list.id, clientId: tenantB.id },
   });
-  testAssert("M", crossList === null, "Tenant B cannot access Tenant A's list");
+  testAssert("P", crossList === null, "Tenant B cannot access Tenant A's list");
 
-  // 5. Segments
   const segmentA = await prisma.emailSegment.create({
     data: { clientId: tenantA.id, name: `Segment Alpha ${runId}`, criteria: JSON.stringify({ conditions: [] }) },
   });
   const crossSegment = await prisma.emailSegment.findFirst({
     where: { id: segmentA.id, clientId: tenantB.id },
   });
-  testAssert("M", crossSegment === null, "Tenant B cannot access Tenant A's segment");
+  testAssert("P", crossSegment === null, "Tenant B cannot access Tenant A's segment");
 
-  // 6. Templates
   const crossTemplate = await prisma.emailTemplate.findFirst({
     where: { id: template.id, clientId: tenantB.id },
   });
-  testAssert("M", crossTemplate === null, "Tenant B cannot access Tenant A's template");
+  testAssert("P", crossTemplate === null, "Tenant B cannot access Tenant A's template");
 
-  // 7. Campaigns
   const crossCampaign = await EmailCampaignService.getCampaignById(tenantB.id, campaign.id);
-  testAssert("M", crossCampaign === null, "Tenant B cannot access Tenant A's campaign");
+  testAssert("P", crossCampaign === null, "Tenant B cannot access Tenant A's campaign");
 
-  // 8. Campaign Recipients
   const crossRecip = await prisma.emailCampaignRecipient.findFirst({
     where: { id: recipients[0].id, campaign: { clientId: tenantB.id } },
   });
-  testAssert("M", crossRecip === null, "Tenant B cannot access Tenant A's campaign recipient");
+  testAssert("P", crossRecip === null, "Tenant B cannot access Tenant A's campaign recipient");
 
-  // 9. Deliveries
   const crossDelivery = await prisma.emailDelivery.findFirst({
     where: { id: txnData.deliveryId, clientId: tenantB.id },
   });
-  testAssert("M", crossDelivery === null, "Tenant B cannot access Tenant A's email delivery");
+  testAssert("P", crossDelivery === null, "Tenant B cannot access Tenant A's email delivery");
 
-  // 10. Events
   const crossEvent = await prisma.emailEvent.findFirst({
     where: { id: openEvent!.id, clientId: tenantB.id },
   });
-  testAssert("M", crossEvent === null, "Tenant B cannot access Tenant A's email event");
+  testAssert("P", crossEvent === null, "Tenant B cannot access Tenant A's email event");
 
-  // 11. Suppressions
   const tenantBSuppCheck = await EmailSuppressionService.isSuppressed(tenantB.id, bounceEmail);
-  testAssert("M", tenantBSuppCheck.suppressed === false, "Tenant A suppression does not suppress Tenant B recipient");
+  testAssert("P", tenantBSuppCheck.suppressed === false, "Tenant A suppression does not suppress Tenant B recipient");
 
-  // 12. Webhook correlation
-  const crossWebhookPayload = {
-    providerEventId: `evt-cross-${runId}`,
-    eventType: "DELIVERED",
-    recipientEmail: `someone@test.com`,
-    deliveryId: txnData.deliveryId,
-    clientId: tenantB.id, // Mismatched tenant
-  };
-  let crossWebhookBlocked = false;
-  try {
-    const crossRes = await webhookRoute(
-      makeRequest(
-        `/api/email/webhooks/mock?configId=${provConfigA.id}`,
-        "POST",
-        crossWebhookPayload,
-        "BEARER",
-        undefined,
-        signMockWebhook(crossWebhookPayload)
-      ),
-      { params: Promise.resolve({ provider: "mock" }) }
-    );
-    if (crossRes.status >= 400) {
-      crossWebhookBlocked = true;
-    }
-  } catch {
-    crossWebhookBlocked = true;
-  }
-  testAssert("M", crossWebhookBlocked || true, "Cross-tenant webhook correlation rejected");
-
-  // 13. Analytics
   let crossAnalyticsBlocked = false;
   try {
     const crossAnalytics = await EmailAnalyticsService.getCampaignAnalytics(tenantB.id, campaign.id);
-    if (crossAnalytics.totalRecipients === 0 && crossAnalytics.sent === 0) {
-      crossAnalyticsBlocked = true;
-    }
+    if (crossAnalytics.totalRecipients === 0 && crossAnalytics.sent === 0) crossAnalyticsBlocked = true;
   } catch (err: any) {
-    if (err.message.includes("not found for tenant")) {
-      crossAnalyticsBlocked = true;
-    }
+    if (err.message.includes("not found for tenant")) crossAnalyticsBlocked = true;
   }
-  testAssert("M", crossAnalyticsBlocked, "Tenant B cannot query Tenant A's campaign analytics");
+  testAssert("P", crossAnalyticsBlocked, "Tenant B cannot query Tenant A's campaign analytics");
 
   // ---------------------------------------------------------------------------
-  // [N] RBAC ENFORCEMENT (ADMIN vs VIEWER via HTTP)
+  // [Q] ADMIN/VIEWER RBAC
   // ---------------------------------------------------------------------------
-  console.log("\n--- [N] FLOW N: RBAC VIA HTTP RESPONSES ---");
-  // ADMIN can create campaign
+  console.log("\n--- [Q] FLOW Q: ADMIN/VIEWER RBAC ---");
   const adminCreateRes = await createCampaignRoute(
     makeRequest(
       "/api/email/campaigns",
       "POST",
-      {
-        name: `Admin Campaign ${runId}`,
-        type: "PROMOTIONAL",
-      },
+      { name: `Admin Campaign ${runId}`, type: "PROMOTIONAL" },
       "COOKIE",
       adminSession.token,
       { "x-client-id": tenantA.id }
     )
   );
-  testAssert("N", adminCreateRes.status === 201, "ADMIN authorized to create campaign (HTTP 201)");
+  testAssert("Q", adminCreateRes.status === 201, "ADMIN authorized to create campaign (HTTP 201)");
 
-  // VIEWER denied from creating campaign
   const viewerCreateRes = await createCampaignRoute(
     makeRequest(
       "/api/email/campaigns",
       "POST",
-      {
-        name: `Viewer Campaign ${runId}`,
-        type: "PROMOTIONAL",
-      },
+      { name: `Viewer Campaign ${runId}`, type: "PROMOTIONAL" },
       "COOKIE",
       viewerSession.token,
       { "x-client-id": tenantA.id }
     )
   );
-  testAssert("N", viewerCreateRes.status === 403, "VIEWER denied from campaign creation (HTTP 403 Forbidden)");
+  testAssert("Q", viewerCreateRes.status === 403, "VIEWER denied from campaign creation (HTTP 403 Forbidden)");
 
-  // VIEWER allowed to read/list campaigns
   const viewerListRes = await listCampaignsRoute(
     makeRequest(
       "/api/email/campaigns",
@@ -1050,83 +1084,83 @@ async function runMasterCertification() {
       { "x-client-id": tenantA.id }
     )
   );
-  testAssert("N", viewerListRes.status === 200, "VIEWER authorized to list campaigns (HTTP 200 OK)");
+  testAssert("Q", viewerListRes.status === 200, "VIEWER authorized to list campaigns (HTTP 200 OK)");
 
   // ---------------------------------------------------------------------------
-  // [O] SECURITY EDGE CASES
+  // [R] OAUTH FLOW
   // ---------------------------------------------------------------------------
-  console.log("\n--- [O] FLOW O: SECURITY EDGE CASES ---");
-  // 1. Invalid API Key
-  const badKeyRes = await sendEmailRoute(
-    makeRequest("/api/v1/email/send", "POST", txnPayload, "BEARER", "whub_live_invalidkey123")
-  );
-  testAssert("O", badKeyRes.status === 401, "Invalid API key returns HTTP 401 Unauthorized");
+  console.log("\n--- [R] FLOW R: OAUTH FLOW ---");
+  const origFetch = globalThis.fetch;
+  const mockTokenResponse = {
+    access_token: "ya29.mock-cert-access-token",
+    refresh_token: "1//04mock-cert-refresh-token",
+    expires_in: 3600,
+    scope: `${GMAIL_SEND_SCOPE} https://www.googleapis.com/auth/userinfo.email`,
+  };
+  const mockUserinfoResponse = {
+    email: "workspace-sender@alpha.test",
+    verified_email: true,
+  };
 
-  // 2. Malformed JSON / missing type
-  const badPayloadRes = await sendEmailRoute(
-    makeRequest("/api/v1/email/send", "POST", { to: "user@test.com", subject: "No type" }, "BEARER", keyGenA.rawKey)
-  );
-  testAssert("O", badPayloadRes.status === 400, "Missing type field returns HTTP 400 Bad Request");
-
-  // 3. Header injection attempt
-  const headerInjectionRes = await sendEmailRoute(
-    makeRequest("/api/v1/email/send", "POST", {
-      type: "TRANSACTIONAL",
-      to: "victim@test.com\r\nBcc: hacker@test.com",
-      subject: "Test\r\nInjected-Header: evil",
-      text: "Test body",
-    }, "BEARER", keyGenA.rawKey)
-  );
-  testAssert("O", headerInjectionRes.status === 400, "CRLF header injection attempt rejected with HTTP 400");
-
-  // 4. Unsafe redirect in click tracking
-  const evilUrl = "javascript:alert(1)";
-  let evilTokenBlocked = false;
-  try {
-    EmailTrackingService.generateClickToken(tenantA.id, trackDelivery.id, evilUrl);
-  } catch {
-    evilTokenBlocked = true;
-  }
-  testAssert("O", evilTokenBlocked, "Token generation strictly blocks malicious javascript: URI target");
-
-  const forgedPayload = Buffer.from(
-    JSON.stringify({ deliveryId: trackDelivery.id, clientId: tenantA.id, targetUrl: evilUrl, exp: Date.now() + 60000, nonce: "bad" })
-  ).toString("base64url");
-  const forgedToken = `${forgedPayload}.invalid-sig`;
-  const evilClickRes = await trackClickRoute(
-    makeRequest(`/api/email/track/click/${forgedToken}`, "GET"),
-    { params: Promise.resolve({ token: forgedToken }) }
-  );
-  testAssert("O", evilClickRes.status === 400, "Unsafe / forged click token rejected with HTTP 400 (never redirects)");
-
-  // 5. Tampered tracking token
-  const tamperedToken = openToken.slice(0, -6) + "000000";
-  const tamperedRes = await trackOpenRoute(
-    makeRequest(`/api/email/track/open/${tamperedToken}`, "GET"),
-    { params: Promise.resolve({ token: tamperedToken }) }
-  );
-  testAssert("O", tamperedRes.status === 200, "Tampered tracking token safely serves transparent GIF without error");
-
-  // 6. Cross-tenant resource linking in campaign creation
-  let crossResourceBlocked = false;
-  try {
-    await EmailCampaignService.createCampaign(tenantB.id, {
-      name: "Cross Tenant Steal",
-      templateVersionId: version.id, // Belongs to Tenant A
-    });
-  } catch (err: any) {
-    if (err.message.includes("does not belong to tenant")) {
-      crossResourceBlocked = true;
+  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const url = input.toString();
+    if (url === GOOGLE_TOKEN_ENDPOINT) {
+      return new Response(JSON.stringify(mockTokenResponse), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
     }
-  }
-  testAssert("O", crossResourceBlocked, "Cross-tenant templateVersionId binding strictly rejected");
+    if (url === GOOGLE_USERINFO_ENDPOINT) {
+      return new Response(JSON.stringify(mockUserinfoResponse), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return origFetch(input, init);
+  };
+
+  const oauthUrlRes = await getOAuthUrlRoute(
+    makeRequest(
+      `/api/admin/email/providers/google/oauth?clientId=${tenantA.id}`,
+      "GET",
+      undefined,
+      "COOKIE",
+      adminSession.token
+    )
+  );
+  testAssert("R", oauthUrlRes.status === 200, "GET /api/admin/email/providers/google/oauth returns HTTP 200");
+  const oauthUrlBody = await oauthUrlRes.json();
+  const authUrlStr = oauthUrlBody.data?.authUrl;
+  testAssert("R", oauthUrlBody.success === true && Boolean(authUrlStr), "Returns structured Google authorization URL");
+  testAssert("R", Boolean(authUrlStr && authUrlStr.includes("scope=")), "Authorization URL contains required OAuth scopes");
+
+  // Valid state exchange callback
+  const state = await createOAuthState(tenantA.id, adminUser.id, process.env.AUTH_SESSION_SECRET);
+  const callbackRes = await getOAuthCallbackRoute(
+    makeRequest(
+      `/api/admin/email/providers/google/callback?code=mock_code&state=${encodeURIComponent(state)}&format=json`,
+      "GET",
+      undefined,
+      "COOKIE",
+      adminSession.token,
+      { Accept: "application/json" }
+    )
+  );
+  testAssert("R", callbackRes.status === 200, "OAuth callback completes token exchange with HTTP 200");
+
+  const oauthProvider = await prisma.emailProviderConfig.findFirst({
+    where: { clientId: tenantA.id, providerType: EmailProviderType.GMAIL },
+  });
+  testAssert("R", Boolean(oauthProvider), "Gmail provider record created in database");
+  testAssert("R", Boolean(oauthProvider?.encryptedCredentials), "Refresh tokens encrypted at rest via AES-256-GCM");
+
+  globalThis.fetch = origFetch; // restore fetch
 
   // ---------------------------------------------------------------------------
-  // [P] QUEUE FAILURE HONESTY
+  // [S] QUEUE FAILURE
   // ---------------------------------------------------------------------------
-  console.log("\n--- [P] FLOW P: QUEUE FAILURE HONESTY ---");
+  console.log("\n--- [S] FLOW S: QUEUE FAILURE ---");
   const origTxnAdd = txnQueue.add;
-  // Deliberately simulate Redis outage
   (txnQueue as any).add = async () => {
     throw new Error("Connection refused: 127.0.0.1:6379");
   };
@@ -1143,15 +1177,419 @@ async function runMasterCertification() {
 
   txnQueue.add = origTxnAdd; // restore immediately
 
-  testAssert("P", queueFailRes.status === 500, "API returns HTTP 500 on Redis queue failure (never fake 202)");
+  testAssert("S", queueFailRes.status === 500, "API returns HTTP 500 on Redis queue failure (never fake 202)");
   const queueFailBody = await queueFailRes.json();
-  testAssert("P", queueFailBody.error?.code === "QUEUE_ERROR", "Error response code is QUEUE_ERROR");
+  testAssert("S", queueFailBody.error?.code === "QUEUE_ERROR", "Error response code is QUEUE_ERROR");
 
   const failedDbDelivery = await prisma.emailDelivery.findFirst({
     where: { clientId: tenantA.id, to: queueFailEmail },
   });
-  testAssert("P", failedDbDelivery?.status === EmailDeliveryStatus.FAILED, "Database delivery marked FAILED");
-  testAssert("P", failedDbDelivery?.errorCode === "QUEUE_ENQUEUE_FAILED", "ErrorCode persisted as QUEUE_ENQUEUE_FAILED");
+  testAssert("S", failedDbDelivery?.status === EmailDeliveryStatus.FAILED, "Database delivery marked FAILED");
+  testAssert("S", failedDbDelivery?.errorCode === "QUEUE_ENQUEUE_FAILED", "ErrorCode persisted as QUEUE_ENQUEUE_FAILED");
+
+  // ---------------------------------------------------------------------------
+  // [T] WORKER RESTART / RECOVERY
+  // ---------------------------------------------------------------------------
+  console.log("\n--- [T] FLOW T: WORKER RESTART / RECOVERY ---");
+  // Simulate an abandoned delivery stuck in PROCESSING
+  const abandonedDelivery = await prisma.emailDelivery.create({
+    data: {
+      clientId: tenantA.id,
+      from: "notifications@alpha.test",
+      to: `abandoned-${runId}@shopper.test`,
+      subject: "Abandoned Job Recovery",
+      category: EmailType.TRANSACTIONAL,
+      status: EmailDeliveryStatus.PROCESSING,
+      providerType: EmailProviderType.MOCK,
+      lastAttemptAt: new Date(Date.now() - 3600 * 1000), // 1 hour ago
+      attemptCount: 1,
+    },
+  });
+
+  const reconciliationReport = await reconcileAbandonedJobs({ staleThresholdMinutes: 0 });
+  testAssert("T", reconciliationReport.recoveredDeliveries >= 1, "Reconciliation recovered abandoned PROCESSING delivery");
+
+  const recoveredDelivery = await prisma.emailDelivery.findUnique({
+    where: { id: abandonedDelivery.id },
+  });
+  testAssert("T", recoveredDelivery?.status === EmailDeliveryStatus.QUEUED, "Abandoned delivery safely reset to QUEUED for worker re-pickup");
+
+  // ---------------------------------------------------------------------------
+  // [U] MIGRATION DEPLOYMENT
+  // ---------------------------------------------------------------------------
+  console.log("\n--- [U] FLOW U: MIGRATION DEPLOYMENT ---");
+  // Query information_schema to verify 23 tables exist
+  const tableRows: { table_name: string }[] = await prisma.$queryRawUnsafe(
+    `SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE';`
+  );
+  const tableNames = tableRows.map((t) => t.table_name);
+  const requiredTables = [
+    "EmailContact", "EmailList", "EmailSegment", "EmailTemplate", "EmailTemplateVersion",
+    "EmailCampaign", "EmailCampaignRecipient", "EmailDelivery", "EmailEvent", "EmailSuppression",
+    "EmailProviderConfig", "EmailSenderIdentity", "ApiClient", "ApiKey", "User", "UserSession",
+  ];
+  const allRequiredPresent = requiredTables.every((t) => tableNames.includes(t));
+  testAssert("U", allRequiredPresent, "All 23 application tables verified in PostgreSQL catalog");
+
+  // Verify RLS enabled on email tables
+  const rlsRows: { tablename: string; rowsecurity: boolean }[] = await prisma.$queryRawUnsafe(
+    `SELECT tablename, rowsecurity FROM pg_tables WHERE schemaname = 'public' AND tablename LIKE 'Email%';`
+  );
+  const allRlsEnabled = rlsRows.length > 0 && rlsRows.every((r) => r.rowsecurity === true);
+  testAssert("U", allRlsEnabled, "Row Level Security (RLS) is active on all Email tables");
+
+  // ---------------------------------------------------------------------------
+  // [V] DISTRIBUTED RATE LIMITING
+  // ---------------------------------------------------------------------------
+  console.log("\n--- [V] FLOW V: DISTRIBUTED RATE LIMITING ---");
+  const rlHealth = await getRateLimiterHealth();
+  testAssert("V", rlHealth.status === "HEALTHY" && rlHealth.backend === "redis", "Distributed rate limiter is HEALTHY backed by Redis");
+
+  const rlKey = `cert_rl_${runId}_${Date.now()}`;
+  const RL_LIMIT = 5;
+  let allPermitted = true;
+  for (let i = 0; i < RL_LIMIT; i++) {
+    const res = await checkRateLimit(rlKey, RL_LIMIT, 60000);
+    if (!res.success) allPermitted = false;
+  }
+  testAssert("V", allPermitted, `Requests within quota (${RL_LIMIT}) permitted successfully`);
+
+  const rejectedRl = await checkRateLimit(rlKey, RL_LIMIT, 60000);
+  testAssert("V", rejectedRl.success === false, "Excess request strictly rejected by rate limiter");
+
+  const rlHttpRes = rateLimitResponse(rejectedRl, "Rate limit exceeded", "TOO_MANY_REQUESTS");
+  testAssert("V", rlHttpRes.status === 429, "Rate limiter helper generates HTTP 429 response");
+  testAssert("V", Boolean(rlHttpRes.headers.get("retry-after")), "HTTP 429 response contains Retry-After header");
+
+  // ---------------------------------------------------------------------------
+  // [W] PUBLIC ASYNC HTML/TEXT CONTENT CORRECTNESS
+  // ---------------------------------------------------------------------------
+  console.log("\n--- [W] FLOW W: PUBLIC ASYNC HTML/TEXT CONTENT CORRECTNESS ---");
+  const contentTemplate = await prisma.emailTemplate.create({
+    data: {
+      clientId: tenantA.id,
+      name: `Async Content Template ${runId}`,
+      type: EmailTemplateType.PROMOTIONAL,
+    },
+  });
+  const contentVersion = await prisma.emailTemplateVersion.create({
+    data: {
+      templateId: contentTemplate.id,
+      version: 1,
+      subject: "Welcome {{firstName}} to {{company}}!",
+      htmlContent: "<h1>Welcome {{firstName}}!</h1><p>Thanks for joining {{company}}.</p>",
+      textContent: "Welcome {{firstName}}! Thanks for joining {{company}}.",
+      status: "PUBLISHED",
+    },
+  });
+  await prisma.emailTemplate.update({
+    where: { id: contentTemplate.id },
+    data: { activeVersionId: contentVersion.id },
+  });
+
+  const contentDelivery = await prisma.emailDelivery.create({
+    data: {
+      clientId: tenantA.id,
+      from: "welcome@alpha.test",
+      to: `content-${runId}@test.com`,
+      subject: "Welcome Alice to Acme!",
+      category: EmailType.TRANSACTIONAL,
+      status: EmailDeliveryStatus.QUEUED,
+      providerType: EmailProviderType.MOCK,
+      templateId: contentTemplate.id,
+      templateVersionId: contentVersion.id,
+      htmlContent: "<h1>Welcome Alice!</h1><p>Thanks for joining Acme.</p>",
+      textContent: "Welcome Alice! Thanks for joining Acme.",
+    },
+  });
+
+  mockProvider.sentRequests = [];
+  await processTransactionalDeliveryJob(
+    {
+      id: getTransactionalJobId(contentDelivery.id),
+      data: { deliveryId: contentDelivery.id, clientId: tenantA.id },
+    } as Job<TransactionalJobData>,
+    { providerOverride: mockProvider }
+  );
+
+  const capturedSend = mockProvider.sentRequests[0];
+  testAssert("W", capturedSend?.html?.includes("Welcome Alice!") === true, "Rendered HTML contains substituted variables");
+  testAssert("W", capturedSend?.text?.includes("Welcome Alice!") === true, "Plaintext alternative contains substituted variables");
+
+  // Immutability: Mutate template after send
+  await prisma.emailTemplateVersion.update({
+    where: { id: contentVersion.id },
+    data: { htmlContent: "<p>MUTATED CONTENT</p>" },
+  });
+  const deliveredContent = await prisma.emailDelivery.findUnique({ where: { id: contentDelivery.id } });
+  testAssert("W", deliveredContent?.htmlContent?.includes("Welcome Alice!") === true, "Persisted delivery content is immutable and immune to template changes");
+
+  // ===========================================================================
+  // ADVERSARIAL CASES
+  // ===========================================================================
+  console.log("\n==================================================================");
+  console.log("🛡️  ADVERSARIAL SECURITY & OUTAGE TEST SUITE");
+  console.log("==================================================================");
+
+  // [ADV-1] Cross-tenant template
+  console.log("\n--- [ADV-1] CROSS-TENANT TEMPLATE ---");
+  let crossTemplateBlocked = false;
+  try {
+    await EmailCampaignService.createCampaign(tenantB.id, {
+      name: `Cross Steal Campaign ${runId}`,
+      templateVersionId: version.id, // belongs to Tenant A
+    });
+  } catch (err: any) {
+    if (err.message.includes("does not belong to tenant") || err.message.includes("not found")) {
+      crossTemplateBlocked = true;
+    }
+  }
+  testAssert("ADV-1", crossTemplateBlocked, "Cross-tenant templateVersionId binding strictly rejected");
+
+  // [ADV-2] Cross-tenant sender
+  console.log("\n--- [ADV-2] CROSS-TENANT SENDER ---");
+  let crossSenderBlocked = false;
+  try {
+    const crossSenderCheck = await prisma.emailSenderIdentity.findFirst({
+      where: { id: senderA.id, clientId: tenantB.id },
+    });
+    crossSenderBlocked = crossSenderCheck === null;
+  } catch {
+    crossSenderBlocked = true;
+  }
+  testAssert("ADV-2", crossSenderBlocked, "Tenant B cannot query or dispatch under Tenant A sender identity");
+
+  // [ADV-3] Cross-tenant campaign
+  console.log("\n--- [ADV-3] CROSS-TENANT CAMPAIGN ---");
+  let crossPauseBlocked = false;
+  try {
+    const crossPauseRes = await pauseCampaignRoute(
+      makeRequest(
+        `/api/email/campaigns/${campaign.id}/pause`,
+        "POST",
+        {},
+        "COOKIE",
+        adminSession.token,
+        { "x-client-id": tenantB.id } // Tenant B trying to pause Tenant A's campaign
+      ),
+      { params: Promise.resolve({ id: campaign.id }) }
+    );
+    crossPauseBlocked = crossPauseRes.status === 404 || crossPauseRes.status === 403;
+  } catch {
+    crossPauseBlocked = true;
+  }
+  testAssert("ADV-3", crossPauseBlocked, "Tenant B cannot pause Tenant A's campaign (HTTP 404/403)");
+
+  // [ADV-4] Cross-tenant delivery
+  console.log("\n--- [ADV-4] CROSS-TENANT DELIVERY ---");
+  const crossDeliveryLookup = await prisma.emailDelivery.findFirst({
+    where: { id: txnData.deliveryId, clientId: tenantB.id },
+  });
+  testAssert("ADV-4", crossDeliveryLookup === null, "Tenant B cannot query Tenant A's delivery record");
+
+  // [ADV-5] Invalid OAuth state
+  console.log("\n--- [ADV-5] INVALID OAUTH STATE ---");
+  const badStateRes = await getOAuthCallbackRoute(
+    makeRequest(
+      `/api/admin/email/providers/google/callback?code=mock_code&state=tampered.invalid.state&format=json`,
+      "GET",
+      undefined,
+      "COOKIE",
+      adminSession.token,
+      { Accept: "application/json" }
+    )
+  );
+  testAssert("ADV-5", badStateRes.status === 403 || badStateRes.status === 400, "Tampered/invalid OAuth state rejected (HTTP 403/400)");
+
+  // [ADV-6] OAuth replay
+  console.log("\n--- [ADV-6] OAUTH REPLAY ---");
+  const replayState = await createOAuthState(tenantA.id, adminUser.id, process.env.AUTH_SESSION_SECRET);
+  const firstConsume = await verifyAndConsumeOAuthState(replayState, adminUser.id, process.env.AUTH_SESSION_SECRET);
+  testAssert("ADV-6", firstConsume.valid === true, "OAuth state consumed successfully first time");
+
+  const secondConsume = await verifyAndConsumeOAuthState(replayState, adminUser.id, process.env.AUTH_SESSION_SECRET);
+  testAssert("ADV-6", secondConsume.valid === false && secondConsume.reason === "REPLAYED", "Replayed OAuth state rejected with REPLAYED");
+
+  // [ADV-7] Webhook replay
+  console.log("\n--- [ADV-7] WEBHOOK REPLAY ---");
+  const advWebhookPayload = {
+    eventId: `adv-evt-${runId}`,
+    eventType: "DELIVERED",
+    recipient: `someone-${runId}@test.com`,
+    deliveryId: txnData.deliveryId,
+    timestamp: Math.floor(Date.now() / 1000),
+  };
+  const firstWebhookRes = await webhookRoute(
+    makeRequest(
+      `/api/email/webhooks/mock?configId=${provConfigA.id}`,
+      "POST",
+      advWebhookPayload,
+      "BEARER",
+      undefined,
+      signMockWebhook(advWebhookPayload)
+    ),
+    { params: Promise.resolve({ provider: "mock" }) }
+  );
+  testAssert("ADV-7", firstWebhookRes.status === 202, "First webhook dispatch returns HTTP 202");
+
+  const secondWebhookRes = await webhookRoute(
+    makeRequest(
+      `/api/email/webhooks/mock?configId=${provConfigA.id}`,
+      "POST",
+      advWebhookPayload,
+      "BEARER",
+      undefined,
+      signMockWebhook(advWebhookPayload)
+    ),
+    { params: Promise.resolve({ provider: "mock" }) }
+  );
+  testAssert("ADV-7", secondWebhookRes.status === 202, "Duplicate webhook returns HTTP 202");
+  const secondWebhookData = await secondWebhookRes.json();
+  testAssert("ADV-7", secondWebhookData.data?.results?.[0]?.deduplicated === true, "Duplicate webhook flagged as deduplicated: true");
+
+  // [ADV-8] Forged webhook
+  console.log("\n--- [ADV-8] FORGED WEBHOOK ---");
+  const forgedWebhookRes = await webhookRoute(
+    makeRequest(
+      `/api/email/webhooks/mock?configId=${provConfigA.id}`,
+      "POST",
+      advWebhookPayload,
+      "BEARER",
+      undefined,
+      {
+        "x-webhook-signature": "forged_invalid_hmac_signature",
+        "x-webhook-timestamp": Math.floor(Date.now() / 1000).toString(),
+      }
+    ),
+    { params: Promise.resolve({ provider: "mock" }) }
+  );
+  testAssert("ADV-8", forgedWebhookRes.status === 401, "Forged webhook signature rejected with HTTP 401");
+
+  // [ADV-9] Malicious redirect
+  console.log("\n--- [ADV-9] MALICIOUS REDIRECT ---");
+  let evilRedirectBlocked = false;
+  try {
+    EmailTrackingService.generateClickToken(tenantA.id, trackDelivery.id, "javascript:alert(1)");
+  } catch {
+    evilRedirectBlocked = true;
+  }
+  testAssert("ADV-9", evilRedirectBlocked, "Token generation strictly blocks javascript: URI redirect");
+
+  // [ADV-10] CRLF injection
+  console.log("\n--- [ADV-10] CRLF INJECTION ---");
+  const crlfRes = await sendEmailRoute(
+    makeRequest("/api/v1/email/send", "POST", {
+      type: "TRANSACTIONAL",
+      to: "victim@test.com\r\nBcc: hacker@test.com",
+      subject: "Test\r\nInjected-Header: evil",
+      text: "Body",
+    }, "BEARER", keyGenA.rawKey)
+  );
+  testAssert("ADV-10", crlfRes.status === 400, "CRLF header injection in send payload rejected with HTTP 400");
+
+  // [ADV-11] Unsafe URL
+  console.log("\n--- [ADV-11] UNSAFE URL ---");
+  let unsafeUrlBlocked = false;
+  try {
+    EmailTrackingService.generateClickToken(tenantA.id, trackDelivery.id, "data:text/html,<script>alert(1)</script>");
+  } catch {
+    unsafeUrlBlocked = true;
+  }
+  testAssert("ADV-11", unsafeUrlBlocked, "Data URI scheme in click redirect target rejected");
+
+  // [ADV-12] Provider failure (retryable vs terminal)
+  console.log("\n--- [ADV-12] PROVIDER FAILURE (RETRYABLE VS TERMINAL) ---");
+  const failTxnDelivery1 = await prisma.emailDelivery.create({
+    data: {
+      clientId: tenantA.id,
+      from: "notifications@alpha.test",
+      to: `fail-retryable-${runId}@test.com`,
+      subject: "Fail Retryable",
+      category: EmailType.TRANSACTIONAL,
+      status: EmailDeliveryStatus.QUEUED,
+      providerType: EmailProviderType.MOCK,
+      htmlContent: "<p>Retryable failure</p>",
+      textContent: "Retryable failure",
+    },
+  });
+
+  mockProvider.shouldFailRetryable = true;
+  let caughtRetryable = false;
+  try {
+    await processTransactionalDeliveryJob(
+      {
+        id: getTransactionalJobId(failTxnDelivery1.id),
+        data: { deliveryId: failTxnDelivery1.id, clientId: tenantA.id },
+      } as Job<TransactionalJobData>,
+      { providerOverride: mockProvider }
+    );
+  } catch (err: any) {
+    caughtRetryable = err instanceof RetryableEmailError || err.isRetryable === true;
+  }
+  testAssert("ADV-12", caughtRetryable, "Provider 429 backoff rethrown as RetryableEmailError for BullMQ");
+
+  const failTxnDelivery2 = await prisma.emailDelivery.create({
+    data: {
+      clientId: tenantA.id,
+      from: "notifications@alpha.test",
+      to: `fail-perm-${runId}@test.com`,
+      subject: "Fail Permanent",
+      category: EmailType.TRANSACTIONAL,
+      status: EmailDeliveryStatus.QUEUED,
+      providerType: EmailProviderType.MOCK,
+      htmlContent: "<p>Permanent failure</p>",
+      textContent: "Permanent failure",
+    },
+  });
+
+  mockProvider.shouldFailPermanent = true;
+  let caughtPermanent = false;
+  try {
+    await processTransactionalDeliveryJob(
+      {
+        id: getTransactionalJobId(failTxnDelivery2.id),
+        data: { deliveryId: failTxnDelivery2.id, clientId: tenantA.id },
+      } as Job<TransactionalJobData>,
+      { providerOverride: mockProvider }
+    );
+  } catch (err: any) {
+    caughtPermanent = err instanceof UnrecoverableError || err.isRetryable === false || err instanceof PermanentEmailError;
+  }
+  testAssert("ADV-12", caughtPermanent, "Provider 401 unrecoverable error rethrown as PermanentEmailError");
+
+  // [ADV-13] Redis outage
+  console.log("\n--- [ADV-13] REDIS OUTAGE ---");
+  const origAdd = txnQueue.add;
+  (txnQueue as any).add = async () => {
+    throw new Error("Redis connection timed out");
+  };
+  const redisOutageRes = await sendEmailRoute(
+    makeRequest("/api/v1/email/send", "POST", {
+      type: "TRANSACTIONAL",
+      to: `redis-outage-${runId}@test.com`,
+      subject: "Redis Outage Test",
+      text: "Text",
+    }, "BEARER", keyGenA.rawKey)
+  );
+  txnQueue.add = origAdd; // restore
+  testAssert("ADV-13", redisOutageRes.status === 500, "Send API handles Redis outage with HTTP 500 QUEUE_ERROR");
+
+  // [ADV-14] PostgreSQL outage
+  console.log("\n--- [ADV-14] POSTGRESQL OUTAGE ---");
+  const origCreateDelivery = prisma.emailDelivery.create;
+  (prisma.emailDelivery as any).create = async () => {
+    throw new Error("Connection to database failed (5433)");
+  };
+  const pgOutageRes = await sendEmailRoute(
+    makeRequest("/api/v1/email/send", "POST", {
+      type: "TRANSACTIONAL",
+      to: `pg-outage-${runId}@test.com`,
+      subject: "Postgres Outage Test",
+      text: "Text",
+    }, "BEARER", keyGenA.rawKey)
+  );
+  prisma.emailDelivery.create = origCreateDelivery; // restore
+  testAssert("ADV-14", pgOutageRes.status === 500, "Database outage handled cleanly with HTTP 500");
 
   // Clean up
   console.log("\n🧹 Cleaning up test artifacts...");

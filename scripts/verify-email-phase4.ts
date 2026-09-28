@@ -537,7 +537,7 @@ async function runPhase4Tests() {
     // 12. Queue Health Observability & Sanitization
     // -------------------------------------------------------------------------
     const health = await getEmailQueueHealth();
-    testAssert(health.status === "HEALTHY" || health.status === "DOWN", "Health report returns valid status code");
+    testAssert(health.status === "HEALTHY" || health.status === "DEGRADED" || health.status === "DOWN", "Health report returns valid status code");
     testAssert(!health.redis.target.includes(":password@"), "Health report never exposes Redis password");
     testAssert(typeof health.queues.transactional.waiting === "number", "Health report includes transactional queue waiting count");
     testAssert(typeof health.queues.campaign.waiting === "number", "Health report includes campaign queue waiting count");

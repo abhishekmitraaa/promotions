@@ -1,11 +1,15 @@
+process.env.DATABASE_URL = "postgresql://postgres:postgres@127.0.0.1:5433/email_test";
+process.env.DIRECT_URL = "postgresql://postgres:postgres@127.0.0.1:5433/email_test";
+process.env.REDIS_URL = "redis://127.0.0.1:6379";
+process.env.NODE_ENV = "test";
+process.env.ALLOW_DESTRUCTIVE_TESTS = "true";
+process.env.AUTH_SESSION_SECRET = "dashboard-test-session-secret-32-chars-min";
+process.env.PROVIDER_CREDENTIAL_KEY = "dashboard-test-cred-encryption-key-32";
+process.env.EMAIL_TRACKING_SECRET = "dashboard-test-tracking-secret-32-chars";
+
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import { assertDestructiveTestAllowed } from "./test-db-guard";
-
-process.env.NODE_ENV = process.env.NODE_ENV || "test";
-process.env.AUTH_SESSION_SECRET ||= "dashboard-test-session-secret-32-chars-min";
-process.env.PROVIDER_CREDENTIAL_KEY ||= "dashboard-test-cred-encryption-key-32";
-process.env.EMAIL_TRACKING_SECRET ||= "dashboard-test-tracking-secret-32-chars";
 
 async function main() {
   assertDestructiveTestAllowed("verify-email-dashboard-operational");

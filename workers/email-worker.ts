@@ -96,10 +96,6 @@ async function main() {
     process.env.EMAIL_CAMPAIGN_CONCURRENCY || String(Math.max(1, Math.floor(workerConcurrency / 2))),
     10
   );
-  const deliveryConcurrency = parseInt(
-    process.env.EMAIL_DELIVERY_CONCURRENCY || String(workerConcurrency),
-    10
-  );
   const eventConcurrency = parseInt(process.env.EMAIL_EVENTS_CONCURRENCY || "10", 10);
 
   workerLogger.info("=================================================");

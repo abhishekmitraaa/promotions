@@ -289,10 +289,12 @@ async function runPhase7Tests() {
   // -------------------------------------------------------------------------
   console.log("\n--- [1] Webhook Signature Verification ---");
   const rawBody = JSON.stringify({ event: "delivered", email: "user@example.com" });
-  const validSig = crypto.createHmac("sha256", secret).update(rawBody).digest("hex");
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  const validSig = crypto.createHmac("sha256", secret).update(`${timestamp}.${rawBody}`).digest("hex");
 
   const validHeaders = new Headers();
   validHeaders.set("x-webhook-signature", validSig);
+  validHeaders.set("x-webhook-timestamp", timestamp);
 
   const resValid = verifyHmacWebhookSignature(rawBody, validHeaders, secret);
   testAssert(resValid.valid === true, "Valid HMAC webhook signature accepted");

@@ -253,7 +253,17 @@ export async function POST(req: NextRequest) {
         },
       });
     }
-    throw err;
+    const msg = err instanceof Error ? err.message : "Database failure";
+    return NextResponse.json(
+      {
+        success: false,
+        error: {
+          code: "DATABASE_ERROR",
+          message: `Database error while creating delivery record: ${msg}`,
+        },
+      },
+      { status: 500 }
+    );
   }
 
   // 9. Queue Asynchronously (Honest Queue Failure Contract)
