@@ -606,6 +606,35 @@
 
 ---
 
+
+### Entry: 2026-09-28 — Supabase Security Advisory Review (`public._prisma_migrations` RLS)
+- **Prompt / Phase**: Review Supabase security advisory regarding `public._prisma_migrations has RLS disabled`, analyze roles, accessibility, and design safest verified remediation without breaking Prisma migrations.
+- **Status**: ✅ Clean (Remediation Validated on Disposable Postgres / Ready for Production)
+- **Root Cause**:
+  - `_prisma_migrations` is created automatically by Prisma Migrate in the default `public` schema without enabling Row Level Security (`rowsecurity: false`).
+  - Supabase's security advisor rule (`rls_disabled_in_public`) flags all tables located in `public` where `rowsecurity = false`.
+- **Role & Exposure Impact Analysis**:
+  - **Actual Application Role**: `whatsapp_hub` connects via `DIRECT_URL` and `DATABASE_URL`. It is the table owner and has full CRUD privileges.
+  - **Client Roles (`anon`, `authenticated`, `authenticator`, `service_role`)**: Currently, default PostgreSQL privileges and explicit REVOKEs restrict access so `has_table_privilege('anon', ...)` and `has_table_privilege('authenticated', ...)` are both `false`. There is no active data leakage via PostgREST.
+  - **Potential Risk**: Because RLS is disabled, any future blanket grant (e.g. `GRANT ALL ON ALL TABLES IN SCHEMA public TO authenticated`) or default privilege drift would immediately expose migration history to PostgREST APIs.
+- **Remediation Design & Disposable Verification**:
+  - Blindly enabling RLS without policies would block non-owner roles and risk Prisma deployment failures.
+  - Safest remediation:
+    1. `ALTER TABLE public._prisma_migrations ENABLE ROW LEVEL SECURITY;`
+    2. `REVOKE ALL ON TABLE public._prisma_migrations FROM anon, authenticated, public;`
+    3. `GRANT ALL ON TABLE public._prisma_migrations TO whatsapp_hub;`
+    4. `CREATE POLICY "whatsapp_hub_prisma_migrations_all" ON public._prisma_migrations FOR ALL TO whatsapp_hub USING (true) WITH CHECK (true);`
+  - Validated on disposable PostgreSQL container (`127.0.0.1:5433` via `scripts/test-prisma-migrations-rls.ts`):
+    - `anon` and `authenticated` roles are strictly blocked with `permission denied`.
+    - `whatsapp_hub` maintains full query, insert, update, and delete access.
+    - `npx prisma migrate status` reports `Database schema is up to date!`.
+    - `npx prisma migrate deploy` succeeds with zero errors (`No pending migrations to apply.`).
+    - Prisma Client queries (`User`, `ApiClient`, `EmailCampaign`) execute normally without degradation.
+- **Unresolved Concerns**: None.
+- **Mitigation / Next Steps**: Production SQL script prepared and documented for operator approval.
+
+---
+
 ## Flag Template for Subsequent Prompts
 
 ```markdown
@@ -618,6 +647,7 @@
 - **Mitigation / Next Steps**:
   - [Action to resolve concern in future phase]
 ```
+
 
 
 
