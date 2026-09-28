@@ -205,6 +205,7 @@ function setupHardeningMocks() {
       if (where.id && c.id !== where.id) return false;
       if (where.clientId && c.clientId !== where.clientId) return false;
       if (where.normalizedEmail && c.normalizedEmail !== where.normalizedEmail) return false;
+      if (where.email && c.email !== where.email && c.normalizedEmail !== where.email) return false;
       return true;
     }) || null;
   };

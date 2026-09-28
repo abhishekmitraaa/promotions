@@ -515,6 +515,49 @@
 
 ---
 
+### Entry: 2026-09-28 — Dedicated Background Email Worker Production Hardening
+- **Prompt / Phase**: Harden the Email Worker (`npm run worker:email`) for Real Production Operation
+- **Status**: ✅ Clean (All Requirements Certified)
+- **Architecture & Hardening Completed**:
+  - **Worker Lifecycle & Startup Validation**:
+    - Built comprehensive startup dependency validation in `workers/email-worker.ts`: ping Redis with latency checks, ping PostgreSQL with `SELECT 1` latency checks, and verify critical schema tables (`EmailDelivery`, `EmailCampaign`, `EmailCampaignRecipient`, `EmailEvent`, `EmailProviderConfig`). Fails fast before accepting queue jobs if any dependency is unreachable.
+    - Graceful shutdown handling for `SIGTERM` and `SIGINT` with a bounded 15-second drain timeout (`SHUTDOWN_TIMEOUT_MS = 15000`). Pauses all 4 BullMQ workers (`worker.pause()`), awaits in-flight job drain (`worker.close()`), deletes Redis heartbeats, releases Redis connections, and disconnects Prisma client.
+    - Managed multi-queue worker orchestration covering all 4 queues: `email-transactional`, `email-promotional-delivery`, `email-promotional`, and `email-events`.
+  - **Queue Behavior & Stalled Job Recovery**:
+    - Classified retryable errors (HTTP 429, 502, 503, 504, `ECONNRESET`, `ETIMEDOUT`, network blips, Prisma initialization errors) with exponential backoff vs terminal unrecoverable errors (HTTP 400, 401, 403, malformed email format, deleted entities).
+    - Hardened BullMQ worker settings: `lockDuration: 30000`, `stalledInterval: 15000`, `maxStalledCount: 2` to safely recover abandoned locks without manual operator intervention.
+    - Strict duplicate job protection via deterministic custom job IDs (`getTransactionalJobId`, `getPromotionalJobId`, `getCampaignJobId`, `getEventJobId`).
+    - Dead-letter observability: failed jobs inspectable via `/api/admin/email/queue/health`.
+  - **Worker Health, Telemetry & Distributed Heartbeats**:
+    - Created `WorkerTelemetry` (`src/lib/email/queue/telemetry.ts`): tracks active in-flight jobs, processed/succeeded/failed/stalled/skipped counts, processing duration, and rolling latency averages.
+    - Distributed Redis heartbeats: writes auto-expiring keys (`email:worker:heartbeat:{workerId}`, TTL 30s) every 10s and maintains `email:worker:active_ids`.
+    - Cluster-wide worker discovery via `getActiveWorkerHeartbeats(redis)` consumed by admin health routes.
+  - **Abandoned State Reconciliation Engine**:
+    - Created `reconcileAbandonedJobs()` (`src/lib/email/queue/reconciliation.ts`): executed at worker startup and every 5 minutes in background daemon.
+    - Stale `EmailDelivery` in `PROCESSING` (>10 min): reset to `QUEUED` and re-enqueued if `attemptCount < maxAttempts`; transitioned to `FAILED` with `ABANDONED_TIMED_OUT` if retry budget exhausted.
+    - Stale `EmailCampaignRecipient` in `PROCESSING` (>10 min): reset to `PENDING` if campaign is `RUNNING` or `PAUSED`; transitioned to `CANCELLED` if campaign is `CANCELLED`.
+    - Abandoned campaigns in `RUNNING` or `PAUSED` with 0 pending/processing recipients are completed deterministically.
+  - **Campaign Safety Guarantees**:
+    - Paused campaigns remain strictly paused (recipient jobs skipped with `CAMPAIGN_PAUSED`).
+    - Cancelled campaigns remain strictly cancelled (recipient jobs transitioned to `CANCELLED`).
+    - Completed campaigns are never resurrected by late-arriving jobs (`CAMPAIGN_ALREADY_COMPLETED`).
+  - **Transaction Safety & Monotonic State Progression**:
+    - Deliveries are never marked `SENT` before authoritative provider acceptance.
+    - Monotonic state updates: delivery status updates to `FAILED` include conditional filters `where: { id: deliveryId, status: { in: [PROCESSING, QUEUED] } }`, mathematically preventing delayed retries from overwriting or downgrading an already `SENT` or `DELIVERED` record.
+  - **Structured Logging & Secret Redaction**:
+    - Created `workerLogger` and `redactSecrets()` (`src/lib/email/queue/worker-logger.ts`): guarantees zero secret leakage by redacting API keys (`whub_`), Google OAuth tokens (`ya29`), client secrets (`GOCSPX-`), bearer tokens, password hashes, Redis connection credentials, and masking email addresses.
+  - **Production Observability & Metrics**:
+    - Created `src/lib/email/queue/metrics.ts` and `/api/admin/email/queue/metrics` endpoint supporting both JSON snapshot and standard Prometheus text format (`email_worker_uptime_seconds`, `email_worker_active_jobs`, `email_jobs_total`, `email_queue_depth_jobs`, `email_backend_connected`, `email_backend_latency_ms`).
+  - **Deployment Topology Documentation**:
+    - Authored `docs/worker-deployment.md` documenting architecture, host environments (Systemd, Docker Compose, Kubernetes with 30s grace period, PM2), Redis `maxmemory-policy noeviction` requirements, PostgreSQL connection pool sizing, restart policies, and competing-consumer horizontal scaling.
+    - Explicitly documented prohibition: **DO NOT deploy worker to Netlify serverless**.
+  - **Comprehensive Automated Test Suite**:
+    - `npm run test:email:worker`: 18 tests covering startup validation, URL credential stripping, error classification, monotonic state safety, paused/cancelled/completed campaign safety, abandoned state reconciliation, telemetry, heartbeats, dead letters, Prometheus metrics, secret redaction, and duplicate job protection (100% pass).
+- **Unresolved Concerns**: None.
+- **Mitigation / Next Steps**: Production email worker daemon fully certified for containerized or VM deployment alongside durable Redis and PostgreSQL.
+
+---
+
 ## Flag Template for Subsequent Prompts
 
 ```markdown

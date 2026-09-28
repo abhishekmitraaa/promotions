@@ -152,10 +152,32 @@ export function isRetryableError(err: unknown): boolean {
   const status = typeof errObj?.status === "number" ? errObj.status : undefined;
 
   if (status === 429 || status === 503 || status === 504 || status === 502) return true;
-  if (code === "RATE_LIMIT_EXCEEDED" || code === "SERVICE_UNAVAILABLE" || code === "ETIMEDOUT" || code === "ECONNRESET") {
+  if (
+    code === "RATE_LIMIT_EXCEEDED" ||
+    code === "SERVICE_UNAVAILABLE" ||
+    code === "ETIMEDOUT" ||
+    code === "ECONNRESET" ||
+    code === "ECONNREFUSED" ||
+    code === "UND_ERR_CONNECT_TIMEOUT"
+  ) {
     return true;
   }
-  if (msg.includes("429") || msg.includes("timeout") || msg.includes("network") || msg.includes("ECONNRESET")) {
+
+  const lowerMsg = msg.toLowerCase();
+  if (
+    lowerMsg.includes("429") ||
+    lowerMsg.includes("503") ||
+    lowerMsg.includes("502") ||
+    lowerMsg.includes("504") ||
+    lowerMsg.includes("service unavailable") ||
+    lowerMsg.includes("timeout") ||
+    lowerMsg.includes("etimedout") ||
+    lowerMsg.includes("network") ||
+    lowerMsg.includes("econnreset") ||
+    lowerMsg.includes("econnrefused") ||
+    lowerMsg.includes("prismaclientinitializationerror") ||
+    lowerMsg.includes("connection pool")
+  ) {
     return true;
   }
 

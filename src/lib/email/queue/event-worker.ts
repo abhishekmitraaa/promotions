@@ -20,38 +20,43 @@ import {
 } from "./types";
 import { createWorkerRedisConnection } from "./connection";
 import { EmailEventService } from "../../services/email-event-service";
-import { logger } from "../../logger";
+import { workerLogger } from "./worker-logger";
+import { workerTelemetry } from "./telemetry";
 
 export async function processEmailEventJob(job: Job<EmailEventJobData>) {
   const eventRecordId = job.data.eventRecordId || job.data.eventId;
   const { eventType, providerType } = job.data;
 
   if (!eventRecordId) {
-    logger.error(`[Worker:Event] Job ${job.id} is missing eventRecordId or eventId`);
+    workerLogger.error(`[Worker:Event] Job ${job.id} is missing eventRecordId or eventId`);
     throw new PermanentEmailError("Missing eventRecordId in job data");
   }
 
-  logger.info(
+  workerLogger.info(
     `[Worker:Event] Processing email event job ${job.id} (recordId: ${eventRecordId}, type: ${eventType || "unknown"}, provider: ${providerType || "unknown"}, attempt: ${job.attemptsMade + 1})`
   );
 
+  const startTime = workerTelemetry.recordJobStart();
   try {
     const result = await EmailEventService.processEventFromWorker(eventRecordId);
-    logger.info(
+    workerTelemetry.recordJobSuccess(startTime);
+    workerLogger.info(
       `[Worker:Event] Successfully finished event job ${job.id} for event ${eventRecordId}`
     );
     return result;
-  } catch (err) {
-    if (isRetryableError(err)) {
-      const msg = err instanceof Error ? err.message : String(err);
-      logger.warn(
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const isRetryable = isRetryableError(err);
+    workerTelemetry.recordJobFailure(startTime, err);
+
+    if (isRetryable) {
+      workerLogger.warn(
         `[Worker:Event] Transient failure processing event ${eventRecordId} (will retry): ${msg}`
       );
       throw err instanceof RetryableEmailError ? err : new RetryableEmailError(msg);
     }
 
-    const msg = err instanceof Error ? err.message : String(err);
-    logger.error(
+    workerLogger.error(
       `[Worker:Event] Permanent terminal failure processing event ${eventRecordId}: ${msg}`
     );
     throw err instanceof PermanentEmailError ? err : new PermanentEmailError(msg);
@@ -77,19 +82,27 @@ export function createEventWorker(options?: {
     {
       connection,
       concurrency,
+      lockDuration: 30000,
+      stalledInterval: 15000,
+      maxStalledCount: 2,
     }
   );
 
   worker.on("completed", (job) => {
-    logger.info(`[Worker:Event] Job ${job.id} completed successfully`);
+    workerLogger.info(`[Worker:Event] Job ${job.id} completed successfully`);
   });
 
   worker.on("failed", (job, err) => {
-    logger.error(`[Worker:Event] Job ${job?.id} failed with error: ${err.message}`);
+    workerLogger.error(`[Worker:Event] Job ${job?.id} failed with error: ${err.message}`);
+  });
+
+  worker.on("stalled", (jobId) => {
+    workerTelemetry.recordJobStalled();
+    workerLogger.warn(`[Worker:Event] Job ${jobId} was reported as stalled and will be re-queued`);
   });
 
   worker.on("error", (err) => {
-    logger.error("[Worker:Event] Event worker runtime error:", err);
+    workerLogger.error("[Worker:Event] Event worker runtime error:", err);
   });
 
   return worker;

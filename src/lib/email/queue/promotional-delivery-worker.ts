@@ -12,6 +12,7 @@
  * 8. Updates database delivery state (PROCESSING -> SENT or FAILED).
  * 9. Transient errors trigger BullMQ retry; permanent errors throw UnrecoverableError.
  * 10. Strict credential scrubbing: zero secrets in logs.
+ * 11. Production telemetry integration.
  */
 
 import { Job, UnrecoverableError } from "bullmq";
@@ -25,12 +26,14 @@ import { EmailUnsubscribeService } from "../../services/email-unsubscribe-servic
 import { EmailTrackingService } from "../tracking/email-tracking-service";
 import { normalizeEmail } from "../normalization";
 import { logger } from "../../logger";
+import { workerTelemetry } from "./telemetry";
 
 export async function processPromotionalDeliveryJob(
   job: Job<PromotionalJobData>,
   options?: { providerOverride?: EmailProvider }
 ) {
   const { deliveryId, clientId } = job.data;
+  const startTimeMs = workerTelemetry.recordJobStart();
   logger.info(`[Worker:Promotional] Processing job ${job.id} for delivery ${deliveryId} (tenant: ${clientId})`);
 
   // 1. Load Authoritative Delivery Record
@@ -41,10 +44,17 @@ export async function processPromotionalDeliveryJob(
     });
   } catch (err) {
     logger.error(`[Worker:Promotional] DB query failed for delivery ${deliveryId}:`, err);
+    const dbErr = new RetryableEmailError(
+      `Database query failed for delivery '${deliveryId}': ${err instanceof Error ? err.message : String(err)}`
+    );
+    workerTelemetry.recordJobFailure(startTimeMs, dbErr);
+    throw dbErr;
   }
 
   if (!delivery) {
-    throw new UnrecoverableError(`Authoritative EmailDelivery '${deliveryId}' not found.`);
+    const notFoundErr = new UnrecoverableError(`Authoritative EmailDelivery '${deliveryId}' not found.`);
+    workerTelemetry.recordJobFailure(startTimeMs, notFoundErr);
+    throw notFoundErr;
   }
 
   // 2. Stale Delivery Guard: If already SENT or DELIVERED, ignore duplicate/stale retry
@@ -53,6 +63,7 @@ export async function processPromotionalDeliveryJob(
     delivery.status === EmailDeliveryStatus.DELIVERED
   ) {
     logger.info(`[Worker:Promotional] Delivery ${deliveryId} is already ${delivery.status}. Skipping stale execution.`);
+    workerTelemetry.recordJobSkipped();
     return {
       skipped: true,
       reason: "ALREADY_COMPLETED",
@@ -73,8 +84,12 @@ export async function processPromotionalDeliveryJob(
         lastAttemptAt: new Date(),
       },
     });
-  } catch {
-    // If table fallback
+  } catch (err) {
+    const dbErr = new RetryableEmailError(
+      `Failed to transition delivery '${delivery.id}' to PROCESSING: ${err instanceof Error ? err.message : String(err)}`
+    );
+    workerTelemetry.recordJobFailure(startTimeMs, dbErr);
+    throw dbErr;
   }
 
   // 4. Verify Real-Time Suppression
@@ -82,7 +97,10 @@ export async function processPromotionalDeliveryJob(
     const isSuppressed = await EmailSuppressionService.isSuppressed(delivery.clientId, delivery.to);
     if (isSuppressed.suppressed) {
       await prisma.emailDelivery.updateMany({
-        where: { id: delivery.id },
+        where: {
+          id: delivery.id,
+          status: { in: [EmailDeliveryStatus.PROCESSING, EmailDeliveryStatus.QUEUED] },
+        },
         data: {
           status: EmailDeliveryStatus.FAILED,
           errorCode: "RECIPIENT_SUPPRESSED",
@@ -90,7 +108,9 @@ export async function processPromotionalDeliveryJob(
           failedAt: new Date(),
         },
       });
-      throw new UnrecoverableError(`Recipient '${delivery.to}' is suppressed.`);
+      const suppErr = new UnrecoverableError(`Recipient '${delivery.to}' is suppressed.`);
+      workerTelemetry.recordJobFailure(startTimeMs, suppErr);
+      throw suppErr;
     }
   } catch (err) {
     if (err instanceof UnrecoverableError) throw err;
@@ -99,27 +119,38 @@ export async function processPromotionalDeliveryJob(
   // 5. Verify Marketing Consent & Prepare One-Click Unsubscribe Headers
   const baseUrl = process.env.NEXT_PUBLIC_APP_URL || "https://hub.local";
   let unsubscribeHeaders: Record<string, string> | undefined;
+
   try {
     const normalizedTo = normalizeEmail(delivery.to);
     const contact = await prisma.emailContact.findFirst({
-      where: { clientId: delivery.clientId, normalizedEmail: normalizedTo },
+      where: {
+        clientId: delivery.clientId,
+        normalizedEmail: normalizedTo,
+      },
     });
 
     if (contact) {
-      if (!contact.hasMarketingConsent || contact.status !== "SUBSCRIBED") {
+      const hasConsent = contact.hasMarketingConsent;
+      if (!hasConsent || (contact.status && contact.status !== "SUBSCRIBED")) {
         await prisma.emailDelivery.updateMany({
-          where: { id: delivery.id },
+          where: {
+            id: delivery.id,
+            status: { in: [EmailDeliveryStatus.PROCESSING, EmailDeliveryStatus.QUEUED] },
+          },
           data: {
             status: EmailDeliveryStatus.FAILED,
             errorCode: "MARKETING_CONSENT_REQUIRED",
-            errorMessage: `Recipient '${delivery.to}' has revoked marketing consent or is unsubscribed.`,
+            errorMessage: `Contact '${delivery.to}' has not provided marketing consent. Promotional dispatch rejected.`,
             failedAt: new Date(),
           },
         });
-        throw new UnrecoverableError(`Recipient '${delivery.to}' does not have marketing consent.`);
+        const consentErr = new UnrecoverableError(
+          `Contact '${delivery.to}' does not have marketing consent for promotional email.`
+        );
+        workerTelemetry.recordJobFailure(startTimeMs, consentErr);
+        throw consentErr;
       }
 
-      // Generate RFC 8058 One-Click Unsubscribe Headers
       const unsubToken = EmailUnsubscribeService.generateUnsubscribeToken(
         delivery.clientId,
         contact.id
@@ -133,7 +164,7 @@ export async function processPromotionalDeliveryJob(
     if (err instanceof UnrecoverableError) throw err;
   }
 
-  // 6. Resolve Tenant Provider
+  // 6. Resolve Provider
   let provider: EmailProvider;
   let providerType: EmailProviderType = EmailProviderType.GMAIL;
   let providerSenderEmail: string | undefined;
@@ -150,7 +181,7 @@ export async function processPromotionalDeliveryJob(
     } catch (resolveErr) {
       const msg = resolveErr instanceof Error ? resolveErr.message : "Provider resolution failed";
       await prisma.emailDelivery.updateMany({
-        where: { id: delivery.id },
+        where: { id: delivery.id, status: EmailDeliveryStatus.PROCESSING },
         data: {
           status: EmailDeliveryStatus.FAILED,
           errorCode: "PROVIDER_RESOLUTION_FAILED",
@@ -158,7 +189,9 @@ export async function processPromotionalDeliveryJob(
           failedAt: new Date(),
         },
       });
-      throw new UnrecoverableError(msg);
+      const unrecErr = new UnrecoverableError(msg);
+      workerTelemetry.recordJobFailure(startTimeMs, unrecErr);
+      throw unrecErr;
     }
   }
 
@@ -171,9 +204,11 @@ export async function processPromotionalDeliveryJob(
   const outgoingText = delivery.textContent || undefined;
 
   if (!outgoingHtml && !outgoingText) {
-    throw new UnrecoverableError(
+    const emptyErr = new UnrecoverableError(
       `Delivery '${delivery.id}' has no authoritative content (htmlContent and textContent are both empty).`
     );
+    workerTelemetry.recordJobFailure(startTimeMs, emptyErr);
+    throw emptyErr;
   }
 
   try {
@@ -192,7 +227,10 @@ export async function processPromotionalDeliveryJob(
 
     if (sendResult.accepted) {
       await prisma.emailDelivery.updateMany({
-        where: { id: delivery.id },
+        where: {
+          id: delivery.id,
+          status: { in: [EmailDeliveryStatus.PROCESSING, EmailDeliveryStatus.QUEUED] },
+        },
         data: {
           status: EmailDeliveryStatus.SENT,
           providerType,
@@ -203,7 +241,15 @@ export async function processPromotionalDeliveryJob(
         },
       });
 
-      logger.info(`[Worker:Promotional] Successfully dispatched promotional delivery ${deliveryId} via ${sendResult.providerName} (messageId: ${sendResult.providerMessageId})`);
+      workerTelemetry.recordJobSuccess(startTimeMs, {
+        deliveryId,
+        recipient: delivery.to,
+        providerType,
+      });
+
+      logger.info(
+        `[Worker:Promotional] Successfully dispatched promotional delivery ${deliveryId} via ${sendResult.providerName} (messageId: ${sendResult.providerMessageId})`
+      );
       return {
         success: true,
         deliveryId,
@@ -217,7 +263,10 @@ export async function processPromotionalDeliveryJob(
     const retryable = error?.retryable ?? isRetryableError(error);
 
     await prisma.emailDelivery.updateMany({
-      where: { id: delivery.id },
+      where: {
+        id: delivery.id,
+        status: { in: [EmailDeliveryStatus.PROCESSING, EmailDeliveryStatus.QUEUED] },
+      },
       data: {
         status: retryable ? EmailDeliveryStatus.PROCESSING : EmailDeliveryStatus.FAILED,
         errorCode: error?.code || "DISPATCH_FAILED",
@@ -227,9 +276,13 @@ export async function processPromotionalDeliveryJob(
     });
 
     if (retryable) {
-      throw new RetryableEmailError(error?.message || "Transient send failure", error?.code);
+      const retryErr = new RetryableEmailError(error?.message || "Transient send failure", error?.code);
+      workerTelemetry.recordJobFailure(startTimeMs, retryErr);
+      throw retryErr;
     } else {
-      throw new UnrecoverableError(error?.message || "Permanent delivery rejection");
+      const permErr = new UnrecoverableError(error?.message || "Permanent delivery rejection");
+      workerTelemetry.recordJobFailure(startTimeMs, permErr);
+      throw permErr;
     }
   } catch (err: unknown) {
     if (err instanceof UnrecoverableError || err instanceof RetryableEmailError) {
@@ -240,7 +293,10 @@ export async function processPromotionalDeliveryJob(
     const msg = err instanceof Error ? err.message : "Unexpected send error";
 
     await prisma.emailDelivery.updateMany({
-      where: { id: delivery.id },
+      where: {
+        id: delivery.id,
+        status: { in: [EmailDeliveryStatus.PROCESSING, EmailDeliveryStatus.QUEUED] },
+      },
       data: {
         status: retryable ? EmailDeliveryStatus.PROCESSING : EmailDeliveryStatus.FAILED,
         errorCode: "PROVIDER_EXCEPTION",
@@ -249,10 +305,8 @@ export async function processPromotionalDeliveryJob(
       },
     });
 
-    if (retryable) {
-      throw new RetryableEmailError(msg);
-    } else {
-      throw new UnrecoverableError(msg);
-    }
+    const finalErr = retryable ? new RetryableEmailError(msg) : new UnrecoverableError(msg);
+    workerTelemetry.recordJobFailure(startTimeMs, finalErr);
+    throw finalErr;
   }
 }

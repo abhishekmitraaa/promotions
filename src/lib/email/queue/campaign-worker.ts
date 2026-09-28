@@ -26,6 +26,7 @@ import { EmailTrackingService } from "../tracking/email-tracking-service";
 import { logger } from "../../logger";
 import { processPromotionalDeliveryJob } from "./promotional-delivery-worker";
 import { processScheduledCampaignTriggerJob } from "./campaign-trigger-worker";
+import { workerTelemetry } from "./telemetry";
 
 export { processPromotionalDeliveryJob, processScheduledCampaignTriggerJob };
 import {
@@ -75,6 +76,16 @@ export async function checkAndCompleteCampaign(campaignId: string): Promise<bool
   return false;
 }
 
+export async function processCampaignJob(
+  job: Job<CampaignJobData>,
+  options?: CampaignWorkerOptions
+) {
+  if (job.name === JOB_NAMES.TRIGGER_SCHEDULED_CAMPAIGN || (!job.data.campaignRecipientId && job.data.campaignId)) {
+    return processScheduledCampaignTriggerJob(job, options);
+  }
+  return processCampaignRecipientJob(job, options);
+}
+
 export async function processCampaignRecipientJob(
   job: Job<CampaignJobData>,
   options?: CampaignWorkerOptions
@@ -89,52 +100,81 @@ export async function processCampaignRecipientJob(
     throw new UnrecoverableError("campaignRecipientId is required for campaign recipient job.");
   }
 
+  const startTimeMs = workerTelemetry.recordJobStart();
+
   logger.info(
     `[Worker:Campaign] Processing job ${job.id} for recipient ${campaignRecipientId} (campaign: ${campaignId})`
   );
 
   // 1. Load Authoritative Recipient Record
-  const recipient = await prisma.emailCampaignRecipient.findUnique({
-    where: { id: campaignRecipientId },
-  });
+  let recipient;
+  try {
+    recipient = await prisma.emailCampaignRecipient.findUnique({
+      where: { id: campaignRecipientId },
+    });
+  } catch (err) {
+    logger.error(`[Worker:Campaign] DB query failed for recipient ${campaignRecipientId}:`, err);
+    const dbErr = new RetryableEmailError(
+      `Database query failed for recipient '${campaignRecipientId}': ${err instanceof Error ? err.message : String(err)}`
+    );
+    workerTelemetry.recordJobFailure(startTimeMs, dbErr);
+    throw dbErr;
+  }
 
   if (!recipient) {
-    throw new UnrecoverableError(`Campaign recipient '${campaignRecipientId}' not found.`);
+    const notFoundErr = new UnrecoverableError(`Campaign recipient '${campaignRecipientId}' not found.`);
+    workerTelemetry.recordJobFailure(startTimeMs, notFoundErr);
+    throw notFoundErr;
   }
 
   // 2. Stale Guard: If already SENT, CANCELLED, SUPPRESSED, or FAILED, skip execution
   if (recipient.status === "SENT") {
     logger.info(`[Worker:Campaign] Recipient ${campaignRecipientId} already SENT. Skipping duplicate execution.`);
+    workerTelemetry.recordJobSkipped();
     return { skipped: true, reason: "ALREADY_SENT" };
   }
   if (recipient.status === "CANCELLED") {
     logger.info(`[Worker:Campaign] Recipient ${campaignRecipientId} already CANCELLED. Skipping execution.`);
+    workerTelemetry.recordJobSkipped();
     return { skipped: true, reason: "RECIPIENT_CANCELLED" };
   }
   if (recipient.status === "SUPPRESSED") {
     logger.info(`[Worker:Campaign] Recipient ${campaignRecipientId} is SUPPRESSED. Skipping execution.`);
+    workerTelemetry.recordJobSkipped();
     return { skipped: true, reason: "RECIPIENT_SUPPRESSED" };
   }
   if (recipient.status === "FAILED") {
     logger.info(`[Worker:Campaign] Recipient ${campaignRecipientId} already FAILED. Skipping execution.`);
+    workerTelemetry.recordJobSkipped();
     return { skipped: true, reason: "RECIPIENT_FAILED" };
   }
 
   // 3. Load Authoritative Campaign & Check Lifecycle State
-  const campaign = await prisma.emailCampaign.findUnique({
-    where: { id: campaignId },
-    include: {
-      templateVersion: true,
-      senderIdentity: {
-        include: {
-          providerConfig: true,
+  let campaign;
+  try {
+    campaign = await prisma.emailCampaign.findUnique({
+      where: { id: campaignId },
+      include: {
+        templateVersion: true,
+        senderIdentity: {
+          include: {
+            providerConfig: true,
+          },
         },
       },
-    },
-  });
+    });
+  } catch (err) {
+    const dbErr = new RetryableEmailError(
+      `Database query failed for campaign '${campaignId}': ${err instanceof Error ? err.message : String(err)}`
+    );
+    workerTelemetry.recordJobFailure(startTimeMs, dbErr);
+    throw dbErr;
+  }
 
   if (!campaign) {
-    throw new UnrecoverableError(`Campaign '${campaignId}' not found.`);
+    const notFoundErr = new UnrecoverableError(`Campaign '${campaignId}' not found.`);
+    workerTelemetry.recordJobFailure(startTimeMs, notFoundErr);
+    throw notFoundErr;
   }
 
   // Lifecycle check: Cancelled
@@ -145,13 +185,22 @@ export async function processCampaignRecipientJob(
       data: { status: "CANCELLED" },
     });
     await checkAndCompleteCampaign(campaign.id);
+    workerTelemetry.recordJobSkipped();
     return { skipped: true, reason: "CAMPAIGN_CANCELLED" };
   }
 
   // Lifecycle check: Paused
   if (campaign.status === EmailCampaignStatus.PAUSED) {
     logger.info(`[Worker:Campaign] Campaign ${campaignId} is PAUSED. Postponing recipient ${campaignRecipientId}.`);
+    workerTelemetry.recordJobSkipped();
     return { skipped: true, reason: "CAMPAIGN_PAUSED" };
+  }
+
+  // Lifecycle check: Completed (Never resurrect completed campaigns)
+  if (campaign.status === EmailCampaignStatus.COMPLETED) {
+    logger.info(`[Worker:Campaign] Campaign ${campaignId} is already COMPLETED. Skipping recipient ${campaignRecipientId}.`);
+    workerTelemetry.recordJobSkipped();
+    return { skipped: true, reason: "CAMPAIGN_ALREADY_COMPLETED" };
   }
 
   // 4. Verify Suppression List in Real-Time
@@ -162,9 +211,11 @@ export async function processCampaignRecipientJob(
       data: { status: "SUPPRESSED" },
     });
     await checkAndCompleteCampaign(campaign.id);
-    throw new UnrecoverableError(
+    const suppErr = new UnrecoverableError(
       `Recipient '${recipient.email}' is suppressed (${suppCheck.reason || "SUPPRESSED"}).`
     );
+    workerTelemetry.recordJobFailure(startTimeMs, suppErr);
+    throw suppErr;
   }
 
   // 5. Load Immutable Template Version
@@ -383,6 +434,12 @@ export async function processCampaignRecipientJob(
       // 12. Check if All Recipients reached terminal states -> Transition to COMPLETED
       await checkAndCompleteCampaign(campaign.id);
 
+      workerTelemetry.recordJobSuccess(startTimeMs, {
+        deliveryId: delivery.id,
+        recipient: recipient.email,
+        providerType,
+      });
+
       return {
         success: true,
         campaignRecipientId: recipient.id,
@@ -394,10 +451,12 @@ export async function processCampaignRecipientJob(
     // Provider returned error
     const err = sendResult.error;
     if (err?.retryable) {
-      throw new RetryableEmailError(err.message, err.code);
+      const retryErr = new RetryableEmailError(err.message, err.code);
+      workerTelemetry.recordJobFailure(startTimeMs, retryErr);
+      throw retryErr;
     } else {
-      await prisma.emailDelivery.update({
-        where: { id: delivery.id },
+      await prisma.emailDelivery.updateMany({
+        where: { id: delivery.id, status: EmailDeliveryStatus.PROCESSING },
         data: {
           status: EmailDeliveryStatus.FAILED,
           failedAt: new Date(),
@@ -411,7 +470,9 @@ export async function processCampaignRecipientJob(
         data: { status: "FAILED" },
       });
       await checkAndCompleteCampaign(campaign.id);
-      throw new UnrecoverableError(err?.message || "Permanent delivery failure");
+      const permErr = new UnrecoverableError(err?.message || "Permanent delivery failure");
+      workerTelemetry.recordJobFailure(startTimeMs, permErr);
+      throw permErr;
     }
   } catch (err: unknown) {
     if (err instanceof UnrecoverableError) {
@@ -428,6 +489,7 @@ export async function processCampaignRecipientJob(
         data: { status: "FAILED" },
       });
       await checkAndCompleteCampaign(campaign.id);
+      workerTelemetry.recordJobFailure(startTimeMs, err);
       throw err;
     }
     if (err instanceof PermanentEmailError) {
@@ -445,15 +507,20 @@ export async function processCampaignRecipientJob(
         data: { status: "FAILED" },
       });
       await checkAndCompleteCampaign(campaign.id);
-      throw new UnrecoverableError(err.message);
+      const unrec = new UnrecoverableError(err.message);
+      workerTelemetry.recordJobFailure(startTimeMs, unrec);
+      throw unrec;
     }
     if (err instanceof RetryableEmailError) {
+      workerTelemetry.recordJobFailure(startTimeMs, err);
       throw err;
     }
 
     const errMsg = err instanceof Error ? err.message : String(err);
     if (errMsg.includes("429") || errMsg.includes("timeout") || errMsg.includes("ETIMEDOUT")) {
-      throw new RetryableEmailError(errMsg, "PROVIDER_RETRYABLE");
+      const retryErr = new RetryableEmailError(errMsg, "PROVIDER_RETRYABLE");
+      workerTelemetry.recordJobFailure(startTimeMs, retryErr);
+      throw retryErr;
     }
 
     await prisma.emailCampaignRecipient.update({
@@ -461,7 +528,9 @@ export async function processCampaignRecipientJob(
       data: { status: "FAILED" },
     });
     await checkAndCompleteCampaign(campaign.id);
-    throw new UnrecoverableError(errMsg);
+    const unrec = new UnrecoverableError(errMsg);
+    workerTelemetry.recordJobFailure(startTimeMs, unrec);
+    throw unrec;
   }
 }
 
@@ -497,6 +566,9 @@ export function createCampaignWorker(options?: {
     {
       connection,
       concurrency,
+      lockDuration: 30000,
+      stalledInterval: 15000,
+      maxStalledCount: 2,
       limiter: {
         max: parseInt(process.env.EMAIL_CAMPAIGN_MAX_RATE || "10", 10),
         duration: 1000,
@@ -510,6 +582,11 @@ export function createCampaignWorker(options?: {
 
   worker.on("failed", (job, err) => {
     logger.error(`[Worker:Campaign] Job ${job?.id} failed with error: ${err.message}`);
+  });
+
+  worker.on("stalled", (jobId) => {
+    workerTelemetry.recordJobStalled();
+    logger.warn(`[Worker:Campaign] Job ${jobId} stalled and will be reclaimed by BullMQ`);
   });
 
   worker.on("error", (err) => {

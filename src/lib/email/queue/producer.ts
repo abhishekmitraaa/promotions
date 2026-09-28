@@ -13,6 +13,7 @@
 import { prisma } from "../../prisma";
 import { EmailDeliveryStatus, EmailProviderType } from "@prisma/client";
 import { getTransactionalQueue } from "./queues";
+export { getTransactionalQueue };
 import { JOB_NAMES, getTransactionalJobId } from "./types";
 import { isValidEmail, normalizeEmail } from "../normalization";
 import { EmailRecipientInput } from "../types";

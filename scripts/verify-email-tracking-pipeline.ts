@@ -672,10 +672,10 @@ async function runTests() {
       },
     });
 
-    // Update campaign totalRecipients
+    // Update campaign totalRecipients and reset to RUNNING
     await prisma.emailCampaign.update({
       where: { id: campaign.id },
-      data: { totalRecipients: 3 },
+      data: { totalRecipients: 3, status: EmailCampaignStatus.RUNNING },
     });
 
     // Dispatch Recipient 2
