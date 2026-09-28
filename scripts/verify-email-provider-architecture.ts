@@ -12,8 +12,12 @@
  *    - GET & POST /api/admin/email/providers/health executes health checks with RBAC.
  */
 
-process.env.DATABASE_URL = "postgresql://postgres:postgres@127.0.0.1:5433/email_test";
-process.env.DIRECT_URL = "postgresql://postgres:postgres@127.0.0.1:5433/email_test";
+if (!process.env.DATABASE_URL || process.env.DATABASE_URL.includes("peqynzeioiauynfpdsdv") || process.env.DATABASE_URL.includes("supabase.co")) {
+  process.env.DATABASE_URL = "postgresql://postgres:postgres@127.0.0.1:5433/email_test";
+}
+if (!process.env.DIRECT_URL || process.env.DIRECT_URL.includes("peqynzeioiauynfpdsdv") || process.env.DIRECT_URL.includes("supabase.co")) {
+  process.env.DIRECT_URL = "postgresql://postgres:postgres@127.0.0.1:5433/email_test";
+}
 process.env.REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
 process.env.AUTH_SESSION_SECRET =
   process.env.AUTH_SESSION_SECRET || "default_dev_session_secret_32_chars_minimum_len!!";

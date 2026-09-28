@@ -17,11 +17,15 @@
  * 11. Content Immutability: modifying the underlying template after queueing does not alter the queued delivery's frozen content.
  */
 
-process.env.DATABASE_URL = "postgresql://postgres:postgres@127.0.0.1:5433/email_test";
-process.env.DIRECT_URL = "postgresql://postgres:postgres@127.0.0.1:5433/email_test";
-process.env.REDIS_URL = "redis://127.0.0.1:6379";
-process.env.REDIS_HOST = "127.0.0.1";
-process.env.REDIS_PORT = "6379";
+if (!process.env.DATABASE_URL || process.env.DATABASE_URL.includes("peqynzeioiauynfpdsdv") || process.env.DATABASE_URL.includes("supabase.co")) {
+  process.env.DATABASE_URL = "postgresql://postgres:postgres@127.0.0.1:5433/email_test";
+}
+if (!process.env.DIRECT_URL || process.env.DIRECT_URL.includes("peqynzeioiauynfpdsdv") || process.env.DIRECT_URL.includes("supabase.co")) {
+  process.env.DIRECT_URL = "postgresql://postgres:postgres@127.0.0.1:5433/email_test";
+}
+process.env.REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
+process.env.REDIS_HOST = process.env.REDIS_HOST || "127.0.0.1";
+process.env.REDIS_PORT = process.env.REDIS_PORT || "6379";
 process.env.NODE_ENV = "test";
 process.env.ALLOW_DESTRUCTIVE_TESTS = "true";
 process.env.AUTH_SESSION_SECRET = "authoritative-test-session-secret-32-chars";

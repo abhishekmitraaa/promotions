@@ -140,6 +140,7 @@ async function runPhase4Tests() {
   const sanitizedUser = sanitizeRedisUrl("rediss://admin:superSecret@redis.example.com:6380/1");
   testAssert(!sanitizedUser.includes("superSecret") && !sanitizedUser.includes("admin"), "sanitizeRedisUrl masks both username and password");
 
+  const origRedisUrl = process.env.REDIS_URL;
   let threwBadProtocol = false;
   try {
     process.env.REDIS_URL = "http://invalid-redis.com";
@@ -147,7 +148,11 @@ async function runPhase4Tests() {
   } catch {
     threwBadProtocol = true;
   } finally {
-    delete process.env.REDIS_URL;
+    if (origRedisUrl) {
+      process.env.REDIS_URL = origRedisUrl;
+    } else {
+      delete process.env.REDIS_URL;
+    }
   }
   testAssert(threwBadProtocol, "getRedisUrl strictly rejects non-redis protocols");
 

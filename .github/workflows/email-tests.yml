@@ -1,0 +1,115 @@
+name: Email Platform Verification
+
+on:
+  push:
+    branches:
+      - "main"
+      - "fix/email*"
+      - "feature/email*"
+      - "feat/email*"
+  pull_request:
+    branches:
+      - "main"
+  workflow_dispatch:
+
+jobs:
+  email-platform:
+    name: Email Platform E2E & Hardening
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: email_test
+        ports:
+          - 5432:5432
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d email_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      NODE_ENV: test
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/email_test
+      DIRECT_URL: postgresql://postgres:postgres@localhost:5432/email_test
+      REDIS_URL: redis://localhost:6379
+      REDIS_HOST: localhost
+      REDIS_PORT: "6379"
+      ALLOW_DESTRUCTIVE_TESTS: "true"
+      AUTH_SESSION_SECRET: email-ci-session-secret-32-characters-minimum
+      API_KEY_PEPPER: email-ci-api-key-pepper-32-characters-min
+      WEBHOOK_SECRET_ENCRYPTION_KEY: email-ci-webhook-key-32-characters-min
+      PROVIDER_CREDENTIAL_KEY: email-ci-cred-key-32-characters-min
+      EMAIL_TRACKING_SECRET: email-ci-tracking-secret-32-characters
+      GMAIL_CLIENT_ID: mock-google-client-id.apps.googleusercontent.com
+      GMAIL_CLIENT_SECRET: mock-google-client-secret
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.12.0
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Apply database migrations
+        run: npx prisma migrate deploy
+
+      - name: Run unit & service tests (includes safety guard check)
+        run: npm test
+
+      - name: Run comprehensive Email test suite
+        run: npm run test:email
+
+      - name: Run Email hardening tests
+        run: npm run test:email:hardening
+
+      - name: Run OAuth tests
+        run: npm run test:email:oauth
+
+      - name: Run campaign lifecycle tests
+        run: npm run test:email:lifecycle
+
+      - name: Run event processing tests
+        run: npm run test:email:events
+
+      - name: Run tracking pipeline tests
+        run: npm run test:email:tracking
+
+      - name: Run webhook security tests
+        run: npm run test:email:webhooks
+
+      - name: Run audience scale tests
+        run: npm run test:email:audience
+
+      - name: Run master 23-flow & adversarial certification suite
+        run: npm run test:email:certify
+
+      - name: Lint codebase
+        run: npm run lint
+
+      - name: Production build (Next.js Turbopack)
+        run: npm run build
+
+      - name: Security audit
+        run: npm audit --audit-level=high
