@@ -556,6 +556,54 @@
 - **Unresolved Concerns**: None.
 - **Mitigation / Next Steps**: Production email worker daemon fully certified for containerized or VM deployment alongside durable Redis and PostgreSQL.
 
+
+### Entry: 2026-09-28 — Production Database Deployment & Verification (Email Platform)
+- **Prompt / Phase**: Prepare and Deploy Email Platform Schema to Production Supabase Database (`whatsapp-hub-db`, Ref: `peqynzeioiauynfpdsdv`)
+- **Status**: ✅ Clean (Production Verified / 100% Invariant Compliance)
+- **Deployment Status Tracking**:
+  - **Source Complete**: ✅ All TypeScript models, services, workers, API routes, templates, tracking pipelines, and forward migration SQL scripts are complete and tested.
+  - **Migration Applied**: ✅ All 4 additive forward migrations applied cleanly to production Supabase:
+    1. `20260925000000_add_email_platform_foundation` (Applied: `2026-09-28 16:14:55.62913+00`)
+    2. `20260925120000_add_email_auth` (Applied: `2026-09-28 16:16:20.032642+00`)
+    3. `20260928000000_email_authoritative_content_and_events` (Applied: `2026-09-28 16:16:20.277186+00`)
+    4. `20260928010000_email_delivery_template_idx` (Applied: `2026-09-28 16:16:20.500095+00`)
+  - **Production Verified**: ✅ Production database schema, tables, RLS, indexes, constraints, baseline data integrity, and migration status verified directly via live PostgreSQL queries.
+- **Verification Invariants & Production Results**:
+  1. **Non-Destructive Forward Deployment**:
+     - Pre-existing failed migration entry (`20260925000000_add_email_platform_foundation` aborted earlier on duplicate enum) cleanly resolved.
+     - Table ownership aligned to `whatsapp_hub` application user.
+     - Zero destructive operations (`DROP TABLE`, `TRUNCATE`, `DROP DATABASE`) executed.
+  2. **Migration List Integrity**:
+     - `_prisma_migrations` contains exactly 6 migrations, all with `finished_at` populated and `logs: null`.
+     - Zero failed migrations. `npx prisma migrate status` reports: `Database schema is up to date!`.
+  3. **13 Email Platform Tables Verified**:
+     - `EmailProviderConfig`, `EmailSenderIdentity`, `EmailContact`, `EmailList`, `EmailListMember`, `EmailSegment`, `EmailTemplate`, `EmailTemplateVersion`, `EmailCampaign`, `EmailCampaignRecipient`, `EmailDelivery`, `EmailEvent`, `EmailSuppression`.
+  4. **Row Level Security (RLS) & Permissions**:
+     - All 13 Email tables have RLS enabled (`rowsecurity: true`).
+     - Explicit `whatsapp_hub_<table_name>_all` policies granted to role `whatsapp_hub`.
+     - Public/anon access revoked.
+  5. **Enums & Schema Definitions**:
+     - All 11 PostgreSQL enums verified in pg_catalog: `EmailProviderType`, `EmailProviderStatus`, `EmailType`, `EmailContactStatus`, `EmailSubscriptionStatus`, `EmailTemplateType`, `EmailCampaignStatus`, `EmailDeliveryStatus`, `EmailEventType`, `EmailSuppressionReason`, `EmailEventProcessingStatus`.
+     - All authoritative content columns (`htmlContent`, `textContent`, `campaignId`, `templateId`, `templateVersionId`, `replyTo`) verified on `EmailDelivery`.
+     - All async queue telemetry columns (`status`, `attempts`, `lastAttemptAt`, `processedAt`, `errorCode`, `errorMessage`, `providerConfigId`) verified on `EmailEvent`.
+     - Auth verification columns (`emailVerified`, `emailVerifiedAt`) verified on `User`.
+  6. **Indexes & Foreign Keys**:
+     - 16 foreign keys verified across Email models enforcing cascade and set null semantics.
+     - Critical indexes verified: `EmailDelivery_templateId_idx`, `EmailDelivery_campaignId_idx`, `EmailDelivery_clientId_idempotencyKey_key`, `EmailEvent_providerConfigId_providerEventId_key`, `EmailContact_clientId_normalizedEmail_key`, `OtpVerification_codeHash_idx`.
+  7. **Tenant Isolation Safety**:
+     - Every primary Email model enforces NOT NULL foreign key `clientId` referencing `ApiClient(id)`.
+  8. **Existing Production WhatsApp & RBAC Data Intact**:
+     - `ApiClient`: 10 rows (100% preserved)
+     - `ApiKey`: 7 rows (100% preserved)
+     - `Message`: 8 rows (100% preserved)
+     - `MessageEvent`: 6 rows (100% preserved)
+     - `User`: 5 rows (100% preserved)
+     - `UserSession`: 4 rows (100% preserved)
+  9. **Zero Fake Data Seeded**:
+     - All 13 Email tables currently contain exactly 0 rows.
+- **Unresolved Concerns**: None.
+- **Mitigation / Next Steps**: Production database is completely deployed, verified, and operational for the Email platform.
+
 ---
 
 ## Flag Template for Subsequent Prompts
@@ -570,6 +618,7 @@
 - **Mitigation / Next Steps**:
   - [Action to resolve concern in future phase]
 ```
+
 
 
 
