@@ -15,7 +15,7 @@
 
 import { Worker, Job, UnrecoverableError } from "bullmq";
 import { prisma } from "../../prisma";
-import { EmailDelivery, EmailDeliveryStatus, EmailProviderType } from "@prisma/client";
+import { EmailDelivery, EmailDeliveryStatus, EmailProviderType, EmailFailureCategory } from "@prisma/client";
 import { createWorkerRedisConnection } from "./connection";
 import { QUEUE_NAMES, TransactionalJobData, PromotionalJobData, JOB_NAMES, RetryableEmailError, isRetryableError } from "./types";
 import { providerRegistry } from "../registry";
@@ -23,6 +23,7 @@ import { EmailProvider } from "../types";
 import { logger } from "../../logger";
 import { processPromotionalDeliveryJob } from "./promotional-delivery-worker";
 import { workerTelemetry } from "./telemetry";
+import { emailDiagnosticsService } from "../../services/email-diagnostics-service";
 
 export { processPromotionalDeliveryJob };
 
@@ -115,6 +116,8 @@ export async function processTransactionalJob(
           status: EmailDeliveryStatus.FAILED,
           errorCode: "RECIPIENT_SUPPRESSED",
           errorMessage: `Recipient '${delivery.to}' is on the tenant suppression list (${isSuppressed.reason}).`,
+          failureCategory: EmailFailureCategory.INVALID_RECIPIENT,
+          diagnosticDetails: "Recipient is suppressed. Sending blocked.",
           failedAt: new Date(),
         },
       });
@@ -267,6 +270,7 @@ export async function processTransactionalJob(
     const msg = sendErr instanceof Error ? sendErr.message : "Unexpected send error";
 
     try {
+      const diag = emailDiagnosticsService.classifyFailure(msg);
       await prisma.emailDelivery.updateMany({
         where: {
           id: delivery.id,
@@ -276,6 +280,9 @@ export async function processTransactionalJob(
           status: retryable ? EmailDeliveryStatus.PROCESSING : EmailDeliveryStatus.FAILED,
           errorCode: "PROVIDER_EXCEPTION",
           errorMessage: msg,
+          failureCategory: diag.category,
+          diagnosticDetails: diag.humanSummary,
+          smtpCode: diag.smtpCode || undefined,
           failedAt: retryable ? null : new Date(),
         },
       });

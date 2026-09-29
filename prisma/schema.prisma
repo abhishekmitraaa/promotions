@@ -170,6 +170,7 @@ model ApiClient {
   emailDeliveries     EmailDelivery[]
   emailEvents         EmailEvent[]
   emailSuppressions   EmailSuppression[]
+  emailDomains        EmailDomain[]
 }
 
 model ApiKey {
@@ -358,6 +359,33 @@ enum EmailEventProcessingStatus {
   FAILED
 }
 
+enum EmailDomainVerificationStatus {
+  PENDING
+  VERIFIED
+  FAILED
+  REVOKED
+}
+
+enum EmailDnsStatus {
+  PENDING
+  VERIFIED
+  MISCONFIGURED
+  FAILED
+  MISSING
+}
+
+enum EmailFailureCategory {
+  AUTHENTICATION_FAILED
+  SPAM_BLOCK
+  INVALID_RECIPIENT
+  MAILBOX_FULL
+  DNS_LOOKUP_FAILURE
+  RATE_LIMITED
+  TLS_ERROR
+  QUOTA_EXCEEDED
+  UNKNOWN
+}
+
 // ==============================================================================
 // Email Platform Models
 // ==============================================================================
@@ -392,22 +420,63 @@ model EmailSenderIdentity {
   id               String               @id @default(uuid())
   clientId         String
   providerConfigId String?
+  domainId         String?
   email            String
   name             String?
   replyToEmail     String?
   isDefault        Boolean              @default(false)
   verified         Boolean              @default(false)
   verifiedAt       DateTime?
+  reputationScore  Int                  @default(100)
+  bounceRate       Float                @default(0.0)
+  complaintRate    Float                @default(0.0)
   createdAt        DateTime             @default(now())
   updatedAt        DateTime             @updatedAt
 
   client           ApiClient            @relation(fields: [clientId], references: [id], onDelete: Cascade)
   providerConfig   EmailProviderConfig? @relation(fields: [providerConfigId], references: [id], onDelete: SetNull)
+  domain           EmailDomain?         @relation(fields: [domainId], references: [id], onDelete: SetNull)
   campaigns        EmailCampaign[]
 
   @@unique([clientId, email])
   @@index([clientId])
   @@index([providerConfigId])
+  @@index([domainId])
+}
+
+model EmailDomain {
+  id                 String                        @id @default(uuid())
+  clientId           String
+  domain             String
+  verificationStatus EmailDomainVerificationStatus @default(PENDING)
+  verificationToken  String
+  spfStatus          EmailDnsStatus                @default(PENDING)
+  spfRecord          String?
+  spfExpected        String?
+  dkimStatus         EmailDnsStatus                @default(PENDING)
+  dkimSelector       String                        @default("whub")
+  dkimRecord         String?
+  dkimPublicKey      String?
+  dmarcStatus        EmailDnsStatus                @default(PENDING)
+  dmarcRecord        String?
+  dmarcPolicy        String?
+  mxStatus           EmailDnsStatus                @default(PENDING)
+  reputationScore    Int                           @default(100)
+  bounceRate         Float                         @default(0.0)
+  complaintRate      Float                         @default(0.0)
+  checkErrors        String?
+  lastCheckedAt      DateTime?
+  verifiedAt         DateTime?
+  createdAt          DateTime                      @default(now())
+  updatedAt          DateTime                      @updatedAt
+
+  client             ApiClient                     @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  senderIdentities   EmailSenderIdentity[]
+
+  @@unique([clientId, domain])
+  @@index([clientId])
+  @@index([domain])
+  @@index([verificationStatus])
 }
 
 model EmailContact {
@@ -616,6 +685,9 @@ model EmailDelivery {
   failedAt               DateTime?
   errorCode              String?
   errorMessage           String?
+  failureCategory        EmailFailureCategory?
+  diagnosticDetails      String?
+  smtpCode               String?
   idempotencyKey         String?
   createdAt              DateTime                @default(now())
   updatedAt              DateTime                @updatedAt
@@ -637,6 +709,7 @@ model EmailDelivery {
   @@index([campaignRecipientId])
   @@index([campaignId])
   @@index([templateId])
+  @@index([clientId, failureCategory])
 }
 
 model EmailEvent {

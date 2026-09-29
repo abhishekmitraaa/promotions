@@ -20,10 +20,12 @@ import {
   EmailContactStatus,
   EmailEventProcessingStatus,
   EmailProviderType,
+  EmailFailureCategory,
 } from "@prisma/client";
 import { NormalizedEmailWebhookEvent } from "../email/webhooks/types";
 import { classifyBounce } from "../email/webhooks/normalizer";
 import { EmailSuppressionService } from "./email-suppression-service";
+import { emailDiagnosticsService } from "./email-diagnostics-service";
 import { getEventsQueue } from "../email/queue/queues";
 import {
   JOB_NAMES,
@@ -665,6 +667,9 @@ export class EmailEventService {
       failedAt?: Date;
       errorCode?: string;
       errorMessage?: string;
+      failureCategory?: EmailFailureCategory;
+      diagnosticDetails?: string;
+      smtpCode?: string;
     } = {
       status: targetStatus,
     };
@@ -679,6 +684,14 @@ export class EmailEventService {
       updateData.failedAt = event.occurredAt || new Date();
       updateData.errorCode = event.bounceType || targetStatus;
       updateData.errorMessage = event.bounceReason || event.complaintFeedback;
+
+      const diag = emailDiagnosticsService.classifyFailure(
+        event.bounceReason || event.complaintFeedback,
+        event.bounceType
+      );
+      updateData.failureCategory = diag.category;
+      updateData.smtpCode = diag.smtpCode || undefined;
+      updateData.diagnosticDetails = diag.humanSummary;
     }
 
     await prisma.emailDelivery.update({

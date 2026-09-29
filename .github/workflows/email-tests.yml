@@ -105,6 +105,9 @@ jobs:
       - name: Run master 23-flow & adversarial certification suite
         run: npm run test:email:certify
 
+      - name: Run deliverability & DNS verification tests
+        run: npm run test:email:deliverability
+
       - name: Lint codebase
         run: npm run lint
 

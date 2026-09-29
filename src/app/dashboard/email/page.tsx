@@ -213,6 +213,9 @@ export default function EmailDashboardPage() {
         <Link href="/dashboard/email/deliveries" className="px-3 py-1.5 rounded-lg bg-zinc-900 text-zinc-300 hover:text-white border border-zinc-800 transition">
           Deliveries
         </Link>
+        <Link href="/dashboard/email/deliverability" className="px-3 py-1.5 rounded-lg bg-zinc-900 text-zinc-300 hover:text-white border border-zinc-800 transition">
+          Deliverability & DNS
+        </Link>
         <Link href="/dashboard/email/providers" className="px-3 py-1.5 rounded-lg bg-zinc-900 text-zinc-300 hover:text-white border border-zinc-800 transition">
           Providers
         </Link>
