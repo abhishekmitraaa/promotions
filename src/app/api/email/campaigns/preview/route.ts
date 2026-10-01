@@ -17,6 +17,7 @@ export async function POST(req: NextRequest) {
 
   const listId = typeof body.listId === "string" ? body.listId : null;
   const segmentId = typeof body.segmentId === "string" ? body.segmentId : null;
+  const criteria = body.criteria || null;
   const campaignType =
     body.type === EmailType.TRANSACTIONAL ? EmailType.TRANSACTIONAL : EmailType.PROMOTIONAL;
 
@@ -24,6 +25,7 @@ export async function POST(req: NextRequest) {
     const preview = await EmailAudienceResolver.resolvePreview(auth.clientId, {
       listId,
       segmentId,
+      criteria,
       type: campaignType,
     });
 
@@ -35,6 +37,8 @@ export async function POST(req: NextRequest) {
         suppressedCount: preview.suppressedCount,
         unsubscribedCount: preview.unsubscribedCount,
         invalidCount: preview.invalidCount,
+        breakdown: preview.breakdown,
+        explainSummary: preview.explainSummary,
       },
     });
   } catch (err) {

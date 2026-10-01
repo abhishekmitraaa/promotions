@@ -16,6 +16,8 @@ export const JOB_NAMES = {
   SEND_CAMPAIGN_RECIPIENT: "send-campaign-recipient",
   TRIGGER_SCHEDULED_CAMPAIGN: "trigger-scheduled-campaign",
   PROCESS_EMAIL_EVENT: "process-email-event",
+  PROCESS_AUTOMATION_STEP: "process-automation-step",
+  TRIGGER_RECURRING_AUTOMATION: "trigger-recurring-automation",
 } as const;
 
 export type EmailJobName = (typeof JOB_NAMES)[keyof typeof JOB_NAMES];
@@ -96,6 +98,37 @@ export function getCampaignJobId(campaignRecipientId: string): string {
     throw new Error("campaignRecipientId is required to generate campaign job ID");
   }
   return `email-campaign-${campaignRecipientId.trim()}`;
+}
+
+/**
+ * Automation Journey Step & Recurring Trigger Payload
+ */
+export interface AutomationJobData {
+  automationId: string;
+  enrollmentId?: string;
+  clientId: string;
+  stepId?: string;
+  recurrenceIndex?: number;
+}
+
+/**
+ * Generates stable business-level idempotency Job ID for automation journey steps.
+ */
+export function getAutomationStepJobId(enrollmentId: string, stepId: string): string {
+  if (!enrollmentId || !stepId) {
+    throw new Error("enrollmentId and stepId are required to generate automation step job ID");
+  }
+  return `email-automation-step-${enrollmentId.trim()}-${stepId.trim()}`;
+}
+
+/**
+ * Generates stable business-level idempotency Job ID for recurring automation triggers.
+ */
+export function getRecurringAutomationJobId(automationId: string, recurrenceIndex: number): string {
+  if (!automationId) {
+    throw new Error("automationId is required to generate recurring automation job ID");
+  }
+  return `email-automation-recurring-${automationId.trim()}-${recurrenceIndex}`;
 }
 
 /**

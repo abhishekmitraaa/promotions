@@ -1,9 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { authenticateEmailApi } from "@/lib/email/api-auth-helper";
 import { EmailSegmentService } from "@/lib/services/email-segment-service";
+import { EmailAudienceResolver } from "@/lib/services/email-audience-resolver";
+import { EmailType } from "@prisma/client";
 
 export async function POST(req: NextRequest) {
-  // Evaluates ad-hoc criteria preview for rule builder
+  // Evaluates ad-hoc criteria preview for rule builder with explainable counts
   const auth = await authenticateEmailApi(req, { requireAdminForMutations: false });
   if (!auth.authorized || !auth.clientId) return auth.errorResponse!;
 
@@ -26,14 +28,31 @@ export async function POST(req: NextRequest) {
 
   try {
     const limit = typeof body.limit === "number" ? body.limit : 20;
-    const result = await EmailSegmentService.previewContacts(auth.clientId, body.criteria, { limit });
+    const campaignType =
+      body.type === EmailType.TRANSACTIONAL ? EmailType.TRANSACTIONAL : EmailType.PROMOTIONAL;
+
+    const [sampleResult, explainableResult] = await Promise.all([
+      EmailSegmentService.previewContacts(auth.clientId, body.criteria, { limit }),
+      EmailAudienceResolver.resolvePreview(auth.clientId, {
+        criteria: body.criteria,
+        type: campaignType,
+      }),
+    ]);
+
     return NextResponse.json({
       success: true,
       data: {
-        totalMatching: result.matchingCount,
-        matchingCount: result.matchingCount,
-        contacts: result.sampleContacts,
-        sampleContacts: result.sampleContacts,
+        totalMatching: sampleResult.matchingCount,
+        matchingCount: sampleResult.matchingCount,
+        totalAudience: explainableResult.totalAudience,
+        eligibleCount: explainableResult.eligibleCount,
+        suppressedCount: explainableResult.suppressedCount,
+        unsubscribedCount: explainableResult.unsubscribedCount,
+        invalidCount: explainableResult.invalidCount,
+        breakdown: explainableResult.breakdown,
+        explainSummary: explainableResult.explainSummary,
+        contacts: sampleResult.sampleContacts,
+        sampleContacts: sampleResult.sampleContacts,
       },
     });
   } catch (err) {

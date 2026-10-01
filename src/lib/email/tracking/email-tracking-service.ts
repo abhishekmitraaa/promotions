@@ -507,6 +507,20 @@ export class EmailTrackingService {
       }
     }
 
+
+    try {
+      const { EmailAutomationService } = await import("../../services/email-automation-service");
+      await EmailAutomationService.handleEmailEvent({
+        clientId: delivery.clientId,
+        eventType: "OPENED",
+        email: delivery.to,
+        deliveryId: delivery.id,
+        campaignId: delivery.campaignId || delivery.campaignRecipient?.campaignId || undefined,
+      });
+    } catch {
+      // Non-fatal
+    }
+
     return { recorded: true };
   }
 
@@ -592,6 +606,20 @@ export class EmailTrackingService {
           data: { deliveredCount: { increment: 1 } },
         });
       }
+    }
+
+
+    try {
+      const { EmailAutomationService } = await import("../../services/email-automation-service");
+      await EmailAutomationService.handleEmailEvent({
+        clientId: delivery.clientId,
+        eventType: "CLICKED",
+        email: delivery.to,
+        deliveryId: delivery.id,
+        campaignId: delivery.campaignId || delivery.campaignRecipient?.campaignId || undefined,
+      });
+    } catch {
+      // Non-fatal
     }
 
     return { recorded: true };

@@ -36,6 +36,7 @@ import {
   isRetryableError,
 } from "../email/queue/types";
 import { checkAndCompleteCampaign } from "../email/queue/campaign-worker";
+import { EmailAutomationService } from "./email-automation-service";
 import { logger } from "../logger";
 
 // Monotonic precedence levels for delivery status
@@ -525,6 +526,19 @@ export class EmailEventService {
           eventRecord.clientId,
           normalizedEvent
         );
+
+        // Hook into Campaign Automation & Journey Engine
+        try {
+          await EmailAutomationService.handleEmailEvent({
+            clientId: eventRecord.clientId,
+            eventType: normalizedEvent.eventType,
+            email: normalizedEvent.recipient,
+            deliveryId: delivery?.id || eventRecord.deliveryId || undefined,
+            campaignId: delivery?.campaignId || undefined,
+          });
+        } catch (autoErr) {
+          logger.warn(`[EventService] Automation hook warning:`, autoErr);
+        }
       }
 
       // 7. Transition: PROCESSING -> PROCESSED

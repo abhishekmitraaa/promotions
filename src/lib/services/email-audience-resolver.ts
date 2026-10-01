@@ -3,15 +3,19 @@
  *
  * Implements a scalable, streaming, injection-proof audience architecture:
  * 1. Translates structured criteria to parameterized Prisma/PostgreSQL queries.
- * 2. Processes audiences in bounded keyset/cursor batches (500 contacts per batch),
+ * 2. Supports nested AND/OR groups, contact attributes, engagement criteria,
+ *    campaign activity, opens, clicks, delivery history, suppression state,
+ *    consent state, and list memberships.
+ * 3. Processes audiences in bounded keyset/cursor batches (500 contacts per batch),
  *    never loading the full tenant contact table into application memory.
- * 3. Preserves deterministic ordering across all queries (orderBy: { id: "asc" }).
- * 4. Filters invalid email formats, promotional consent, and suppressions authoritatively.
- * 5. Performs batched suppression lookups (1 indexed query per batch rather than N+1 queries).
- * 6. Guarantees preview counts match snapshot counts accurately for the same point in time.
- * 7. Protects snapshot creation under concurrent invocation via PostgreSQL advisory locks
+ * 4. Preserves deterministic ordering across all queries (orderBy: { id: "asc" }).
+ * 5. Filters invalid email formats, promotional consent, and suppressions authoritatively.
+ * 6. Performs batched suppression lookups (1 indexed query per batch rather than N+1 queries).
+ * 7. Provides explainable audience counts with granular breakdowns and summaries.
+ * 8. Guarantees preview counts match snapshot counts accurately for the same point in time.
+ * 9. Protects snapshot creation under concurrent invocation via PostgreSQL advisory locks
  *    and bulk inserts with duplicate prevention (skipDuplicates: true).
- * 8. Creates immutable, frozen recipient metadata snapshots on campaign launch.
+ * 10. Creates immutable, frozen recipient metadata snapshots on campaign launch.
  */
 
 import { prisma } from "../prisma";
@@ -30,13 +34,36 @@ import {
 
 type ListMemberWithContact = EmailListMember & { contact: EmailContact };
 
+export interface ExplainableBreakdown {
+  statusCounts: Record<string, number>;
+  suppressionReasons: Record<string, number>;
+  consentMetrics: {
+    hasMarketingConsentTrue: number;
+    hasMarketingConsentFalse: number;
+    verifiedTrue: number;
+    verifiedFalse: number;
+  };
+}
+
 export interface AudienceResolutionResult {
   totalAudience: number;
   eligibleCount: number;
   suppressedCount: number;
   unsubscribedCount: number;
   invalidCount: number;
+  breakdown: ExplainableBreakdown;
+  explainSummary: string;
   snapshotRecipients: EmailCampaignRecipient[];
+}
+
+export interface AudiencePreviewResult {
+  totalAudience: number;
+  eligibleCount: number;
+  suppressedCount: number;
+  unsubscribedCount: number;
+  invalidCount: number;
+  breakdown: ExplainableBreakdown;
+  explainSummary: string;
 }
 
 export interface BatchFilterResult {
@@ -44,6 +71,14 @@ export interface BatchFilterResult {
   suppressedCount: number;
   unsubscribedCount: number;
   invalidCount: number;
+  statusCounts: Record<string, number>;
+  suppressionReasons: Record<string, number>;
+  consentMetrics: {
+    hasMarketingConsentTrue: number;
+    hasMarketingConsentFalse: number;
+    verifiedTrue: number;
+    verifiedFalse: number;
+  };
 }
 
 const DEFAULT_BATCH_SIZE = 500;
@@ -53,22 +88,29 @@ export class EmailAudienceResolver {
    * Resolves and filters audience for preview without creating database snapshots.
    * Processes large audiences using bounded streaming batches for accurate, uncapped counts
    * while keeping memory flat and constant.
+   * Produces explainable audience metrics and summary.
    */
   static async resolvePreview(
     clientId: string,
-    target: { listId?: string | null; segmentId?: string | null; type: EmailType }
-  ): Promise<{
-    totalAudience: number;
-    eligibleCount: number;
-    suppressedCount: number;
-    unsubscribedCount: number;
-    invalidCount: number;
-  }> {
+    target: {
+      listId?: string | null;
+      segmentId?: string | null;
+      criteria?: unknown;
+      type: EmailType;
+    }
+  ): Promise<AudiencePreviewResult> {
     let totalAudience = 0;
     let eligibleCount = 0;
     let suppressedCount = 0;
     let unsubscribedCount = 0;
     let invalidCount = 0;
+
+    const accumulatedStatusCounts: Record<string, number> = {};
+    const accumulatedSuppressionReasons: Record<string, number> = {};
+    let totalConsentTrue = 0;
+    let totalConsentFalse = 0;
+    let totalVerifiedTrue = 0;
+    let totalVerifiedFalse = 0;
 
     for await (const batch of this.iterateCandidateBatches(clientId, target)) {
       totalAudience += batch.length;
@@ -77,7 +119,29 @@ export class EmailAudienceResolver {
       suppressedCount += filtered.suppressedCount;
       unsubscribedCount += filtered.unsubscribedCount;
       invalidCount += filtered.invalidCount;
+
+      // Accumulate status counts
+      for (const [st, cnt] of Object.entries(filtered.statusCounts)) {
+        accumulatedStatusCounts[st] = (accumulatedStatusCounts[st] || 0) + cnt;
+      }
+      // Accumulate suppression reasons
+      for (const [rs, cnt] of Object.entries(filtered.suppressionReasons)) {
+        accumulatedSuppressionReasons[rs] = (accumulatedSuppressionReasons[rs] || 0) + cnt;
+      }
+      totalConsentTrue += filtered.consentMetrics.hasMarketingConsentTrue;
+      totalConsentFalse += filtered.consentMetrics.hasMarketingConsentFalse;
+      totalVerifiedTrue += filtered.consentMetrics.verifiedTrue;
+      totalVerifiedFalse += filtered.consentMetrics.verifiedFalse;
     }
+
+    const explainSummary = this.buildExplainSummary({
+      totalAudience,
+      eligibleCount,
+      suppressedCount,
+      unsubscribedCount,
+      invalidCount,
+      type: target.type,
+    });
 
     return {
       totalAudience,
@@ -85,6 +149,17 @@ export class EmailAudienceResolver {
       suppressedCount,
       unsubscribedCount,
       invalidCount,
+      breakdown: {
+        statusCounts: accumulatedStatusCounts,
+        suppressionReasons: accumulatedSuppressionReasons,
+        consentMetrics: {
+          hasMarketingConsentTrue: totalConsentTrue,
+          hasMarketingConsentFalse: totalConsentFalse,
+          verifiedTrue: totalVerifiedTrue,
+          verifiedFalse: totalVerifiedFalse,
+        },
+      },
+      explainSummary,
     };
   }
 
@@ -95,7 +170,12 @@ export class EmailAudienceResolver {
    */
   static async createRecipientSnapshot(
     clientId: string,
-    campaign: { id: string; listId?: string | null; segmentId?: string | null; type: EmailType }
+    campaign: {
+      id: string;
+      listId?: string | null;
+      segmentId?: string | null;
+      type: EmailType;
+    }
   ): Promise<AudienceResolutionResult> {
     // Fast path: if snapshot already exists, return existing recipients deterministically
     let existingRecipients: EmailCampaignRecipient[] = [];
@@ -115,6 +195,17 @@ export class EmailAudienceResolver {
         suppressedCount: 0,
         unsubscribedCount: 0,
         invalidCount: 0,
+        breakdown: {
+          statusCounts: { SUBSCRIBED: existingRecipients.length },
+          suppressionReasons: {},
+          consentMetrics: {
+            hasMarketingConsentTrue: existingRecipients.length,
+            hasMarketingConsentFalse: 0,
+            verifiedTrue: existingRecipients.length,
+            verifiedFalse: 0,
+          },
+        },
+        explainSummary: `Audience loaded from existing frozen snapshot (${existingRecipients.length} recipients).`,
         snapshotRecipients: existingRecipients,
       };
     }
@@ -144,6 +235,17 @@ export class EmailAudienceResolver {
           suppressedCount: 0,
           unsubscribedCount: 0,
           invalidCount: 0,
+          breakdown: {
+            statusCounts: { SUBSCRIBED: lockedRecipients.length },
+            suppressionReasons: {},
+            consentMetrics: {
+              hasMarketingConsentTrue: lockedRecipients.length,
+              hasMarketingConsentFalse: 0,
+              verifiedTrue: lockedRecipients.length,
+              verifiedFalse: 0,
+            },
+          },
+          explainSummary: `Audience loaded from existing frozen snapshot (${lockedRecipients.length} recipients).`,
           snapshotRecipients: lockedRecipients,
         };
       }
@@ -153,12 +255,30 @@ export class EmailAudienceResolver {
       let unsubscribedCount = 0;
       let invalidCount = 0;
 
+      const accumulatedStatusCounts: Record<string, number> = {};
+      const accumulatedSuppressionReasons: Record<string, number> = {};
+      let totalConsentTrue = 0;
+      let totalConsentFalse = 0;
+      let totalVerifiedTrue = 0;
+      let totalVerifiedFalse = 0;
+
       for await (const batch of this.iterateCandidateBatches(clientId, campaign)) {
         totalAudience += batch.length;
         const filtered = await this.filterCandidateBatch(clientId, batch, campaign.type, tx);
         suppressedCount += filtered.suppressedCount;
         unsubscribedCount += filtered.unsubscribedCount;
         invalidCount += filtered.invalidCount;
+
+        for (const [st, cnt] of Object.entries(filtered.statusCounts)) {
+          accumulatedStatusCounts[st] = (accumulatedStatusCounts[st] || 0) + cnt;
+        }
+        for (const [rs, cnt] of Object.entries(filtered.suppressionReasons)) {
+          accumulatedSuppressionReasons[rs] = (accumulatedSuppressionReasons[rs] || 0) + cnt;
+        }
+        totalConsentTrue += filtered.consentMetrics.hasMarketingConsentTrue;
+        totalConsentFalse += filtered.consentMetrics.hasMarketingConsentFalse;
+        totalVerifiedTrue += filtered.consentMetrics.verifiedTrue;
+        totalVerifiedFalse += filtered.consentMetrics.verifiedFalse;
 
         if (filtered.eligible.length > 0) {
           const records = filtered.eligible.map((contact) => {
@@ -226,12 +346,32 @@ export class EmailAudienceResolver {
         data: { totalRecipients: snapshotRecipients.length },
       });
 
+      const explainSummary = this.buildExplainSummary({
+        totalAudience,
+        eligibleCount: snapshotRecipients.length,
+        suppressedCount,
+        unsubscribedCount,
+        invalidCount,
+        type: campaign.type,
+      });
+
       return {
         totalAudience,
         eligibleCount: snapshotRecipients.length,
         suppressedCount,
         unsubscribedCount,
         invalidCount,
+        breakdown: {
+          statusCounts: accumulatedStatusCounts,
+          suppressionReasons: accumulatedSuppressionReasons,
+          consentMetrics: {
+            hasMarketingConsentTrue: totalConsentTrue,
+            hasMarketingConsentFalse: totalConsentFalse,
+            verifiedTrue: totalVerifiedTrue,
+            verifiedFalse: totalVerifiedFalse,
+          },
+        },
+        explainSummary,
         snapshotRecipients,
       };
     };
@@ -254,25 +394,65 @@ export class EmailAudienceResolver {
   }
 
   /**
+   * Builds an explainable text summary of audience evaluation.
+   */
+  private static buildExplainSummary(params: {
+    totalAudience: number;
+    eligibleCount: number;
+    suppressedCount: number;
+    unsubscribedCount: number;
+    invalidCount: number;
+    type: EmailType;
+  }): string {
+    const { totalAudience, eligibleCount, suppressedCount, unsubscribedCount, invalidCount, type } = params;
+    const excluded = totalAudience - eligibleCount;
+    if (excluded === 0) {
+      return `All ${totalAudience} matching contacts are eligible to receive ${type.toLowerCase()} mail.`;
+    }
+
+    const reasons: string[] = [];
+    if (unsubscribedCount > 0) {
+      reasons.push(
+        type === EmailType.PROMOTIONAL
+          ? `${unsubscribedCount} lacking promotional consent / unsubscribed`
+          : `${unsubscribedCount} unsubscribed`
+      );
+    }
+    if (suppressedCount > 0) {
+      reasons.push(`${suppressedCount} suppressed by deliverability protections`);
+    }
+    if (invalidCount > 0) {
+      reasons.push(`${invalidCount} with invalid email syntax`);
+    }
+
+    return `${totalAudience} contacts evaluated. ${eligibleCount} are eligible. ${excluded} excluded (${reasons.join(", ")}).`;
+  }
+
+  /**
    * Asynchronous generator yielding batches of candidate contacts using cursor-based pagination.
    * Evaluates criteria in parameterized database queries where possible and avoids loading
    * the full contact table into memory.
    */
   private static async *iterateCandidateBatches(
     clientId: string,
-    target: { listId?: string | null; segmentId?: string | null },
+    target: {
+      listId?: string | null;
+      segmentId?: string | null;
+      criteria?: unknown;
+    },
     batchSize: number = DEFAULT_BATCH_SIZE
   ): AsyncGenerator<EmailContact[], void, unknown> {
     const hasList = Boolean(target.listId);
     const hasSegment = Boolean(target.segmentId);
+    const hasAdhocCriteria = Boolean(target.criteria);
 
-    // If neither list nor segment specified, audience is empty
-    if (!hasList && !hasSegment) {
+    // If neither list, segment, nor adhoc criteria specified, audience is empty
+    if (!hasList && !hasSegment && !hasAdhocCriteria) {
       return;
     }
 
-    // 1. If target has a list, fetch list members in batches
-    if (hasList && !hasSegment) {
+    // 1. If target has a list only (no segment, no adhoc criteria), fetch list members in batches
+    if (hasList && !hasSegment && !hasAdhocCriteria) {
       let cursorId: string | undefined = undefined;
       while (true) {
         const members: ListMemberWithContact[] = await prisma.emailListMember.findMany({
@@ -309,21 +489,30 @@ export class EmailAudienceResolver {
       return;
     }
 
-    // 2. Target has a segment (with or without list)
+    // 2. Target has a segment or adhoc criteria (with or without list)
     let segmentCriteria: SegmentCriteria | null = null;
     let segmentPrismaWhere: Prisma.EmailContactWhereInput = { clientId };
     let hasAttributeConditions = false;
 
-    if (target.segmentId) {
+    if (hasAdhocCriteria) {
+      try {
+        segmentCriteria = EmailSegmentService.validateCriteria(target.criteria);
+        const translation = EmailSegmentService.buildPrismaWhereFromCriteria(clientId, segmentCriteria);
+        segmentPrismaWhere = translation.prismaWhere;
+        hasAttributeConditions = translation.hasAttributeConditions;
+      } catch {
+        // Fallback
+      }
+    } else if (target.segmentId) {
       const segment = await prisma.emailSegment.findFirst({
         where: { id: target.segmentId, clientId },
       });
 
       if (segment) {
         try {
-          segmentCriteria = typeof segment.criteria === "string"
-            ? JSON.parse(segment.criteria)
-            : (segment.criteria as SegmentCriteria);
+          const rawCriteria =
+            typeof segment.criteria === "string" ? JSON.parse(segment.criteria) : segment.criteria;
+          segmentCriteria = EmailSegmentService.validateCriteria(rawCriteria);
           if (segmentCriteria) {
             const translation = EmailSegmentService.buildPrismaWhereFromCriteria(
               clientId,
@@ -383,7 +572,7 @@ export class EmailAudienceResolver {
     }
 
     // Yield segment contacts (excluding any already yielded from list)
-    if (hasSegment) {
+    if (hasSegment || hasAdhocCriteria) {
       let cursorId: string | undefined = undefined;
       while (true) {
         const batch: EmailContact[] = await prisma.emailContact.findMany({
@@ -428,6 +617,7 @@ export class EmailAudienceResolver {
    * 1. Filters invalid email formats.
    * 2. Enforces promotional marketing consent and subscribed status.
    * 3. Authoritatively checks suppressions in a single indexed batch lookup.
+   * 4. Collects granular diagnostic metrics for explainable breakdowns.
    */
   private static async filterCandidateBatch(
     clientId: string,
@@ -439,9 +629,22 @@ export class EmailAudienceResolver {
     let unsubscribedCount = 0;
     let suppressedCount = 0;
 
+    const statusCounts: Record<string, number> = {};
+    const suppressionReasons: Record<string, number> = {};
+    let hasMarketingConsentTrue = 0;
+    let hasMarketingConsentFalse = 0;
+    let verifiedTrue = 0;
+    let verifiedFalse = 0;
+
     // 1. Email syntax validity check
     const validSyntax: EmailContact[] = [];
     for (const contact of candidates) {
+      statusCounts[contact.status] = (statusCounts[contact.status] || 0) + 1;
+      if (contact.hasMarketingConsent) hasMarketingConsentTrue++;
+      else hasMarketingConsentFalse++;
+      if (contact.verified) verifiedTrue++;
+      else verifiedFalse++;
+
       if (!contact.email || !isValidEmail(contact.email)) {
         invalidCount++;
       } else {
@@ -449,30 +652,26 @@ export class EmailAudienceResolver {
       }
     }
 
-    // 2. Promotional consent and subscription status check
-    const consented: EmailContact[] = [];
-    for (const contact of validSyntax) {
-      if (campaignType === EmailType.PROMOTIONAL) {
-        if (contact.hasMarketingConsent !== true || contact.status !== EmailContactStatus.SUBSCRIBED) {
-          unsubscribedCount++;
-          continue;
-        }
-      }
-      consented.push(contact);
-    }
-
-    if (consented.length === 0) {
+    if (validSyntax.length === 0) {
       return {
         eligible: [],
         suppressedCount,
         unsubscribedCount,
         invalidCount,
+        statusCounts,
+        suppressionReasons,
+        consentMetrics: {
+          hasMarketingConsentTrue,
+          hasMarketingConsentFalse,
+          verifiedTrue,
+          verifiedFalse,
+        },
       };
     }
 
-    // 3. Batched suppression lookup (1 indexed query per batch with fallback)
-    const normalizedEmails = consented.map((c) => c.normalizedEmail);
-    let suppSet = new Set<string>();
+    // 2. Batched suppression lookup (indexed query per batch with fallback)
+    const normalizedEmails = validSyntax.map((c) => c.normalizedEmail);
+    const suppMap = new Map<string, string>(); // normalizedEmail -> reason
 
     try {
       if ("emailSuppression" in txDb && typeof txDb.emailSuppression?.findMany === "function") {
@@ -481,29 +680,55 @@ export class EmailAudienceResolver {
             clientId,
             normalizedEmail: { in: normalizedEmails },
           },
-          select: { normalizedEmail: true },
+          select: { normalizedEmail: true, reason: true },
         });
-        suppSet = new Set(suppressions.map((s) => s.normalizedEmail));
+        for (const s of suppressions) {
+          suppMap.set(s.normalizedEmail, s.reason);
+        }
       } else {
         throw new Error("findMany not available");
       }
     } catch {
-      // Fallback for environments without findMany mock
       for (const normEmail of normalizedEmails) {
         const supp = await EmailSuppressionService.isSuppressed(clientId, normEmail);
         if (supp.suppressed) {
-          suppSet.add(normEmail);
+          suppMap.set(normEmail, supp.reason || "SUPPRESSED");
         }
       }
     }
 
-    const eligible: EmailContact[] = [];
-    for (const contact of consented) {
-      if (suppSet.has(contact.normalizedEmail)) {
+    const unsuppressed: EmailContact[] = [];
+    for (const contact of validSyntax) {
+      const isStatusSuppressed =
+        contact.status === EmailContactStatus.SUPPRESSED ||
+        contact.status === EmailContactStatus.BOUNCED ||
+        contact.status === EmailContactStatus.COMPLAINED;
+
+      if (isStatusSuppressed || suppMap.has(contact.normalizedEmail)) {
         suppressedCount++;
+        const reason =
+          suppMap.get(contact.normalizedEmail) ||
+          (contact.status === EmailContactStatus.BOUNCED
+            ? "HARD_BOUNCE"
+            : contact.status === EmailContactStatus.COMPLAINED
+            ? "COMPLAINT"
+            : "SUPPRESSED");
+        suppressionReasons[reason] = (suppressionReasons[reason] || 0) + 1;
       } else {
-        eligible.push(contact);
+        unsuppressed.push(contact);
       }
+    }
+
+    // 3. Promotional consent and subscription status check on clean non-suppressed contacts
+    const eligible: EmailContact[] = [];
+    for (const contact of unsuppressed) {
+      if (campaignType === EmailType.PROMOTIONAL) {
+        if (contact.hasMarketingConsent !== true || contact.status !== EmailContactStatus.SUBSCRIBED) {
+          unsubscribedCount++;
+          continue;
+        }
+      }
+      eligible.push(contact);
     }
 
     return {
@@ -511,6 +736,14 @@ export class EmailAudienceResolver {
       suppressedCount,
       unsubscribedCount,
       invalidCount,
+      statusCounts,
+      suppressionReasons,
+      consentMetrics: {
+        hasMarketingConsentTrue,
+        hasMarketingConsentFalse,
+        verifiedTrue,
+        verifiedFalse,
+      },
     };
   }
 }

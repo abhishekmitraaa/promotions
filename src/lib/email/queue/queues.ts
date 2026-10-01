@@ -9,11 +9,12 @@ import {
   TransactionalJobData,
   PromotionalJobData,
   CampaignJobData,
+  AutomationJobData,
   EmailEventJobData,
 } from "./types";
 
 let transactionalQueue: Queue<TransactionalJobData | PromotionalJobData> | null = null;
-let campaignQueue: Queue<CampaignJobData | PromotionalJobData> | null = null;
+let campaignQueue: Queue<CampaignJobData | PromotionalJobData | AutomationJobData> | null = null;
 let eventsQueue: Queue<EmailEventJobData> | null = null;
 
 function getBaseQueueOptions(): QueueOptions {
@@ -53,9 +54,9 @@ export function getTransactionalQueue(): Queue<TransactionalJobData | Promotiona
 /**
  * Accessor for the promotional campaign queue.
  */
-export function getCampaignQueue(): Queue<CampaignJobData | PromotionalJobData> {
+export function getCampaignQueue(): Queue<CampaignJobData | PromotionalJobData | AutomationJobData> {
   if (!campaignQueue) {
-    campaignQueue = new Queue<CampaignJobData | PromotionalJobData>(
+    campaignQueue = new Queue<CampaignJobData | PromotionalJobData | AutomationJobData>(
       QUEUE_NAMES.CAMPAIGN,
       getBaseQueueOptions()
     );

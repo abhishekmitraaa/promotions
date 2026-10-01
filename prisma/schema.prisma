@@ -171,6 +171,8 @@ model ApiClient {
   emailEvents         EmailEvent[]
   emailSuppressions   EmailSuppression[]
   emailDomains        EmailDomain[]
+  emailAutomations    EmailAutomation[]
+  emailEnrollments    EmailAutomationEnrollment[]
 }
 
 model ApiKey {
@@ -386,6 +388,35 @@ enum EmailFailureCategory {
   UNKNOWN
 }
 
+enum EmailAutomationStatus {
+  DRAFT
+  ACTIVE
+  PAUSED
+  ARCHIVED
+}
+
+enum EmailAutomationTriggerType {
+  RECURRING_SCHEDULE
+  EVENT_TRIGGERED
+  SEGMENT_ENTRY
+  MANUAL
+}
+
+enum AudienceReEvaluationPolicy {
+  ALWAYS_RE_EVALUATE
+  SNAPSHOT_ONCE
+  STRICT_CONSENT_ONLY
+}
+
+enum EmailEnrollmentStatus {
+  ACTIVE
+  WAITING
+  COMPLETED
+  PAUSED
+  ABANDONED
+  FAILED
+}
+
 // ==============================================================================
 // Email Platform Models
 // ==============================================================================
@@ -499,8 +530,9 @@ model EmailContact {
   updatedAt           DateTime                 @updatedAt
 
   client              ApiClient                @relation(fields: [clientId], references: [id], onDelete: Cascade)
-  listMemberships     EmailListMember[]
-  campaignRecipients  EmailCampaignRecipient[]
+  listMemberships       EmailListMember[]
+  campaignRecipients    EmailCampaignRecipient[]
+  automationEnrollments EmailAutomationEnrollment[]
 
   @@unique([clientId, normalizedEmail])
   @@index([clientId])
@@ -620,7 +652,9 @@ model EmailCampaign {
   deliveredCount     Int                      @default(0)
   bouncedCount       Int                      @default(0)
   complaintCount     Int                      @default(0)
-  unsubscribedCount  Int                      @default(0)
+  automationId       String?
+  automationStepId   String?
+  recurrenceIndex    Int?
   createdAt          DateTime                 @default(now())
   updatedAt          DateTime                 @updatedAt
 
@@ -629,6 +663,7 @@ model EmailCampaign {
   segment            EmailSegment?            @relation(fields: [segmentId], references: [id], onDelete: SetNull)
   list               EmailList?               @relation(fields: [listId], references: [id], onDelete: SetNull)
   senderIdentity     EmailSenderIdentity?     @relation(fields: [senderIdentityId], references: [id], onDelete: SetNull)
+  automation         EmailAutomation?         @relation(fields: [automationId], references: [id], onDelete: SetNull)
   recipients         EmailCampaignRecipient[]
   deliveries         EmailDelivery[]
 
@@ -637,6 +672,7 @@ model EmailCampaign {
   @@index([scheduledAt])
   @@index([templateVersionId])
   @@index([senderIdentityId])
+  @@index([automationId])
 }
 
 model EmailCampaignRecipient {
@@ -762,3 +798,60 @@ model EmailSuppression {
   @@index([normalizedEmail])
   @@index([reason])
 }
+
+model EmailAutomation {
+  id                         String                      @id @default(uuid())
+  clientId                   String
+  name                       String
+  description                String?
+  status                     EmailAutomationStatus       @default(DRAFT)
+  triggerType                EmailAutomationTriggerType  @default(MANUAL)
+  triggerConfig              String?
+  reEvaluationPolicy         AudienceReEvaluationPolicy  @default(ALWAYS_RE_EVALUATE)
+  steps                      String                      // JSON serialized journey steps DAG
+  createdAt                  DateTime                    @default(now())
+  updatedAt                  DateTime                    @updatedAt
+  lastExecutedAt             DateTime?
+  nextRunAt                  DateTime?
+  executionCount             Int                         @default(0)
+  activeEnrollmentsCount     Int                         @default(0)
+  completedEnrollmentsCount  Int                         @default(0)
+  abandonedEnrollmentsCount  Int                         @default(0)
+
+  client                     ApiClient                   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  enrollments                EmailAutomationEnrollment[]
+  campaigns                  EmailCampaign[]
+
+  @@unique([clientId, name])
+  @@index([clientId])
+  @@index([status])
+  @@index([nextRunAt])
+}
+
+model EmailAutomationEnrollment {
+  id                String                 @id @default(uuid())
+  automationId      String
+  contactId         String
+  clientId          String
+  currentStepId     String?
+  status            EmailEnrollmentStatus  @default(ACTIVE)
+  abandonedReason   String?
+  contextData       String?                // JSON: execution history, variables, branch decisions
+  nextActionAt      DateTime?
+  enrolledAt        DateTime               @default(now())
+  completedAt       DateTime?
+  abandonedAt       DateTime?
+  updatedAt         DateTime               @updatedAt
+
+  automation        EmailAutomation        @relation(fields: [automationId], references: [id], onDelete: Cascade)
+  contact           EmailContact           @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  client            ApiClient              @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@unique([automationId, contactId])
+  @@index([automationId])
+  @@index([contactId])
+  @@index([clientId])
+  @@index([status])
+  @@index([nextActionAt])
+}
+

@@ -15,7 +15,16 @@
 
 import { Job, UnrecoverableError, Worker } from "bullmq";
 import { prisma } from "../../prisma";
-import { CampaignJobData, PromotionalJobData, RetryableEmailError, PermanentEmailError, QUEUE_NAMES, JOB_NAMES } from "./types";
+import {
+  CampaignJobData,
+  PromotionalJobData,
+  AutomationJobData,
+  RetryableEmailError,
+  PermanentEmailError,
+  QUEUE_NAMES,
+  JOB_NAMES,
+} from "./types";
+import { EmailAutomationService } from "../../services/email-automation-service";
 import { createWorkerRedisConnection } from "./connection";
 import { TemplateEngine } from "../template-engine";
 import { EmailSuppressionService } from "../../services/email-suppression-service";
@@ -77,13 +86,23 @@ export async function checkAndCompleteCampaign(campaignId: string): Promise<bool
 }
 
 export async function processCampaignJob(
-  job: Job<CampaignJobData>,
+  job: Job<CampaignJobData | AutomationJobData>,
   options?: CampaignWorkerOptions
 ) {
-  if (job.name === JOB_NAMES.TRIGGER_SCHEDULED_CAMPAIGN || (!job.data.campaignRecipientId && job.data.campaignId)) {
-    return processScheduledCampaignTriggerJob(job, options);
+  if (job.name === JOB_NAMES.PROCESS_AUTOMATION_STEP) {
+    const data = job.data as AutomationJobData;
+    if (data.enrollmentId) {
+      return EmailAutomationService.processEnrollmentStep(data.clientId, data.enrollmentId, data.stepId);
+    }
   }
-  return processCampaignRecipientJob(job, options);
+  if (job.name === JOB_NAMES.TRIGGER_RECURRING_AUTOMATION) {
+    const data = job.data as AutomationJobData;
+    return EmailAutomationService.executeRecurringStep(data.clientId, data.automationId);
+  }
+  if (job.name === JOB_NAMES.TRIGGER_SCHEDULED_CAMPAIGN || (!("campaignRecipientId" in job.data) && "campaignId" in job.data)) {
+    return processScheduledCampaignTriggerJob(job as Job<CampaignJobData>, options);
+  }
+  return processCampaignRecipientJob(job as Job<CampaignJobData>, options);
 }
 
 export async function processCampaignRecipientJob(
@@ -546,7 +565,7 @@ export function createCampaignWorker(options?: {
   const concurrency =
     options?.concurrency || parseInt(process.env.EMAIL_CAMPAIGN_CONCURRENCY || "5", 10);
 
-  const worker = new Worker<CampaignJobData | PromotionalJobData>(
+  const worker = new Worker<CampaignJobData | PromotionalJobData | AutomationJobData>(
     QUEUE_NAMES.CAMPAIGN,
     async (job) => {
       if (job.name === JOB_NAMES.SEND_PROMOTIONAL) {
@@ -558,6 +577,16 @@ export function createCampaignWorker(options?: {
         return processScheduledCampaignTriggerJob(job as Job<CampaignJobData>, {
           providerOverride: options?.providerOverride,
         });
+      }
+      if (job.name === JOB_NAMES.PROCESS_AUTOMATION_STEP) {
+        const data = job.data as AutomationJobData;
+        if (data.enrollmentId) {
+          return EmailAutomationService.processEnrollmentStep(data.clientId, data.enrollmentId, data.stepId);
+        }
+      }
+      if (job.name === JOB_NAMES.TRIGGER_RECURRING_AUTOMATION) {
+        const data = job.data as AutomationJobData;
+        return EmailAutomationService.executeRecurringStep(data.clientId, data.automationId);
       }
       return processCampaignRecipientJob(job as Job<CampaignJobData>, {
         providerOverride: options?.providerOverride,

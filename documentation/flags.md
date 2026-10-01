@@ -741,6 +741,65 @@
 
 ---
 
+### Entry: 2026-09-29 — Audience Engine Expansion (Nested Groups, Multi-Criteria, Explainable Breakdowns)
+- **Prompt / Phase**: Audience Engine Expansion & Advanced Criteria
+- **Status**: ✅ Clean (No unresolved concerns)
+- **Unresolved Concerns**: None.
+- **Capabilities Delivered**:
+  - **Nested AND/OR Groups**: Recursive AST engine supporting multi-level boolean trees with recursion depth limits (max depth 5) preventing stack overflow or cyclic DoS.
+  - **Contact Attributes**: Complete evaluation across direct fields (`email`, `firstName`, `lastName`, `status`, `createdAt`, `lastEmailedAt`) and JSON metadata (`attributes.<key>`) with rich operators (`equals`, `not_equals`, `contains`, `not_contains`, `starts_with`, `ends_with`, `in`, `not_in`, `greater_than`, `less_than`, `gte`, `lte`, `is_empty`, `is_not_empty`).
+  - **Engagement Criteria**: Dimension recency evaluation (`last_emailed` within N days, older than N days, never emailed).
+  - **Previous Campaign Activity**: Relational queries on past campaign dispatches (`targeted`, `not_targeted`, `received`, `not_received`).
+  - **Opens History**: Event-driven tracking queries for opened emails by campaign ID or within timeframes (`opened`, `not_opened`, `opened_within_days`).
+  - **Clicks History**: Event-driven tracking queries for clicked links (`clicked`, `not_clicked`, `clicked_url`, `clicked_within_days`).
+  - **Delivery History**: Direct delivery status filtering (`delivered`, `bounced`, `complained`, `failed`, `not_bounced`).
+  - **Suppression State**: Authoritative suppression checking (`is_suppressed`, `is_not_suppressed`) prioritizing hard bounces and spam complaints.
+  - **Consent State**: Promotional marketing consent verification (`hasMarketingConsent`, `verified`, `consentSource`, `consentTimestamp`).
+  - **List Membership**: Parameterized subqueries for list inclusion and exclusion (`in_list`, `not_in_list`) with subscription status checks.
+  - **Parameterized Query Generation & Zero Arbitrary SQL**: All queries compile down to Prisma typed AST objects with parameter bindings, completely immune to SQL injection.
+  - **Tenant Isolation**: Every condition node and relational branch strictly scopes to `clientId`.
+  - **Explainable Audience Counts**: Real-time diagnostic breakdowns with `totalAudience`, `eligibleCount`, `suppressedCount`, `unsubscribedCount`, `invalidCount`, `suppressionReasons`, `consentMetrics`, and human-readable `explainSummary`.
+  - **Scalable Pagination**: Keyset cursor streaming pagination (`take: 500`, `cursor: { id }`, `orderBy: { id: "asc" }`) maintaining flat memory consumption.
+  - **Deterministic Previews & Frozen Snapshots**: Previews strictly match snapshot counts for identical timestamps; campaign launches create immutable `metadataSnapshot` records protected by PostgreSQL transaction advisory locks (`SELECT pg_advisory_xact_lock(...)`) and duplicate prevention (`skipDuplicates: true`).
+- **Test Suites Verified**:
+  - `npm run test:email:audience`: 43/43 scale assertions passing.
+  - `npm run test:email:audience:advanced`: 28/28 criteria and isolation assertions passing.
+  - Total: 71/71 audience engine assertions passing (100% pass rate).
+  - ESLint passing cleanly (0 errors, 0 warnings).
+  - Next.js 16 Turbo build succeeding with all 71 routes compiled.
+
+---
+
+### Entry: 2026-09-29 — Campaign Automation & Journey Engine Built on Unified Campaign Core
+- **Prompt / Phase**: Build campaign automation on top of existing campaign engine (recurring campaigns, scheduled journeys, delayed follow-ups, event-triggered campaigns, abandoned workflow states, conditional branches, audience re-evaluation policies). Reusing BullMQ, PostgreSQL, state machine, consent/suppression, and tenant isolation without creating a second engine.
+- **Status**: ✅ Clean (100% Certified / All 32 Automation Tests Passing)
+- **Unresolved Concerns**: None.
+- **Key Architectures Delivered**:
+  - **Prisma Schema & Migrations**: Added `EmailAutomation`, `EmailAutomationEnrollment`, `EmailAutomationStatus`, `EmailAutomationTriggerType`, `AudienceReEvaluationPolicy`, `EmailEnrollmentStatus`. Created and applied forward migration `20260929010000_add_campaign_automation`.
+  - **Unified Campaign Engine Reuse**: Zero duplicate sending logic. Step emails dispatch as `EmailCampaign` child instances with `automationId`, `automationStepId`, and `recurrenceIndex`. All dispatches use existing BullMQ queue `email-campaign` (`JOB_NAMES.SEND_CAMPAIGN_RECIPIENT`), worker suppression verification, tracking pixel injection, and monotonic delivery state machine.
+  - **Recurring Campaigns**: Interval (minutes/days) and 5-field cron parsing (`0 9 * * 1`), automated child campaign creation, `nextRunAt` advances, and `maxRuns` cap enforcement.
+  - **Scheduled Journeys**: Multi-step DAG workflows supporting `SEND_CAMPAIGN`, `DELAY`, `CONDITIONAL_BRANCH`, `WAIT_FOR_EVENT`, and `END` steps.
+  - **Delayed Follow-ups**: `DELAY` steps compute `nextActionAt`, transition enrollment to `WAITING`, and enqueue BullMQ delayed jobs (`JOB_NAMES.PROCESS_AUTOMATION_STEP`).
+  - **Conditional Branches**: Parameterized evaluation of previous step opens/clicks (`EVENT_ENGAGEMENT`), contact attributes (`CONTACT_ATTRIBUTE`), marketing consent (`CONSENT_STATUS`), and list memberships (`LIST_MEMBERSHIP`).
+  - **Event-Triggered Campaigns & Wait-For-Event**: Webhook & tracking events (`OPENED`, `CLICKED`, `DELIVERED`) hook into `EmailAutomationService.handleEmailEvent`, advancing waiting enrollments and auto-enrolling contacts into active event automations.
+  - **Abandoned Workflow States**: Explicit terminal state `ABANDONED` with authoritative abandonment reasons: `TIMEOUT_EXPIRED`, `UNSUBSCRIBED`, `SUPPRESSED`, `CRITERIA_MISMATCH`, `MANUAL_EXIT`, `FAILED_DELIVERY`.
+  - **Audience Re-evaluation Policies**: `ALWAYS_RE_EVALUATE` (re-evaluates segment criteria dynamically before step sends), `SNAPSHOT_ONCE` (freezes initial membership), and `STRICT_CONSENT_ONLY` (re-verifies consent and suppression authoritatively).
+  - **REST API Endpoints**:
+    - `GET & POST /api/email/automations`
+    - `GET, PATCH, DELETE /api/email/automations/[id]`
+    - `POST /api/email/automations/[id]/activate`
+    - `POST /api/email/automations/[id]/pause`
+    - `POST /api/email/automations/[id]/enroll` (single contact or full audience)
+    - `GET /api/email/automations/[id]/enrollments` (paginated enrollment monitoring)
+- **Test Verification**:
+  - `npm run test:email:automation`: **32 PASSED, 0 FAILED** (100% pass across all 7 sections).
+  - `npm run test:email:certify`: **130 PASSED, 0 FAILED** (Zero regressions).
+  - `npm run test:email:audience:advanced`: **28 PASSED, 0 FAILED**.
+  - `npm run test:email:audience`: **43 PASSED, 0 FAILED**.
+  - `npx tsc --noEmit`: 0 errors.
+
+---
+
 ## Flag Template for Subsequent Prompts
 
 ```markdown

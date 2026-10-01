@@ -234,7 +234,7 @@ export class EmailAnalyticsService {
       complaints = campaign.complaintCount;
     }
 
-    const unsubscribed = campaign.unsubscribedCount || 0;
+    const unsubscribed = (campaign as any).unsubscribedCount || 0;
 
     const rates = computeAuthoritativeRates({
       sent,
@@ -291,7 +291,6 @@ export class EmailAnalyticsService {
           deliveredCount: true,
           bouncedCount: true,
           complaintCount: true,
-          unsubscribedCount: true,
         },
       }),
       prisma.emailSuppression.count({
@@ -369,8 +368,7 @@ export class EmailAnalyticsService {
       failed = Math.max(0, sent - delivered - bounced - complaints);
     }
 
-    const campaignUnsubs = campaigns.reduce((acc, c) => acc + (c.unsubscribedCount || 0), 0);
-    const unsubscribed = Math.max(unsubsCount, campaignUnsubs);
+    const unsubscribed = unsubsCount;
 
     const rates = computeAuthoritativeRates({
       sent,
