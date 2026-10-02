@@ -4,12 +4,20 @@ import { logger } from "@/lib/logger";
 import { requireUser } from "@/lib/auth";
 import { timingSafeEqualSecret } from "@/lib/timing-safe";
 
-export async function POST(req: NextRequest) {
+async function handleProcessQueue(req: NextRequest) {
   const workerSecret = req.headers.get("x-worker-secret");
-  const configuredWorkerSecret = process.env.INTERNAL_WORKER_SECRET;
-  const isWorkerAuthorized = await timingSafeEqualSecret(workerSecret, configuredWorkerSecret);
+  const authHeader = req.headers.get("authorization");
+  const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.substring(7) : null;
 
-  if (!isWorkerAuthorized) {
+  const configuredWorkerSecret = process.env.INTERNAL_WORKER_SECRET;
+  const configuredCronSecret = process.env.CRON_SECRET;
+
+  const isWorkerAuthorized = await timingSafeEqualSecret(workerSecret, configuredWorkerSecret);
+  const isBearerAuthorized =
+    (Boolean(bearerToken && configuredWorkerSecret) && (await timingSafeEqualSecret(bearerToken, configuredWorkerSecret))) ||
+    (Boolean(bearerToken && configuredCronSecret) && (await timingSafeEqualSecret(bearerToken, configuredCronSecret)));
+
+  if (!isWorkerAuthorized && !isBearerAuthorized) {
     const auth = await requireUser(req, "ADMIN");
     if (auth.response) return auth.response;
   }
@@ -35,4 +43,12 @@ export async function POST(req: NextRequest) {
       { status: 500 }
     );
   }
+}
+
+export async function POST(req: NextRequest) {
+  return handleProcessQueue(req);
+}
+
+export async function GET(req: NextRequest) {
+  return handleProcessQueue(req);
 }
