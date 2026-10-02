@@ -2,7 +2,12 @@
  * Push Notification Channel Provider Adapter (Future-Ready Architecture)
  *
  * Implements ChannelProviderAdapter for mobile/web push notifications (FCM / APNs).
- * Ready for immediate activation without modifying the unified messaging core.
+ *
+ * Production Safety Invariant:
+ * - Push notification gateway provider is not yet configured.
+ * - This adapter MUST NOT return fake successes, fake SENT status, or fabricate providerMessageId.
+ * - All send attempts fail explicitly with PROVIDER_UNAVAILABLE.
+ * - Health status reports DEGRADED until live gateway credentials and transports are wired.
  */
 
 import { ChannelProviderAdapter } from "./channel-adapter";
@@ -29,7 +34,7 @@ export class PushChannelAdapter implements ChannelProviderAdapter {
 
   /**
    * Dispatches Push Notification.
-   * In current phase, acts as a compliant mock / stub awaiting gateway binding.
+   * Fails explicitly with PROVIDER_UNAVAILABLE until upstream gateway credentials are configured.
    */
   async sendMessage(request: UnifiedMessageRequest): Promise<UnifiedSendResult> {
     const rawTo = request.recipient.destination || request.recipient.deviceToken;
@@ -81,15 +86,18 @@ export class PushChannelAdapter implements ChannelProviderAdapter {
       };
     }
 
-    const deliveryId = `push-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
-
+    // Invariant: Fail explicitly. Never fabricate fake success or fake providerMessageId!
     return {
-      success: true,
+      success: false,
       channel: "PUSH",
-      deliveryId,
-      providerMessageId: `fcm-${deliveryId}`,
-      status: "SENT",
-      sentAt: new Date(),
+      deliveryId: "",
+      status: "FAILED",
+      error: {
+        code: "PROVIDER_UNAVAILABLE",
+        message: "Push notification provider is not configured. Live push dispatch is unavailable.",
+        retryable: false,
+        failureCategory: "PROVIDER_ERROR",
+      },
     };
   }
 
@@ -121,22 +129,23 @@ export class PushChannelAdapter implements ChannelProviderAdapter {
 
   /**
    * Assesses Push gateway health.
+   * Reports DEGRADED because upstream gateway is not yet bound.
    */
   async checkHealth(): Promise<UnifiedProviderHealthResult> {
     return {
       providerType: this.providerName,
       channel: "PUSH",
-      status: "HEALTHY",
-      latencyMs: 18,
+      status: "DEGRADED",
+      latencyMs: -1,
       checkedAt: new Date(),
-      message: "Push Notification Gateway adapter operational",
+      message: "Push notification gateway provider is not configured. Live push dispatch is unavailable.",
       capabilities: {
-        supportsTemplates: true,
-        supportsMedia: true,
+        supportsTemplates: false,
+        supportsMedia: false,
         supportsTwoWay: false,
-        supportsDeliveryReceipts: true,
-        supportsReadReceipts: true,
-        maxThroughputPerSecond: 500,
+        supportsDeliveryReceipts: false,
+        supportsReadReceipts: false,
+        maxThroughputPerSecond: 0,
       },
     };
   }

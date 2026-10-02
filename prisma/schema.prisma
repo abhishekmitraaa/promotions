@@ -441,6 +441,7 @@ model EmailProviderConfig {
   client                     ApiClient           @relation(fields: [clientId], references: [id], onDelete: Cascade)
   senderIdentities           EmailSenderIdentity[]
   events                     EmailEvent[]
+  deliveries                 EmailDelivery[]
 
   @@index([clientId])
   @@index([providerType])
@@ -468,6 +469,7 @@ model EmailSenderIdentity {
   providerConfig   EmailProviderConfig? @relation(fields: [providerConfigId], references: [id], onDelete: SetNull)
   domain           EmailDomain?         @relation(fields: [domainId], references: [id], onDelete: SetNull)
   campaigns        EmailCampaign[]
+  deliveries       EmailDelivery[]
 
   @@unique([clientId, email])
   @@index([clientId])
@@ -712,6 +714,8 @@ model EmailDelivery {
   templateId             String?
   templateVersionId      String?
   campaignId             String?
+  providerConfigId       String?
+  senderIdentityId       String?
   status                 EmailDeliveryStatus     @default(QUEUED)
   attemptCount           Int                     @default(0)
   lastAttemptAt          DateTime?
@@ -733,6 +737,8 @@ model EmailDelivery {
   campaign               EmailCampaign?          @relation(fields: [campaignId], references: [id], onDelete: SetNull)
   template               EmailTemplate?          @relation(fields: [templateId], references: [id], onDelete: SetNull)
   templateVersion        EmailTemplateVersion?   @relation(fields: [templateVersionId], references: [id], onDelete: SetNull)
+  providerConfig         EmailProviderConfig?    @relation(fields: [providerConfigId], references: [id], onDelete: SetNull)
+  senderIdentity         EmailSenderIdentity?    @relation(fields: [senderIdentityId], references: [id], onDelete: SetNull)
   events                 EmailEvent[]
 
   @@unique([clientId, idempotencyKey])
@@ -745,6 +751,8 @@ model EmailDelivery {
   @@index([campaignRecipientId])
   @@index([campaignId])
   @@index([templateId])
+  @@index([providerConfigId])
+  @@index([senderIdentityId])
   @@index([clientId, failureCategory])
 }
 

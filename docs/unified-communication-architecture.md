@@ -1,262 +1,129 @@
-# Unified Multi-Channel Communication Platform Architecture
+# Unified Multi-Channel Communication Architecture & Migration Strategy
 
-**Document Version:** 1.0.0  
-**Status:** Approved Architectural Blueprint  
-**Target Systems:** WhatsApp (Meta Cloud API), Email (Gmail / ESP Engine), Future SMS, Future Push Notifications  
+## Executive Overview
+This document defines the architectural specification, design patterns, lifecycle state machines, cross-channel contracts, and the phased non-breaking migration strategy for transitioning from channel-siloed messaging to a unified omnichannel communication platform.
 
----
-
-## 1. Executive Summary & Architectural Paradigm
-
-Modern communication platforms require seamless engagement across multiple direct-to-consumer and business-to-business messaging channels. However, attempting to prematurely merge heterogeneous communication channels (such as WhatsApp, Email, SMS, and Push) into a single polymorphic database table causes severe architectural problems:
-- **Polymorphic Column Bloat & Nullability Epidemic:** Email requires RFC 5322 headers, DKIM/SPF domain verification, HTML bodies, and MIME multipart payloads; WhatsApp requires Meta Cloud API template namespaces, button indexes, and component parameters; SMS requires character encoding segments (GSM-7 vs. UCS-2); Push requires APNs collapse IDs and FCM device registration tokens. Merging them into a single table degrades indexing, increases row size, and removes relational foreign key constraints.
-- **Downtime and Regression Risk:** Altering production tables (`Message`, `EmailDelivery`, `EmailContact`) risks breaking live customer-facing messaging and marketing automations.
-
-### Architectural Solution: Domain-Driven Design & Anti-Corruption Layer (ACL)
-Instead of premature database unification, this architecture decouples the **conceptual domain layer** from the **concrete storage layer**:
-1. **Unified Domain Layer:** Exposes channel-agnostic contracts for 10 shared concepts: Contact, Message, Campaign, Template, Delivery, Event, Suppression, Consent, Provider, and Analytics.
-2. **Channel-Specific Services:** Retain optimized, dedicated services (`MessageService`, `EmailService`, `EmailEventService`, `EmailAutomationService`).
-3. **Provider-Specific Adapters:** Pluggable adapters implementing the `ChannelProviderAdapter` Service Provider Interface (SPI).
-4. **Anti-Corruption Layer (ACL):** Normalizes incoming vendor webhooks (Meta, Google, Resend, Twilio, Apple APNs) into standardized domain events without altering underlying storage.
-5. **Shared Lifecycle & Tenant Models:** Enforces strict monotonic delivery state transitions and multi-tenant isolation (`clientId`) across all channels.
-
-```mermaid
-flowchart TD
-    subgraph Client Application Layer
-        API[Admin / Public REST API]
-        CampaignEngine[Campaign Automation Engine]
-        Workflow[Scheduled Journeys & Automations]
-    end
-
-    subgraph Unified Communication Platform Abstraction
-        Router[UnifiedMessageRouter]
-        Registry[CommunicationRegistry]
-        TenantModel[Shared Tenant Isolation clientId]
-        Lifecycle[Monotonic Delivery State Machine]
-        AnalyticsEngine[Cross-Channel Analytics Aggregator]
-    end
-
-    subgraph Channel Provider Adapters SPI
-        WAAdapter[WhatsAppChannelAdapter]
-        EmailAdapter[EmailChannelAdapter]
-        SMSAdapter[SmsChannelAdapter]
-        PushAdapter[PushChannelAdapter]
-    end
-
-    subgraph Existing Concrete Storage & Underlying Services
-        WAPlatform[WhatsApp MessageService\nPrisma Message / MessageEvent]
-        EmailPlatform[EmailService & Deliverability\nPrisma EmailDelivery / EmailEvent]
-        SMSPlatform[SMS Gateway Provider\nTwilio / AWS SNS]
-        PushPlatform[Push Notification Gateway\nFirebase FCM / Apple APNs]
-    end
-
-    API --> Router
-    CampaignEngine --> Router
-    Workflow --> Router
-
-    Router --> TenantModel
-    Router --> Registry
-    Registry --> WAAdapter
-    Registry --> EmailAdapter
-    Registry --> SMSAdapter
-    Registry --> PushAdapter
-
-    WAAdapter --> WAPlatform
-    EmailAdapter --> EmailPlatform
-    SMSAdapter --> SMSPlatform
-    PushAdapter --> PushPlatform
-
-    WAPlatform -. Webhook Events .-> WAAdapter
-    EmailPlatform -. Webhook Events .-> EmailAdapter
-    SMSPlatform -. Webhook Events .-> SMSAdapter
-    PushPlatform -. Webhook Events .-> PushAdapter
-
-    WAAdapter --> Lifecycle
-    EmailAdapter --> Lifecycle
-    SMSAdapter --> Lifecycle
-    PushAdapter --> Lifecycle
-
-    Lifecycle --> AnalyticsEngine
-```
+### Core Architecture Principles
+1. **Zero Premature Schema Merging**: Channel-specific storage models (`Message` / `MessageEvent` for WhatsApp; `EmailContact` / `EmailDelivery` / `EmailEvent` / `EmailCampaign` for Email) remain isolated in PostgreSQL. We strictly reject polymorphic column dumping and table coalescing that would sacrifice referential integrity, indexes, or tenant isolation.
+2. **Anti-Corruption Layer (ACL)**: Unification occurs above the persistence layer via strongly-typed domain contracts, monotonic lifecycle adapters, and the `ChannelProviderAdapter` Service Provider Interface (SPI).
+3. **Strict Backward Compatibility**: Existing WhatsApp APIs, webhooks, and services (`MessageService`, `/api/webhooks/whatsapp`) and Email delivery pipelines (`EmailService`, BullMQ queues, worker processors) remain 100% backward compatible without interface drift or signature breaks.
+4. **Deterministic Fail-Closed Security**: Suppression verification, tenant boundary validation, and webhook signature verification strictly fail closed. Promotional dispatches are blocked if suppression state cannot be conclusively confirmed.
+5. **No Fake Upstream Successes**: Future adapters (SMS, Push) strictly return `PROVIDER_UNAVAILABLE` until production upstream gateways and credentials are bound.
 
 ---
 
-## 2. The 10 Shared Conceptual Domain Models
+## The 10 Shared Domain Concepts
 
-The architecture formalizes 10 core concepts shared across all current and future channels:
+The platform establishes 10 canonical abstractions in `src/lib/communication/types.ts`:
 
-### 2.1 Contact (`UnifiedContact`)
-An omnichannel entity representing a person or subscriber reachable across one or more communication channels.
-- **Reachability Map:** Maps destination channels (`WHATSAPP`, `EMAIL`, `SMS`, `PUSH`) with verification status (`verified: boolean`), opt-in status (`OPTED_IN`, `OPTED_OUT`, `PENDING`), and channel-specific handles.
-- **Data Model Boundary:** Maintains links to concrete records (`EmailContact`, WhatsApp phone directory) without forcing physical table unification.
-
-### 2.2 Message (`UnifiedMessageRequest`, `UnifiedSendResult`)
-The channel-agnostic envelope for outbound message dispatch.
-- **Tenant Context:** Strict `clientId` requirement.
-- **Message Category:** `TRANSACTIONAL`, `PROMOTIONAL`, `UTILITY`, `AUTHENTICATION`.
-- **Channel Variants:** Polymorphic content payload (rich HTML, plain text, Meta HSM template name and parameters, SMS body, Push notification payload).
-- **Idempotency:** Client-supplied idempotency key scoped strictly to `clientId`.
-
-### 2.3 Campaign (`UnifiedCampaign`)
-Cross-channel broadcast and marketing journey coordination.
-- **Lifecycle Statuses:** `DRAFT` $\to$ `SCHEDULED` $\to$ `RUNNING` $\to$ `PAUSED` $\to$ `COMPLETED` / `FAILED` / `CANCELLED`.
-- **Target Channels:** Dispatches across WhatsApp, Email, SMS, or Push.
-- **Audience Criteria:** Dynamic segments, static lists, or event triggers.
-
-### 2.4 Template (`UnifiedTemplate`)
-A single logical communication template containing channel-specific rendering variants:
-- **WhatsApp Variant:** Template name, language code (e.g. `en_US`), and parameter components.
-- **Email Variant:** Subject line, HTML body, plain text alternative, and variable interpolation syntax (`{{firstName}}`).
-- **SMS Variant:** 160-character segmented plain text with mandatory opt-out instructions (`Reply STOP`).
-- **Push Variant:** Title, subtitle, body, badge count, and custom JSON data payload.
-
-### 2.5 Delivery (`UnifiedDeliveryRecord`)
-Represents an individual transmission attempt to a specific recipient address/token.
-- **Lifecycle Tracking:** Monotonic tracking (`QUEUED` $\to$ `PROCESSING` $\to$ `SENT` $\to$ `DELIVERED` $\to$ `READ_OR_OPENED`).
-- **Failure Classification:** `UnifiedFailureCategory` (`INVALID_DESTINATION`, `RATE_LIMITED`, `PROVIDER_ERROR`, `OPTED_OUT_OR_SUPPRESSED`, etc.).
-
-### 2.6 Event (`UnifiedNormalizedEvent`)
-Authoritative telemetry stream capturing all channel interactions:
-- Standardized event types: `QUEUED`, `SENT`, `DELIVERED`, `READ_OR_OPENED`, `CLICKED`, `FAILED`, `BOUNCED`, `COMPLAINT`, `OPT_OUT`.
-- Canonical timestamp, recipient identity, provider event IDs, and payload metadata.
-
-### 2.7 Suppression (`UnifiedSuppression`)
-Cross-channel suppression registry preventing delivery to invalid or unwilling destinations:
-- **Reasons:** `HARD_BOUNCE`, `COMPLAINT`, `UNSUBSCRIBED`, `USER_BLOCKED`, `INVALID_DESTINATION`, `MANUAL`.
-- **Scope:** Channel-specific or global (`channel: "ALL"`).
-
-### 2.8 Consent (`UnifiedConsent`)
-Auditable opt-in / opt-out ledger supporting GDPR, TCPA, and Meta Business Policy compliance:
-- Category-level consent: Subscribers can opt into `TRANSACTIONAL` (order updates) while opting out of `PROMOTIONAL` campaigns.
-- Cryptographic proof, source tracking, and revocation timestamps.
-
-### 2.9 Provider (`UnifiedProviderHealthResult`, `ChannelProviderAdapter`)
-Decoupled transport adapter interface:
-- Standardized health probing (`checkHealth()`), round-trip latency reporting, and capability negotiation (media support, templates, two-way messaging, read receipts, rate limits).
-
-### 2.10 Analytics (`UnifiedRateMetrics`, `UnifiedAnalyticsSummary`)
-Standardized performance metrics across all channels:
-- $\text{deliveryRate} = \frac{\text{delivered}}{\text{sent}}$
-- $\text{readOrOpenRate} = \frac{\text{readOrOpened}}{\text{delivered}}$
-- $\text{clickThroughRate} = \frac{\text{clicked}}{\text{delivered}}$
-- $\text{clickToOpenRate} = \frac{\text{clicked}}{\text{readOrOpened}}$
-- $\text{bounceRate} = \frac{\text{bounced}}{\text{sent}}$
-- $\text{complaintRate} = \frac{\text{complaints}}{\text{delivered}}$
+| # | Concept | Unified Interface | Channel Implementations & Mappings |
+|---|---|---|---|
+| 1 | **Contact** | `UnifiedContact` | WhatsApp: E.164 phone number, chat contact profile.<br>Email: `EmailContact` (email, name, subscription status, consent).<br>SMS: E.164 normalized destination.<br>Push: Device registration token, OS type. |
+| 2 | **Message** | `UnifiedMessageRequest` | Standardized envelope containing sender, recipient, content variants (text, template, rich media), delivery options, idempotency keys, and tenant ID. |
+| 3 | **Campaign** | `UnifiedCampaign` | Encapsulates audience targeting, recurrence intervals, DAG automation steps, execution counters, and campaign state machines. |
+| 4 | **Template** | `UnifiedTemplate` | Multi-channel template definitions with channel-specific rendering targets (WhatsApp Cloud API template components vs. Email HTML/CSS/text vs. SMS text). |
+| 5 | **Delivery** | `UnifiedDeliveryRecord` | Monotonic state tracking record capturing provider references, attempt counts, timestamps, error diagnostics, and terminal delivery status. |
+| 6 | **Event** | `UnifiedNormalizedEvent` | Canonical telemetry event representation (`QUEUED`, `SENT`, `DELIVERED`, `READ_OR_OPENED`, `CLICKED`, `FAILED`, `BOUNCED`, `COMPLAINED`, `UNSUBSCRIBED`). |
+| 7 | **Suppression** | `UnifiedSuppression` | Multi-channel suppression record indexed by destination (email or E.164 phone) across reasons (`HARD_BOUNCE`, `COMPLAINT`, `UNSUBSCRIBE`, `MANUAL`). |
+| 8 | **Consent** | `UnifiedConsent` | Legal consent tracking with opt-in status (`OPTED_IN`, `OPTED_OUT`, `EXPLICIT_DOUBLE_OPT_IN`), source, timestamp, and audit trail. |
+| 9 | **Provider** | `UnifiedProviderHealthResult` | Provider abstraction defining credentials, latency health checks, rate limits, and capabilities (`supportsTemplates`, `supportsMedia`, `supportsTwoWay`). |
+| 10 | **Analytics** | `UnifiedAnalyticsSummary` | Normalized performance counters, deliverability rates, engagement rates, and error categorizations across channels and tenants. |
 
 ---
 
-## 3. Monotonic Delivery State Machine
+## Monotonic Delivery Lifecycle State Machine
 
-Because webhooks from Meta, Gmail, Resend, SendGrid, and Twilio can arrive out-of-order or duplicate, the platform enforces a **strictly monotonic state progression**:
+To prevent out-of-order webhook delivery from overwriting advanced terminal states with stale events, every channel adheres to a monotonic precedence matrix:
 
 ```mermaid
 stateDiagram-v2
-    [*] --> QUEUED
-    QUEUED --> PROCESSING: Worker Picks Job (Rank 10)
-    PROCESSING --> SENT: Provider Accepts (Rank 20)
-    SENT --> DELIVERED: Recipient Device Receives (Rank 30)
-    DELIVERED --> READ_OR_OPENED: User Opens / Reads (Rank 40)
-
-    SENT --> FAILED: Transport Error (Terminal)
-    PROCESSING --> FAILED: Internal Failure (Terminal)
-    QUEUED --> FAILED: Pre-dispatch Block (Terminal)
-
-    SENT --> BOUNCED: Mailbox Reject / Invalid Phone (Terminal)
-    DELIVERED --> COMPLAINED: User Flags Spam (Terminal)
-    BOUNCED --> COMPLAINED: Complaint Supersedes (Terminal)
-
-    note right of DELIVERED
-        Out-of-order 'SENT' webhooks arriving
-        after 'DELIVERED' are rejected to
-        prevent state regression.
-    end note
+    [*] --> QUEUED : Initial Creation
+    QUEUED --> PROCESSING : Picked up by Worker
+    PROCESSING --> SENT : Accepted by Gateway
+    SENT --> DELIVERED : Gateway Delivery Receipt
+    DELIVERED --> READ_OR_OPENED : Recipient Open / Read
+    READ_OR_OPENED --> CLICKED : Link Click
+    
+    PROCESSING --> FAILED : Gateway Reject
+    SENT --> BOUNCED : SMTP Hard Bounce / Reject
+    DELIVERED --> COMPLAINED : Spam Complaint
+    
+    FAILED --> [*]
+    BOUNCED --> [*]
+    COMPLAINED --> [*]
+    CLICKED --> [*]
 ```
 
-### Precedence Table
-
-| Rank | Status | Monotonic Rules |
-| :---: | :--- | :--- |
-| **0** | `QUEUED` | Initial queued state |
-| **10** | `PROCESSING` | Worker pickup; cannot regress to `QUEUED` |
-| **20** | `SENT` | Upstream accepted; cannot regress to `PROCESSING` or `QUEUED` |
-| **30** | `DELIVERED` | Handed off to destination device |
-| **40** | `READ_OR_OPENED` | Confirmed user engagement |
-| **90** | `FAILED` | Terminal transport failure; cannot regress |
-| **95** | `BOUNCED` | Terminal destination reject; cannot regress |
-| **100** | `COMPLAINED` | Terminal spam flag; supersedes all progressive states and soft failures |
+### Precedence Matrix & Transition Invariants
+- `QUEUED` (0) $\to$ `PROCESSING` (1) $\to$ `SENT` (2) $\to$ `DELIVERED` (3) $\to$ `READ_OR_OPENED` (4) $\to$ `CLICKED` (5).
+- Terminal failure states (`FAILED`, `BOUNCED`, `COMPLAINED`) have precedence 4+.
+- Terminal states can never transition backward to `QUEUED`, `PROCESSING`, or `SENT`.
+- `DELIVERED` can never be superseded by late generic `FAILED` or late `BOUNCED`.
+- `COMPLAINED` can legally succeed `DELIVERED` (representing user spam complaint after inbox receipt).
 
 ---
 
-## 4. Multi-Tenant Isolation Model
+## Campaign Automation & Journey Engine
 
-Tenant isolation is enforced as an uncompromisable security boundary:
-1. **Mandatory Tenant Context:** All operations require a verified `clientId`.
-2. **Horizontal Privilege Escalation Defense:** `assertTenantBoundary(entity, expectedClientId)` validates that every accessed record matches the caller's tenant.
-3. **Channel Gating:** Tenants only access channels explicitly permitted in their tenant profile.
+Built on top of the existing PostgreSQL and BullMQ foundations without introducing a second campaign engine:
+
+### DAG Workflow Step Types
+1. `SEND_CAMPAIGN`: Dispatches campaigns or single-recipient child campaigns via `executeSendCampaignStep`, ensuring later enrollments are never skipped by campaign worker completion.
+2. `DELAY`: Pauses execution for a positive duration (`delayMinutes`, `delayHours`, `delayDays`), scheduling BullMQ delayed jobs with mandatory continuation paths.
+3. `CONDITIONAL_BRANCH`: Evaluates contact attributes, tags, custom fields, and previous step outcomes to route contacts to `trueNextStepId` or `falseNextStepId`.
+4. `WAIT_FOR_EVENT`: Listens for recipient interactions (`OPENED`, `CLICKED`, `REPLIED`, etc.). Enforces timeout semantics: if the event arrives before timeout, advances to `nextStepId`; if timeout expires, branches to `timeoutNextStepId` or transitions to `ABANDONED` (`TIMEOUT_EXPIRED`). Never enters infinite timeout loops.
+5. `END`: Formally concludes journey execution, transitioning enrollment to `COMPLETED`.
+
+### Workflow Graph Validation Rules
+- **Unique Step Identifiers**: Every node must have a unique non-empty `id`.
+- **Dangling Reference Prevention**: Every edge target must resolve to a defined step in the workflow graph.
+- **Cycle Detection**: 3-color Depth-First Search (`UNVISITED`, `VISITING`, `VISITED`) proves the graph is a Directed Acyclic Graph (DAG) and reports the exact cycle chain upon detection.
+- **Bounded Depth**: Workflow execution depth is strictly limited to 50 steps.
+- **Reachability**: All nodes must be reachable from the root step.
+- **Terminal Path**: At least one path must reach a valid terminal step.
+
+### Audience Re-evaluation & Self-Trigger Prevention
+- **Re-evaluation Policies**: `ALWAYS_RE_EVALUATE`, `RE_EVALUATE_ON_STEP`, `NEVER_RE_EVALUATE`. Contacts failing segment filters or losing marketing consent are immediately abandoned with `CRITERIA_MISMATCH` or `UNSUBSCRIBED`.
+- **Strict Self-Trigger Prevention**: If an event originated from a child campaign belonging to an automation, that automation is prohibited from re-enrolling the contact from its own output.
+- **Re-entry Policy**: By default, contacts that complete or abandon cannot re-enroll. Re-entry requires explicit `allowReentry: true` configuration and compliance with the cooldown period (minimum 60 minutes).
 
 ---
 
-## 5. Phase-by-Phase Non-Breaking Migration Strategy
+## Phased Non-Breaking Migration Strategy
 
 ```mermaid
-gantt
-    title Omnichannel Platform Non-Breaking Migration Strategy
-    dateFormat  YYYY-MM-DD
-    section Phase 1: Conceptual Abstraction
-    Domain Types & Contracts (types.ts)               :done, p1_1, 2026-09-29, 2d
-    Lifecycle State Machine & Normalizers             :done, p1_2, 2026-09-29, 2d
-    Tenant Boundary Model & Analytics SPI             :done, p1_3, 2026-09-30, 2d
-    Channel Adapters & Unified Router (router.ts)      :done, p1_4, 2026-09-30, 2d
-    section Phase 2: Dual Routing & Verification
-    Shadow Routing Outbound WhatsApp & Email          :active, p2_1, 2026-10-02, 5d
-    Cross-Channel Verification & Regression Gates      :p2_2, after p2_1, 3d
-    section Phase 3: Omnichannel Journeys
-    Cross-Channel Campaign Orchestration               :p3_1, 2026-10-10, 7d
-    Unified Audience Segmentation                      :p3_2, after p3_1, 5d
-    section Phase 4: Event Streaming Bus
-    Redis / Kafka Unified Event Stream                :p4_1, 2026-10-22, 7d
-    Global Suppression & Consent Synchronization       :p4_2, after p4_1, 4d
-    section Phase 5: Storage Optimization
-    Optional Partitioned Archival Views                :p5_1, 2026-11-05, 10d
+timeline
+    title 5-Phase Zero-Downtime Migration Strategy
+    Phase 1 : Shared Domain Types & Anti-Corruption Layer : Zero DB schema modifications : Zero breaking changes
+    Phase 2 : Channel Provider Adapters & Message Router : WhatsApp & Email wrapped behind SPI : SMS/Push fail-safe stubs
+    Phase 3 : Authoritative Queue & Deliverability Hardening : Single pipeline for Email/WhatsApp : Fail-closed suppression
+    Phase 4 : Unified Ingestion Webhooks & Cross-Channel Analytics : Aggregated metrics : Normalization of all channel events
+    Phase 5 : Optional Read-Model Schema Consolidation : Omnichannel contact views : Zero downtime DB indexes
 ```
 
-### Phase 1: Conceptual Abstraction & Anti-Corruption Layer (COMPLETED)
-- Created shared contracts in `src/lib/communication/`: `types.ts`, `lifecycle.ts`, `tenant.ts`, `analytics.ts`, `adapters/`, `registry.ts`, `router.ts`.
-- Zero database changes: WhatsApp uses `Message` / `MessageEvent`; Email uses `EmailDelivery` / `EmailEvent`.
-- 100% backward compatibility certified with automated verification suite (`npm run test:communication`).
+### Phase 1: Shared Domain Abstractions (Completed)
+- Deploy `src/lib/communication/types.ts`, `lifecycle.ts`, `tenant.ts`, `analytics.ts`.
+- Zero database mutations.
+- WhatsApp and Email existing database schemas and code remain 100% untouched.
 
-### Phase 2: Dual Routing & Verification (Ready to Roll Out)
-- New features or internal services dispatch outbound communications through `UnifiedMessageRouter.route(request)`.
-- Existing direct calls to `MessageService.send()` and `EmailService.send()` continue executing identically without disruption.
-- Health checks monitor provider status across WhatsApp, Email, SMS, and Push.
+### Phase 2: Channel Adapters & Unified Router (Completed)
+- Implement `ChannelProviderAdapter` SPI.
+- Deploy `WhatsAppChannelAdapter` wrapping `MessageService` with 100% backward compatibility.
+- Deploy `EmailChannelAdapter` delegating to `EmailService` and template engine.
+- Deploy `SmsChannelAdapter` and `PushChannelAdapter` returning explicit `PROVIDER_UNAVAILABLE` until production gateways are provisioned.
+- Deploy `UnifiedMessageRouter` with multi-tenant boundaries and fail-closed suppression verification.
 
-### Phase 3: Omnichannel Journeys & Shared Campaigns
-- The existing Campaign Engine executes multi-step journeys that switch or fallback across channels (e.g. attempt WhatsApp $\to$ fallback to SMS $\to$ send follow-up Email).
-- Unified template resolver selects channel variants based on user preference.
+### Phase 3: Authoritative Pipeline & Automation Hardening (Completed)
+- Eliminate duplicate email dispatch pathways by routing through authoritative `EmailDelivery` persistence and BullMQ queues.
+- Implement child campaign isolation per enrollment execution in `EmailAutomationService`.
+- Implement timeout resolution and DAG cycle validation.
+- Protect webhooks with provider-level authentication and HMAC/PubSub signature verification.
 
-### Phase 4: Unified Event Streaming Bus
-- Publish all normalized events (`UnifiedNormalizedEvent`) to a Redis Stream or Kafka topic.
-- Dedicated worker processes update cross-channel analytics, suppression lists, and engagement scores in real time.
+### Phase 4: Omnichannel Event Telemetry & Cross-Channel Reporting
+- Ingest WhatsApp and Email webhook events into normalized domain contracts.
+- Aggregate deliverability and engagement counters across channels per tenant.
+- Provide unified analytics endpoints reporting delivery rate, open/read rate, click rate, and bounce rate.
 
-### Phase 5: Optional Storage Optimization (Long-Term)
-- If high-volume archival requires storage consolidation in the future, introduce database views or partitioned tables (`UnifiedDeliveryPartitioned`) with zero-downtime dual-writes.
-- Deprecation of legacy tables only after 6 months of verified parallel operation.
-
----
-
-## 6. Verification & Test Certification
-
-The platform includes a dedicated end-to-end verification suite in `scripts/verify-unified-communication.ts`:
-- **Test 1:** All 10 Shared Domain Concepts representation and typing.
-- **Test 2:** Monotonic delivery status transitions and regression rejections.
-- **Test 3:** Campaign lifecycle state machine transitions.
-- **Test 4:** Multi-tenant boundary isolation and unauthorized access prevention.
-- **Test 5:** Channel provider adapters SPI compliance for WhatsApp, Email, SMS, and Push.
-- **Test 6:** Unified channel registry and diagnostic health probes.
-- **Test 7:** Cross-channel analytics aggregation, zero-division defense, and bot scanner clamping.
-- **Test 8:** Inbound status and event normalization across all channels.
-
-To execute the verification suite:
-```bash
-npm run test:communication
-```
+### Phase 5: Optional Read-Model Schema Optimization (Future)
+- Introduce read-only PostgreSQL views or auxiliary query projections joining WhatsApp and Email contacts by phone/email hash.
+- Maintain independent source-of-truth tables (`Message` and `EmailDelivery`) permanently to preserve high-throughput partitioning, channel-specific indexes, and zero-risk isolation.

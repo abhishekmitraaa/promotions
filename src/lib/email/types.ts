@@ -178,6 +178,16 @@ export interface EmailSendRequest {
   attachments?: EmailAttachment[];
 
   /**
+   * Exact provider configuration binding (immutable provider selection).
+   */
+  providerConfigId?: string;
+
+  /**
+   * Sender identity reference.
+   */
+  senderIdentityId?: string;
+
+  /**
    * Idempotency key for deduplication.
    */
   idempotencyKey?: string;

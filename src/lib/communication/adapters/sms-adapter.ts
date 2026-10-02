@@ -2,7 +2,12 @@
  * SMS Channel Provider Adapter (Future-Ready Architecture)
  *
  * Implements the ChannelProviderAdapter contract for SMS messaging (Twilio / AWS SNS / MessageBird).
- * Ready for immediate activation without modifying the unified messaging core or other channels.
+ *
+ * Production Safety Invariant:
+ * - SMS gateway provider is not yet configured.
+ * - This adapter MUST NOT return fake successes, fake SENT status, or fabricate providerMessageId.
+ * - All send attempts fail explicitly with PROVIDER_UNAVAILABLE.
+ * - Health status reports DEGRADED until live gateway credentials and transports are wired.
  */
 
 import { ChannelProviderAdapter } from "./channel-adapter";
@@ -35,7 +40,7 @@ export class SmsChannelAdapter implements ChannelProviderAdapter {
 
   /**
    * Dispatches SMS message.
-   * In current phase, acts as a compliant mock / stub awaiting upstream gateway integration.
+   * Fails explicitly with PROVIDER_UNAVAILABLE until upstream gateway credentials are configured.
    */
   async sendMessage(request: UnifiedMessageRequest): Promise<UnifiedSendResult> {
     const rawTo = request.recipient.destination || request.recipient.phone;
@@ -85,21 +90,23 @@ export class SmsChannelAdapter implements ChannelProviderAdapter {
       };
     }
 
-    // Generated simulated or upstream delivery ID
-    const deliveryId = `sms-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
-
+    // Invariant: Fail explicitly. Never fabricate fake success or fake providerMessageId!
     return {
-      success: true,
+      success: false,
       channel: "SMS",
-      deliveryId,
-      providerMessageId: `sms-gw-${deliveryId}`,
-      status: "SENT",
-      sentAt: new Date(),
+      deliveryId: "",
+      status: "FAILED",
+      error: {
+        code: "PROVIDER_UNAVAILABLE",
+        message: "SMS channel is not configured with an active upstream provider gateway. Live SMS transmission is unavailable.",
+        retryable: false,
+        failureCategory: "PROVIDER_ERROR",
+      },
     };
   }
 
   /**
-   * Normalizes incoming SMS delivery receipt webhook.
+   * Normalizes incoming SMS delivery receipt webhook if gateway is active.
    */
   normalizeEvent(rawPayload: any): UnifiedNormalizedEvent | null {
     if (!rawPayload) return null;
@@ -129,22 +136,23 @@ export class SmsChannelAdapter implements ChannelProviderAdapter {
 
   /**
    * Assesses SMS provider health.
+   * Reports DEGRADED because upstream gateway is not yet bound.
    */
   async checkHealth(): Promise<UnifiedProviderHealthResult> {
     return {
       providerType: this.providerName,
       channel: "SMS",
-      status: "HEALTHY",
-      latencyMs: 20,
+      status: "DEGRADED",
+      latencyMs: -1,
       checkedAt: new Date(),
-      message: "SMS Gateway adapter operational",
+      message: "SMS gateway provider is not configured. Live SMS transmission is unavailable.",
       capabilities: {
         supportsTemplates: false,
         supportsMedia: false,
-        supportsTwoWay: true,
-        supportsDeliveryReceipts: true,
+        supportsTwoWay: false,
+        supportsDeliveryReceipts: false,
         supportsReadReceipts: false,
-        maxThroughputPerSecond: 50,
+        maxThroughputPerSecond: 0,
       },
     };
   }

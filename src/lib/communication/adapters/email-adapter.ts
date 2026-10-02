@@ -95,17 +95,57 @@ export class EmailChannelAdapter implements ChannelProviderAdapter {
       };
     }
 
+    let finalSubject = subject;
+    let finalHtml = htmlContent;
+    let finalText = textContent;
+    let resolvedTemplateId: string | undefined = request.content.templateId || (request.metadata?.templateId as string);
+    let resolvedTemplateVersionId: string | undefined = (request.metadata?.templateVersionId as string) || undefined;
+
+    if (resolvedTemplateId) {
+      try {
+        const { EmailTemplateService } = await import("../../services/email-template-service");
+        const { TemplateEngine } = await import("../../email/template-engine");
+
+        const template = await EmailTemplateService.getTemplateById(request.clientId, resolvedTemplateId);
+        if (template) {
+          const version = resolvedTemplateVersionId
+            ? template.versions.find((v) => v.id === resolvedTemplateVersionId)
+            : template.versions.find((v) => v.status === "ACTIVE") || template.versions[0];
+
+          if (version) {
+            const vars = {
+              email: val.normalized,
+              name: request.recipient.name || "",
+              ...(request.recipient.variables || {}),
+              ...(request.metadata || {}),
+            };
+            const rendered = TemplateEngine.renderTemplate(version, vars);
+            finalSubject = rendered.subject;
+            finalHtml = rendered.html;
+            finalText = rendered.text;
+            resolvedTemplateVersionId = version.id;
+          }
+        }
+      } catch (err: any) {
+        console.warn(`[EmailChannelAdapter] Template resolution warning: ${err.message}`);
+      }
+    }
+
     const emailSendRequest: EmailSendRequest = {
       clientId: request.clientId,
       to: val.normalized,
       from: request.sender?.fromAddress,
       replyTo: request.sender?.replyTo,
-      subject,
-      html: htmlContent,
-      text: textContent,
+      subject: finalSubject,
+      html: finalHtml,
+      text: finalText,
       type: request.category === "PROMOTIONAL" ? "PROMOTIONAL" : "TRANSACTIONAL",
       idempotencyKey: request.idempotencyKey,
       campaignId: request.campaignId,
+      templateId: resolvedTemplateId,
+      templateVersionId: resolvedTemplateVersionId,
+      providerConfigId: (request.metadata?.providerConfigId as string) || undefined,
+      senderIdentityId: request.sender?.identityId || (request.metadata?.senderIdentityId as string) || undefined,
       metadata: request.metadata,
     };
 

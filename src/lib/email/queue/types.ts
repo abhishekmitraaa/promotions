@@ -109,6 +109,7 @@ export interface AutomationJobData {
   clientId: string;
   stepId?: string;
   recurrenceIndex?: number;
+  isTimeout?: boolean;
 }
 
 /**

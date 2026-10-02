@@ -329,7 +329,7 @@ async function runTestSuite() {
   assert(pushAdapter.validateDestination("fcm_token_abcdef1234567890_valid").valid === true, "Push validator must accept valid device tokens");
   assert(pushAdapter.validateDestination("short").valid === false, "Push validator must reject short device tokens");
 
-  // Test SMS Dispatch stub
+  // Test SMS Dispatch stub (Fails safely with PROVIDER_UNAVAILABLE)
   const smsResult = await smsAdapter.sendMessage({
     clientId: testClientId,
     channel: "SMS",
@@ -337,9 +337,12 @@ async function runTestSuite() {
     recipient: { destination: "+14155552671" },
     content: { text: "Your verification code is 123456" },
   });
-  assert(smsResult.success === true && smsResult.channel === "SMS", "SMS adapter dispatch must succeed");
+  assert(
+    smsResult.success === false && smsResult.channel === "SMS" && smsResult.error?.code === "PROVIDER_UNAVAILABLE",
+    "SMS adapter must fail explicitly with PROVIDER_UNAVAILABLE when gateway is unconfigured"
+  );
 
-  // Test Push Dispatch stub
+  // Test Push Dispatch stub (Fails safely with PROVIDER_UNAVAILABLE)
   const pushResult = await pushAdapter.sendMessage({
     clientId: testClientId,
     channel: "PUSH",
@@ -347,7 +350,10 @@ async function runTestSuite() {
     recipient: { destination: "fcm_token_abcdef1234567890_valid" },
     content: { subject: "Security Alert", text: "New login from San Francisco" },
   });
-  assert(pushResult.success === true && pushResult.channel === "PUSH", "Push adapter dispatch must succeed");
+  assert(
+    pushResult.success === false && pushResult.channel === "PUSH" && pushResult.error?.code === "PROVIDER_UNAVAILABLE",
+    "Push adapter must fail explicitly with PROVIDER_UNAVAILABLE when gateway is unconfigured"
+  );
 
   console.log("   ✅ Channel provider adapters compliant with SPI.");
   passedTests++;

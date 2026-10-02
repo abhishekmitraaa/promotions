@@ -123,16 +123,19 @@ export class EmailService {
     let providerType: EmailProviderType;
     let providerSenderEmail: string | undefined;
 
+    let resolvedConfigId: string | null = request.providerConfigId || null;
+
     if (options?.providerOverride) {
       provider = options.providerOverride;
       providerType = provider.providerType;
     } else {
-      const resolved = await providerRegistry.resolveForTenant(request.clientId, undefined, {
+      const resolved = await providerRegistry.resolveForTenant(request.clientId, request.providerConfigId, {
         fetchFn: options?.fetchFn,
       });
       provider = resolved.provider;
       providerType = resolved.providerType;
       providerSenderEmail = resolved.senderEmail;
+      resolvedConfigId = resolved.configId;
     }
 
     // 4. Validate & Resolve Sender Identity (Step 9)
@@ -167,6 +170,8 @@ export class EmailService {
         data: {
           clientId: request.clientId,
           providerType,
+          providerConfigId: resolvedConfigId,
+          senderIdentityId: request.senderIdentityId || null,
           providerMessageId: sendResult.providerMessageId || null,
           campaignRecipientId: request.campaignRecipientId || null,
           transactionalReference: request.transactionalReference || null,

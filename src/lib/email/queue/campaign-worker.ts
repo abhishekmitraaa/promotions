@@ -92,6 +92,9 @@ export async function processCampaignJob(
   if (job.name === JOB_NAMES.PROCESS_AUTOMATION_STEP) {
     const data = job.data as AutomationJobData;
     if (data.enrollmentId) {
+      if (data.isTimeout && data.stepId) {
+        return EmailAutomationService.executeStepTimeout(data.clientId, data.enrollmentId, data.stepId);
+      }
       return EmailAutomationService.processEnrollmentStep(data.clientId, data.enrollmentId, data.stepId);
     }
   }

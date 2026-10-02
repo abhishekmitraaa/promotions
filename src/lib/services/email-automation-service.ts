@@ -284,7 +284,7 @@ export function parseNextCronOccurrence(cron: string, fromDate: Date = new Date(
 
 export class EmailAutomationService {
   /**
-   * Validates journey steps structure (DAG integrity, step names, types, targets).
+   * Validates journey steps structure (DAG integrity, step names, types, targets, cycle detection, depth, and reachability).
    */
   static validateSteps(steps: unknown): JourneyStep[] {
     if (!Array.isArray(steps) || steps.length === 0) {
@@ -292,19 +292,23 @@ export class EmailAutomationService {
     }
 
     const stepIdSet = new Set<string>();
+    const typedSteps: JourneyStep[] = [];
 
-    for (const step of steps) {
+    // Phase 1: Structure, unique IDs, types, and step-level config
+    for (let i = 0; i < steps.length; i++) {
+      const step = steps[i];
       if (!step || typeof step !== "object") {
-        throw new Error("Invalid step definition: step must be an object.");
+        throw new Error(`Invalid step definition at index ${i}: step must be an object.`);
       }
       const s = step as Partial<JourneyStep>;
       if (!s.id || typeof s.id !== "string" || !s.id.trim()) {
-        throw new Error("Each step must have a unique non-empty 'id'.");
+        throw new Error(`Step at index ${i} must have a unique non-empty string 'id'.`);
       }
-      if (stepIdSet.has(s.id)) {
-        throw new Error(`Duplicate step id '${s.id}' detected.`);
+      const cleanId = s.id.trim();
+      if (stepIdSet.has(cleanId)) {
+        throw new Error(`Duplicate step id '${cleanId}' detected.`);
       }
-      stepIdSet.add(s.id);
+      stepIdSet.add(cleanId);
 
       const validTypes: JourneyStepType[] = [
         "SEND_CAMPAIGN",
@@ -315,29 +319,271 @@ export class EmailAutomationService {
       ];
       if (!s.type || !validTypes.includes(s.type)) {
         throw new Error(
-          `Invalid step type '${s.type}' for step '${s.id}'. Valid types: ${validTypes.join(", ")}`
+          `Invalid step type '${s.type}' for step '${cleanId}'. Valid types: ${validTypes.join(", ")}`
         );
       }
 
-      // Step-specific validation
-      if (s.type === "CONDITIONAL_BRANCH") {
-        const branchConfig = s.config as ConditionalBranchStepConfig | undefined;
-        if (!branchConfig || !branchConfig.trueNextStepId || !branchConfig.falseNextStepId) {
-          throw new Error(
-            `CONDITIONAL_BRANCH step '${s.id}' requires 'trueNextStepId' and 'falseNextStepId'.`
+      typedSteps.push({
+        id: cleanId,
+        name: s.name ? String(s.name).trim() : `Step ${cleanId}`,
+        type: s.type,
+        config: (s.config || {}) as any,
+        nextStepId: s.nextStepId ? String(s.nextStepId).trim() : null,
+      });
+    }
+
+    // Build adjacency list for graph analysis
+    const adjacencyList = new Map<string, string[]>();
+    for (const step of typedSteps) {
+      adjacencyList.set(step.id, []);
+    }
+
+    for (const s of typedSteps) {
+      const outEdges: string[] = [];
+
+      switch (s.type) {
+        case "SEND_CAMPAIGN": {
+          const cfg = (s.config || {}) as SendCampaignStepConfig;
+          if (!cfg.templateId && !cfg.templateVersionId) {
+            throw new Error(`SEND_CAMPAIGN step '${s.id}' requires either 'templateId' or 'templateVersionId'.`);
+          }
+          if (s.nextStepId) {
+            if (s.nextStepId === s.id) {
+              throw new Error(`Self-referential edge detected: step '${s.id}' points to itself.`);
+            }
+            if (!stepIdSet.has(s.nextStepId)) {
+              throw new Error(`Step '${s.id}' references non-existent nextStepId '${s.nextStepId}'.`);
+            }
+            outEdges.push(s.nextStepId);
+          }
+          break;
+        }
+
+        case "DELAY": {
+          const delayConfig = (s.config || {}) as DelayStepConfig;
+          const hasDuration = Boolean(
+            (delayConfig.delayMinutes && delayConfig.delayMinutes > 0) ||
+            (delayConfig.delayHours && delayConfig.delayHours > 0) ||
+            (delayConfig.delayDays && delayConfig.delayDays > 0) ||
+            (delayConfig.delayMs && delayConfig.delayMs > 0)
           );
+          if (!hasDuration) {
+            throw new Error(`DELAY step '${s.id}' must specify a positive delay duration.`);
+          }
+          if (!s.nextStepId) {
+            throw new Error(`DELAY step '${s.id}' must specify a valid nextStepId continuation. Dangling delay steps are forbidden.`);
+          }
+          if (s.nextStepId === s.id) {
+            throw new Error(`Self-referential edge detected: DELAY step '${s.id}' points to itself.`);
+          }
+          if (!stepIdSet.has(s.nextStepId)) {
+            throw new Error(`DELAY step '${s.id}' references non-existent nextStepId '${s.nextStepId}'.`);
+          }
+          outEdges.push(s.nextStepId);
+          break;
+        }
+
+        case "CONDITIONAL_BRANCH": {
+          const branchConfig = s.config as ConditionalBranchStepConfig | undefined;
+          if (!branchConfig || !branchConfig.trueNextStepId || !branchConfig.falseNextStepId) {
+            throw new Error(
+              `CONDITIONAL_BRANCH step '${s.id}' requires 'trueNextStepId' and 'falseNextStepId'.`
+            );
+          }
+          const trueTarget = String(branchConfig.trueNextStepId).trim();
+          const falseTarget = String(branchConfig.falseNextStepId).trim();
+
+          if (trueTarget === s.id || falseTarget === s.id) {
+            throw new Error(`Self-referential edge detected: CONDITIONAL_BRANCH step '${s.id}' points to itself.`);
+          }
+          if (!stepIdSet.has(trueTarget)) {
+            throw new Error(`CONDITIONAL_BRANCH step '${s.id}' references non-existent trueNextStepId '${trueTarget}'.`);
+          }
+          if (!stepIdSet.has(falseTarget)) {
+            throw new Error(`CONDITIONAL_BRANCH step '${s.id}' references non-existent falseNextStepId '${falseTarget}'.`);
+          }
+          outEdges.push(trueTarget);
+          outEdges.push(falseTarget);
+          break;
+        }
+
+        case "WAIT_FOR_EVENT": {
+          const waitConfig = s.config as WaitForEventStepConfig | undefined;
+          if (!waitConfig || !waitConfig.nextStepId) {
+            throw new Error(`WAIT_FOR_EVENT step '${s.id}' requires 'nextStepId'.`);
+          }
+          const nextTarget = String(waitConfig.nextStepId).trim();
+          if (nextTarget === s.id) {
+            throw new Error(`Self-referential edge detected: WAIT_FOR_EVENT step '${s.id}' points to itself.`);
+          }
+          if (!stepIdSet.has(nextTarget)) {
+            throw new Error(`WAIT_FOR_EVENT step '${s.id}' references non-existent nextStepId '${nextTarget}'.`);
+          }
+          outEdges.push(nextTarget);
+
+          if (waitConfig.timeoutNextStepId) {
+            const timeoutTarget = String(waitConfig.timeoutNextStepId).trim();
+            if (timeoutTarget === s.id) {
+              throw new Error(`Self-referential edge detected: WAIT_FOR_EVENT timeout step '${s.id}' points to itself.`);
+            }
+            if (!stepIdSet.has(timeoutTarget)) {
+              throw new Error(`WAIT_FOR_EVENT step '${s.id}' references non-existent timeoutNextStepId '${timeoutTarget}'.`);
+            }
+            outEdges.push(timeoutTarget);
+          }
+          break;
+        }
+
+        case "END": {
+          if (s.nextStepId) {
+            throw new Error(`END step '${s.id}' cannot have outgoing nextStepId.`);
+          }
+          break;
         }
       }
 
-      if (s.type === "WAIT_FOR_EVENT") {
-        const waitConfig = s.config as WaitForEventStepConfig | undefined;
-        if (!waitConfig || !waitConfig.nextStepId) {
-          throw new Error(`WAIT_FOR_EVENT step '${s.id}' requires 'nextStepId'.`);
+      adjacencyList.set(s.id, outEdges);
+    }
+
+    // Phase 2: Cycle Detection using Depth-First Search with 3-color node state
+    // 0 = UNVISITED, 1 = VISITING (in current recursion stack), 2 = VISITED
+    const visitState = new Map<string, number>();
+    for (const step of typedSteps) {
+      visitState.set(step.id, 0);
+    }
+
+    function checkCycle(nodeId: string, pathStack: string[]): void {
+      visitState.set(nodeId, 1);
+      pathStack.push(nodeId);
+
+      const neighbors = adjacencyList.get(nodeId) || [];
+      for (const neighbor of neighbors) {
+        const state = visitState.get(neighbor);
+        if (state === 1) {
+          const cyclePath = [...pathStack, neighbor].join(" -> ");
+          throw new Error(`Cycle detected in automation workflow graph: ${cyclePath}.`);
+        }
+        if (state === 0) {
+          checkCycle(neighbor, pathStack);
+        }
+      }
+
+      pathStack.pop();
+      visitState.set(nodeId, 2);
+    }
+
+    for (const step of typedSteps) {
+      if (visitState.get(step.id) === 0) {
+        checkCycle(step.id, []);
+      }
+    }
+
+    // Phase 3: Reachability Analysis from Root Node (step[0])
+    const rootId = typedSteps[0].id;
+    const reachable = new Set<string>();
+    const queue = [rootId];
+    reachable.add(rootId);
+
+    while (queue.length > 0) {
+      const curr = queue.shift()!;
+      const neighbors = adjacencyList.get(curr) || [];
+      for (const next of neighbors) {
+        if (!reachable.has(next)) {
+          reachable.add(next);
+          queue.push(next);
         }
       }
     }
 
-    return steps as JourneyStep[];
+    const unreachable = typedSteps.filter((s) => !reachable.has(s.id)).map((s) => s.id);
+    if (unreachable.length > 0) {
+      throw new Error(`Unreachable step(s) detected: ${unreachable.join(", ")}. All steps must be reachable from root.`);
+    }
+
+    // Phase 4: Bounded Graph Depth (Max 50 steps from root)
+    const MAX_GRAPH_DEPTH = 50;
+    function computeMaxDepth(nodeId: string, currentDepth: number): number {
+      if (currentDepth > MAX_GRAPH_DEPTH) {
+        throw new Error(`Workflow graph exceeds maximum allowed depth of ${MAX_GRAPH_DEPTH}.`);
+      }
+      const neighbors = adjacencyList.get(nodeId) || [];
+      if (neighbors.length === 0) return currentDepth;
+      let maxSub = currentDepth;
+      for (const next of neighbors) {
+        const d = computeMaxDepth(next, currentDepth + 1);
+        if (d > maxSub) maxSub = d;
+      }
+      return maxSub;
+    }
+    computeMaxDepth(rootId, 1);
+
+    // Phase 5: Terminal Path Validation (Every path must be able to terminate)
+    const hasTerminal = typedSteps.some((s) => (adjacencyList.get(s.id) || []).length === 0);
+    if (!hasTerminal) {
+      throw new Error("Workflow graph has no valid terminal path. At least one terminal step (e.g. END) is required.");
+    }
+
+    return typedSteps;
+  }
+
+  /**
+   * Validates trigger configuration according to triggerType.
+   */
+  static validateTriggerConfig(triggerType: EmailAutomationTriggerType, triggerConfig?: unknown): void {
+    if (triggerType === EmailAutomationTriggerType.RECURRING_SCHEDULE) {
+      if (!triggerConfig || typeof triggerConfig !== "object") {
+        throw new Error("RECURRING_SCHEDULE automation requires 'triggerConfig' object.");
+      }
+      const cfg = triggerConfig as RecurringScheduleConfig;
+      if (!cfg.cronExpression && (!cfg.intervalMinutes || cfg.intervalMinutes <= 0) && (!cfg.intervalDays || cfg.intervalDays <= 0)) {
+        throw new Error("RECURRING_SCHEDULE trigger requires a valid 'cronExpression', 'intervalMinutes', or 'intervalDays'.");
+      }
+    }
+    if (triggerType === EmailAutomationTriggerType.EVENT_TRIGGERED) {
+      if (!triggerConfig || typeof triggerConfig !== "object") {
+        throw new Error("EVENT_TRIGGERED automation requires 'triggerConfig' object.");
+      }
+      const cfg = triggerConfig as EventTriggerConfig;
+      if (!cfg.eventType || typeof cfg.eventType !== "string") {
+        throw new Error("EVENT_TRIGGERED trigger requires a valid 'eventType'.");
+      }
+    }
+  }
+
+  /**
+   * Validates referenced resources (template, list, segment, sender) under the same tenant.
+   */
+  static async validateAutomationResources(
+    clientId: string,
+    input: CreateAutomationInput | UpdateAutomationInput
+  ): Promise<void> {
+    if (input.triggerConfig) {
+      const tc = input.triggerConfig as any;
+      if (tc.segmentId) {
+        const seg = await prisma.emailSegment.findFirst({ where: { id: tc.segmentId, clientId } });
+        if (!seg) throw new Error(`Referenced segment '${tc.segmentId}' not found for tenant '${clientId}'.`);
+      }
+      if (tc.listId) {
+        const list = await prisma.emailList.findFirst({ where: { id: tc.listId, clientId } });
+        if (!list) throw new Error(`Referenced list '${tc.listId}' not found for tenant '${clientId}'.`);
+      }
+    }
+
+    if (input.steps && Array.isArray(input.steps)) {
+      for (const step of input.steps) {
+        if (step.type === "SEND_CAMPAIGN" && step.config) {
+          const sc = step.config as SendCampaignStepConfig;
+          if (sc.templateId) {
+            const tpl = await prisma.emailTemplate.findFirst({ where: { id: sc.templateId, clientId } });
+            if (!tpl) throw new Error(`Referenced template '${sc.templateId}' in step '${step.id}' not found for tenant '${clientId}'.`);
+          }
+          if (sc.senderIdentityId) {
+            const sender = await prisma.emailSenderIdentity.findFirst({ where: { id: sc.senderIdentityId, clientId } });
+            if (!sender) throw new Error(`Referenced sender identity '${sc.senderIdentityId}' in step '${step.id}' not found for tenant '${clientId}'.`);
+          }
+        }
+      }
+    }
   }
 
   // ===========================================================================
@@ -356,6 +602,8 @@ export class EmailAutomationService {
     if (!name) throw new Error("Automation name is required");
 
     const validatedSteps = this.validateSteps(input.steps);
+    this.validateTriggerConfig(input.triggerType, input.triggerConfig);
+    await this.validateAutomationResources(clientId, input);
 
     // Check duplicate name per tenant
     const existing = await prisma.emailAutomation.findUnique({
@@ -417,7 +665,7 @@ export class EmailAutomationService {
   }
 
   /**
-   * Updates an existing automation.
+   * Updates an existing automation with full DAG, trigger, and resource validation.
    */
   static async updateAutomation(
     clientId: string,
@@ -460,6 +708,13 @@ export class EmailAutomationService {
       }
     }
 
+    if (input.triggerType || input.triggerConfig) {
+      this.validateTriggerConfig(
+        input.triggerType || existing.triggerType,
+        input.triggerConfig !== undefined ? input.triggerConfig : (existing.triggerConfig ? JSON.parse(existing.triggerConfig) : undefined)
+      );
+    }
+
     if (input.reEvaluationPolicy !== undefined) {
       data.reEvaluationPolicy = input.reEvaluationPolicy;
     }
@@ -469,6 +724,8 @@ export class EmailAutomationService {
       data.steps = JSON.stringify(validated);
     }
 
+    await this.validateAutomationResources(clientId, input);
+
     return prisma.emailAutomation.update({
       where: { id: existing.id },
       data,
@@ -476,7 +733,7 @@ export class EmailAutomationService {
   }
 
   /**
-   * Activates an automation. If it has a recurring schedule, enqueues the first run.
+   * Activates an automation and recovers/reschedules any paused or overdue enrollments.
    */
   static async activateAutomation(clientId: string, automationId: string): Promise<EmailAutomation> {
     const automation = await this.getAutomationById(clientId, automationId);
@@ -514,6 +771,43 @@ export class EmailAutomationService {
       }
     }
 
+    // Recover paused enrollments for this automation so they are not permanently stranded
+    const pausedEnrollments = await prisma.emailAutomationEnrollment.findMany({
+      where: {
+        automationId: automation.id,
+        status: EmailEnrollmentStatus.PAUSED,
+      },
+    });
+
+    const queue = getCampaignQueue();
+    for (const enrollment of pausedEnrollments) {
+      const isWaitingStep = Boolean(
+        enrollment.currentStepId &&
+        enrollment.nextActionAt &&
+        enrollment.nextActionAt.getTime() > Date.now()
+      );
+      const newStatus = isWaitingStep ? EmailEnrollmentStatus.WAITING : EmailEnrollmentStatus.ACTIVE;
+
+      await prisma.emailAutomationEnrollment.update({
+        where: { id: enrollment.id },
+        data: { status: newStatus },
+      });
+
+      if (!isWaitingStep && enrollment.currentStepId) {
+        const jobId = getAutomationStepJobId(enrollment.id, enrollment.currentStepId);
+        await queue.add(
+          JOB_NAMES.PROCESS_AUTOMATION_STEP,
+          {
+            automationId: automation.id,
+            enrollmentId: enrollment.id,
+            clientId,
+            stepId: enrollment.currentStepId,
+          } as AutomationJobData,
+          { jobId }
+        );
+      }
+    }
+
     return prisma.emailAutomation.update({
       where: { id: automation.id },
       data: {
@@ -524,13 +818,24 @@ export class EmailAutomationService {
   }
 
   /**
-   * Pauses an active automation.
+   * Pauses an active automation and marks active/waiting enrollments as PAUSED.
    */
   static async pauseAutomation(clientId: string, automationId: string): Promise<EmailAutomation> {
     const automation = await this.getAutomationById(clientId, automationId);
     if (!automation) {
       throw new Error(`Automation '${automationId}' not found for tenant '${clientId}'.`);
     }
+
+    // Mark active and waiting enrollments as PAUSED
+    await prisma.emailAutomationEnrollment.updateMany({
+      where: {
+        automationId: automation.id,
+        status: { in: [EmailEnrollmentStatus.ACTIVE, EmailEnrollmentStatus.WAITING] },
+      },
+      data: {
+        status: EmailEnrollmentStatus.PAUSED,
+      },
+    });
 
     return prisma.emailAutomation.update({
       where: { id: automation.id },
@@ -607,11 +912,34 @@ export class EmailAutomationService {
     if (existing) {
       if (
         existing.status === EmailEnrollmentStatus.ACTIVE ||
-        existing.status === EmailEnrollmentStatus.WAITING
+        existing.status === EmailEnrollmentStatus.WAITING ||
+        existing.status === EmailEnrollmentStatus.PAUSED
       ) {
         return existing; // Already actively enrolled
       }
-      // Re-enroll if previously completed or abandoned
+
+      // Re-entry Policy Guard: By default, do NOT re-enroll completed or abandoned contacts.
+      const triggerCfg: any = automation.triggerConfig ? JSON.parse(automation.triggerConfig) : {};
+      const allowReentry = Boolean(triggerCfg.allowReentry);
+
+      if (!allowReentry) {
+        logger.info(
+          `[Automation:Reentry] Contact '${contactId}' previously completed or abandoned automation '${automationId}'. Re-entry is disabled. Skipping.`
+        );
+        return existing;
+      }
+
+      // Cooldown protection (default minimum 60 minutes)
+      const cooldownMinutes = typeof triggerCfg.reentryCooldownMinutes === "number" ? triggerCfg.reentryCooldownMinutes : 60;
+      const lastFinished = existing.completedAt || existing.abandonedAt || existing.updatedAt;
+      if (lastFinished && Date.now() - lastFinished.getTime() < cooldownMinutes * 60 * 1000) {
+        logger.info(
+          `[Automation:Reentry] Contact '${contactId}' within cooldown (${cooldownMinutes}m) for automation '${automationId}'. Skipping.`
+        );
+        return existing;
+      }
+
+      // Re-enroll if policy explicitly permits and cooldown passed
       return this.resetAndStartEnrollment(clientId, existing.id, automation, contact, contextData);
     }
 
@@ -1062,7 +1390,18 @@ export class EmailAutomationService {
       }
 
       case "WAIT_FOR_EVENT": {
-        const waitConfig = step.config as WaitForEventStepConfig;
+        // If enrollment is ALREADY waiting on this step, this invocation represents the timeout check!
+        if (enrollment.status === EmailEnrollmentStatus.WAITING && enrollment.currentStepId === step.id) {
+          await this.executeStepTimeout(clientId, enrollment.id, step.id);
+          const updated = await prisma.emailAutomationEnrollment.findUnique({ where: { id: enrollment.id } });
+          return {
+            status: updated?.status || EmailEnrollmentStatus.WAITING,
+            stepId: updated?.currentStepId || step.id,
+            abandonedReason: updated?.abandonedReason || undefined,
+          };
+        }
+
+        const waitConfig = (step.config || {}) as WaitForEventStepConfig;
         let timeoutMs = 24 * 3600 * 1000; // default 24h
         if (waitConfig.timeoutMinutes) timeoutMs = waitConfig.timeoutMinutes * 60 * 1000;
         if (waitConfig.timeoutHours) timeoutMs = waitConfig.timeoutHours * 3600 * 1000;
@@ -1079,16 +1418,26 @@ export class EmailAutomationService {
           },
         });
 
-        // Enqueue delayed timeout check
+        // Enqueue delayed timeout check (Deterministic ID)
         const queue = getCampaignQueue();
         const timeoutJobId = `timeout-${enrollment.id}-${step.id}`;
+
+        const existingJob = await queue.getJob(timeoutJobId);
+        if (existingJob) {
+          const state = await existingJob.getState();
+          if (state === "completed" || state === "failed") {
+            await existingJob.remove();
+          }
+        }
+
         await queue.add(
           JOB_NAMES.PROCESS_AUTOMATION_STEP,
           {
             automationId: enrollment.automationId,
             enrollmentId: enrollment.id,
             clientId,
-            stepId: step.id, // Re-evaluates this step upon timeout
+            stepId: step.id,
+            isTimeout: true,
           } as AutomationJobData,
           {
             delay: timeoutMs,
@@ -1109,9 +1458,91 @@ export class EmailAutomationService {
   }
 
   /**
+   * Authoritative timeout execution for WAIT_FOR_EVENT steps.
+   * If enrollment is still waiting at this step:
+   * - Advances to timeoutNextStepId if specified.
+   * - Otherwise transitions to ABANDONED (TIMEOUT_EXPIRED).
+   * Idempotent: no-op if enrollment has already advanced past this step.
+   */
+  static async executeStepTimeout(
+    clientId: string,
+    enrollmentId: string,
+    stepId: string
+  ): Promise<{ handled: boolean; action: string }> {
+    const enrollment = await prisma.emailAutomationEnrollment.findUnique({
+      where: { id: enrollmentId },
+      include: { automation: true },
+    });
+
+    if (!enrollment || enrollment.clientId !== clientId) {
+      return { handled: false, action: "ENROLLMENT_NOT_FOUND" };
+    }
+
+    // 1. Guard: Automation paused or archived
+    if (enrollment.automation.status !== EmailAutomationStatus.ACTIVE) {
+      logger.info(
+        `[Automation:Timeout] Automation ${enrollment.automationId} is ${enrollment.automation.status}. Postponing timeout execution.`
+      );
+      return { handled: false, action: "AUTOMATION_NOT_ACTIVE" };
+    }
+
+    // 2. Guard: Verification that enrollment is STILL waiting on THIS exact step
+    if (enrollment.status !== EmailEnrollmentStatus.WAITING || enrollment.currentStepId !== stepId) {
+      logger.info(
+        `[Automation:Timeout] Enrollment ${enrollmentId} is no longer waiting on step ${stepId} (status: ${enrollment.status}, step: ${enrollment.currentStepId}). Timeout is an idempotent no-op.`
+      );
+      return { handled: true, action: "NOOP_ALREADY_ADVANCED" };
+    }
+
+    // 3. Load step configuration
+    const steps: JourneyStep[] = JSON.parse(enrollment.automation.steps);
+    const step = steps.find((s) => s.id === stepId);
+    if (!step || step.type !== "WAIT_FOR_EVENT") {
+      return { handled: false, action: "INVALID_STEP_TYPE" };
+    }
+
+    const config = (step.config || {}) as WaitForEventStepConfig;
+    const context: EnrollmentContextData = enrollment.contextData
+      ? JSON.parse(enrollment.contextData)
+      : { stepHistory: [], branchDecisions: {} };
+
+    // 4. Branch on timeoutNextStepId vs Abandonment
+    if (config.timeoutNextStepId) {
+      logger.info(
+        `[Automation:Timeout] Enrollment ${enrollmentId} timed out at step ${stepId}. Branching to '${config.timeoutNextStepId}'.`
+      );
+      context.stepHistory.push({
+        stepId: step.id,
+        type: "WAIT_FOR_EVENT",
+        executedAt: new Date().toISOString(),
+        details: { outcome: "TIMEOUT_BRANCHED", nextStepId: config.timeoutNextStepId },
+      });
+
+      await prisma.emailAutomationEnrollment.update({
+        where: { id: enrollment.id },
+        data: {
+          status: EmailEnrollmentStatus.ACTIVE,
+          currentStepId: config.timeoutNextStepId,
+          nextActionAt: new Date(),
+          contextData: JSON.stringify(context),
+        },
+      });
+
+      await this.processEnrollmentStep(clientId, enrollment.id, config.timeoutNextStepId);
+      return { handled: true, action: "TIMEOUT_BRANCHED" };
+    } else {
+      logger.info(
+        `[Automation:Timeout] Enrollment ${enrollmentId} timed out at step ${stepId} without next step. Abandoning with TIMEOUT_EXPIRED.`
+      );
+      await this.abandonEnrollment(clientId, enrollment.id, ABANDON_REASONS.TIMEOUT_EXPIRED);
+      return { handled: true, action: "TIMEOUT_ABANDONED" };
+    }
+  }
+
+  /**
    * Executes a SEND_CAMPAIGN step using the existing campaign engine.
-   * Never creates a second sending system:
-   * Creates or resolves a step campaign -> creates campaign recipient -> enqueues BullMQ job.
+   * Dedicated child campaign per enrollment/execution (Option A):
+   * Ensures campaign worker completion never causes later contacts to be skipped!
    */
   private static async executeSendCampaignStep(
     clientId: string,
@@ -1121,12 +1552,15 @@ export class EmailAutomationService {
   ): Promise<void> {
     const config = (step.config || {}) as SendCampaignStepConfig;
 
-    // Find or create dedicated child campaign for this automation step
+    // Find or create dedicated child campaign for this enrollment's step execution
+    const stepCampaignName = `${config.campaignNamePrefix || "Journey Step"} - ${step.name} - ${enrollment.id.slice(0, 8)}`;
+
     let stepCampaign = await prisma.emailCampaign.findFirst({
       where: {
         clientId,
         automationId: enrollment.automationId,
         automationStepId: step.id,
+        name: stepCampaignName,
       },
     });
 
@@ -1151,7 +1585,7 @@ export class EmailAutomationService {
           clientId,
           automationId: enrollment.automationId,
           automationStepId: step.id,
-          name: `${config.campaignNamePrefix || "Journey Step"} - ${step.name}`,
+          name: stepCampaignName,
           templateVersionId,
           senderIdentityId: config.senderIdentityId || null,
           type: EmailType.PROMOTIONAL,
@@ -1599,6 +2033,21 @@ export class EmailAutomationService {
     });
 
     for (const auto of eventAutomations) {
+      // Strict Self-Trigger Prevention: If the event was emitted by a campaign
+      // originating from this same automation, NEVER re-trigger this automation!
+      if (campaignId) {
+        const sourceCampaign = await prisma.emailCampaign.findUnique({
+          where: { id: campaignId },
+          select: { automationId: true },
+        });
+        if (sourceCampaign?.automationId === auto.id) {
+          logger.info(
+            `[Automation:SelfTrigger] Blocked event '${eventType}' from campaign '${campaignId}' originating from automation '${auto.id}'. Self-reentry prohibited.`
+          );
+          continue;
+        }
+      }
+
       const config: EventTriggerConfig = auto.triggerConfig ? JSON.parse(auto.triggerConfig) : {};
       if (config.eventType === eventType || config.eventType === "CUSTOM") {
         try {

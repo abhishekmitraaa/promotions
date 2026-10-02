@@ -4,9 +4,10 @@
  * Provides a single, omnichannel dispatch interface for the platform.
  * Enforces:
  * 1. Multi-tenant boundaries and channel enablement.
- * 2. Pre-dispatch suppression and opt-out checks (e.g. EmailSuppressionService).
+ * 2. Pre-dispatch suppression and opt-out checks with strict FAIL-CLOSED semantics.
+ *    (Never dispatches promotional communications if suppression status cannot be verified).
  * 3. Recipient address validation via channel adapters.
- * 4. Zero schema disruption: delegates directly to channel adapters without mutating tables.
+ * 4. Zero schema disruption: delegates directly to authoritative channel adapters.
  */
 
 import { assertTenantContext, isChannelEnabledForTenant } from "./tenant";
@@ -16,6 +17,7 @@ import {
   UnifiedSendResult,
 } from "./types";
 import { EmailSuppressionService } from "../services/email-suppression-service";
+import { normalizePhoneNumber } from "../crypto";
 
 export class UnifiedMessageRouter {
   /**
@@ -87,9 +89,10 @@ export class UnifiedMessageRouter {
       }
     }
 
-    // 6. Channel-Specific Suppression Enforcement
-    if (request.channel === "EMAIL") {
-      try {
+    // 6. Unified Suppression Enforcement (FAIL-CLOSED)
+    // Production Invariant: Never dispatch when suppression state is unverified or active.
+    try {
+      if (request.channel === "EMAIL") {
         const suppCheck = await EmailSuppressionService.isSuppressed(
           tenant.clientId,
           destination
@@ -102,16 +105,48 @@ export class UnifiedMessageRouter {
             status: "FAILED",
             error: {
               code: "RECIPIENT_SUPPRESSED",
-              message: `Recipient '${destination}' is suppressed for tenant '${tenant.clientId}' (reason: ${suppCheck.reason})`,
+              message: `Recipient '${destination}' is suppressed for tenant '${tenant.clientId}' (reason: ${suppCheck.reason || "SUPPRESSED"})`,
               retryable: false,
               failureCategory: "OPTED_OUT_OR_SUPPRESSED",
             },
           };
         }
-      } catch (err: any) {
-        // If suppression check errors out, log and continue or fail safe
-        console.warn(`[UnifiedMessageRouter] Suppression check warning: ${err.message}`);
+      } else if (request.channel === "WHATSAPP" || request.channel === "SMS") {
+        // Phone-based suppression verification
+        const normalizedPhone = normalizePhoneNumber(destination);
+        const suppCheck = await EmailSuppressionService.isSuppressed(
+          tenant.clientId,
+          normalizedPhone
+        );
+        if (suppCheck.suppressed) {
+          return {
+            success: false,
+            channel: request.channel,
+            deliveryId: "",
+            status: "FAILED",
+            error: {
+              code: "RECIPIENT_SUPPRESSED",
+              message: `Recipient '${destination}' is suppressed for tenant '${tenant.clientId}' (reason: ${suppCheck.reason || "SUPPRESSED"})`,
+              retryable: false,
+              failureCategory: "OPTED_OUT_OR_SUPPRESSED",
+            },
+          };
+        }
       }
+    } catch (err: any) {
+      // FAIL-CLOSED: Authoritative suppression check could not be verified
+      return {
+        success: false,
+        channel: request.channel,
+        deliveryId: "",
+        status: "FAILED",
+        error: {
+          code: "SUPPRESSION_CHECK_FAILED",
+          message: `Authoritative suppression check failed for recipient '${destination}': ${err.message}. Dispatch blocked (fail-closed).`,
+          retryable: true,
+          failureCategory: "OPTED_OUT_OR_SUPPRESSED",
+        },
+      };
     }
 
     // 7. Dispatch message via Adapter

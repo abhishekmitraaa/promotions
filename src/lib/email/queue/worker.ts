@@ -140,10 +140,21 @@ export async function processTransactionalJob(
     providerType = provider.providerType;
   } else {
     try {
-      const resolved = await providerRegistry.resolveForTenant(delivery.clientId);
+      const resolved = await providerRegistry.resolveForTenant(
+        delivery.clientId,
+        delivery.providerConfigId || undefined
+      );
       provider = resolved.provider;
       providerType = resolved.providerType;
       providerSenderEmail = resolved.senderEmail;
+
+      // Immutably bind providerConfigId if not already persisted
+      if (!delivery.providerConfigId && resolved.configId) {
+        await prisma.emailDelivery.updateMany({
+          where: { id: delivery.id },
+          data: { providerConfigId: resolved.configId },
+        });
+      }
     } catch (resolveErr) {
       const msg = resolveErr instanceof Error ? resolveErr.message : "Provider resolution failed";
       await prisma.emailDelivery.updateMany({
