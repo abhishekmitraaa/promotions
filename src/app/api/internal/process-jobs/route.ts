@@ -13,6 +13,9 @@ import { timingSafeEqualSecret } from "@/lib/timing-safe";
  * Fails closed in production if secret is unconfigured or mismatch occurs.
  * Never allows processing on GET requests (returns HTTP 405).
  */
+export const maxDuration = 60;
+export const dynamic = "force-dynamic";
+
 export async function POST(req: NextRequest) {
   const configuredSecret = process.env.INTERNAL_PROCESSOR_SECRET;
 

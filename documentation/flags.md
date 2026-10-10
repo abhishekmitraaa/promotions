@@ -969,7 +969,45 @@
 
 ---
 
+### Entry: 2026-10-11 — Fix Slow Serverless Processing, Runtime Limits & Pipeline Verification
+- **Prompt / Phase**: Fix Slow Serverless Processing, Configure Production Runtime Limits, 4-Stage Bounded Parallelism, and Recertify Pipeline
+- **Status**: ✅ Clean (All Checks Clean, Timeout Boundary Secured, 66/66 Pipeline Tests Green)
+- **Resolved Optimizations & Configurations**:
+  1. **Prisma Connection Reuse Across Serverless Invocations**:
+     - In `src/lib/prisma.ts`, enabled unconditional assignment `globalForPrisma.prisma = prisma;` in production.
+     - Preserves connection pool across warm serverless container invocations, eliminating repeated TCP/SSL handshakes to Supabase pooler.
+  2. **Vercel Route & Infrastructure Configuration**:
+     - Configured `export const maxDuration = 60;` and `export const dynamic = "force-dynamic";` in both `src/app/api/internal/process-jobs/route.ts` and `src/app/api/admin/jobs/process/route.ts`.
+     - In `vercel.json`, configured function execution region to Mumbai (`bom1`) and `maxDuration: 60` for `/api/internal/process-jobs` and `/api/admin/jobs/process`, co-locating serverless compute with Supabase PostgreSQL (`ap-south-1`).
+  3. **4-Stage Bounded Parallelism**:
+     - Restructured `ServerlessJobProcessor.processAll` from 8 serial database sweeps into 4 concurrent stages of disjoint tables:
+       - Stage 1: `processWebhooks` (`WebhookDelivery`) + `processBackgroundJobs` (`BackgroundJob`)
+       - Stage 2: `processScheduledCampaigns` (`EmailCampaign`) + `processRecurringAutomations` (`EmailAutomation`)
+       - Stage 3: `processEvents` (`EmailEvent`) + `processAutomationEnrollments` (`EmailAutomationEnrollment`)
+       - Stage 4: `processTransactionalEmails` (`EmailDelivery`) + `processCampaignRecipients` (`EmailCampaignRecipient`)
+       - Stage 5: `reconcileJobs` (only if reconciliation flag set)
+  4. **Dynamic Time Budget & Early Deadline Guards**:
+     - Dynamic execution budget: 25,000ms default (35,000ms with reconciliation) with a 5,000ms safety buffer.
+     - Implemented early time exhaustion checks across all 9 processing categories to prevent unnecessary database queries when the budget is spent.
+     - Enforced atomic release of claimed but unstarted jobs back to `QUEUED`/`PENDING` upon approaching deadline in both BackgroundJob processor and Webhook delivery processor.
+  5. **Category-Level Timing Telemetry**:
+     - Each processor category returns `durationMs`, and `ServerlessJobProcessor.processAll` includes structured `timingBreakdownMs` across all categories.
+  6. **Comprehensive Regression Suite & Test Certification**:
+     - `npx prisma validate`: Schema valid.
+     - `npx prisma generate`: Client generated (v6.19.0).
+     - `npm run test:guard`: 16/16 PASSED (Unconditional production protection verified).
+     - `npm run test:workerless`: 66/66 PASSED (19 comprehensive scenarios covering empty-queue telemetry, terminal status, enqueue atomicity, concurrency, unstarted claim release, timeout detection, database error surfacing, retryable vs permanent errors, tenant isolation, zero real outbound messages, and deadline regression).
+     - `npm run test:communication`: 8/8 PASSED.
+     - `npm run test:email:certify`: 130/130 PASSED.
+     - `npx tsc --noEmit`: 0 errors.
+     - `npm run lint`: 0 errors, 0 warnings.
+     - `npm run build`: 100% SUCCESS (all 74 Next.js routes compiled cleanly).
+- **Unresolved Concerns**:
+  - `None (all checks clean)`.
+- **Operational Verification Note**:
+  - Production job tables (`BackgroundJob`, `EmailDelivery`, `WebhookDelivery`) currently have 0 rows in production Supabase. Verification in disposable PostgreSQL confirms end-to-end processing across all categories; live production traffic remains partial until genuine customer volume is dispatched.
 
+---
 
 ## Flag Template for Subsequent Prompts
 

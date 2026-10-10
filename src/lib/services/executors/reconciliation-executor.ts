@@ -21,6 +21,7 @@ import { logger } from "../../logger";
 export interface ReconciliationOptions {
   staleMinutes?: number;
   maxAttempts?: number;
+  isTimeExhausted?: () => boolean;
 }
 
 export interface ReconciliationReport {
@@ -31,10 +32,12 @@ export interface ReconciliationReport {
   recoveredJobs: number;
   failedJobs: number;
   completedCampaigns: number;
+  durationMs?: number;
 }
 
 export class ReconciliationExecutor {
   static async reconcile(options?: ReconciliationOptions): Promise<ReconciliationReport> {
+    const startTime = Date.now();
     const staleMinutes = options?.staleMinutes || 10;
     const maxAttempts = options?.maxAttempts || 5;
     const staleCutoff = new Date(Date.now() - staleMinutes * 60 * 1000);
@@ -49,7 +52,13 @@ export class ReconciliationExecutor {
 
     logger.info(`[ReconciliationExecutor] Starting reconciliation sweep (cutoff: ${staleCutoff.toISOString()})`);
 
+    const checkTime = () => Boolean(options?.isTimeExhausted && options.isTimeExhausted());
+
     // 1. Stale EmailDelivery in 'PROCESSING'
+    if (checkTime()) {
+      logger.warn("[ReconciliationExecutor] Deadline reached before stale delivery check.");
+      return { recoveredDeliveries, failedDeliveries, recoveredRecipients, failedRecipients, recoveredJobs, failedJobs, completedCampaigns, durationMs: Date.now() - startTime };
+    }
     const staleDeliveries = await prisma.emailDelivery.findMany({
       where: {
         status: EmailDeliveryStatus.PROCESSING,
@@ -90,6 +99,10 @@ export class ReconciliationExecutor {
     }
 
     // 2. Stale EmailCampaignRecipient in 'PROCESSING'
+    if (checkTime()) {
+      logger.warn("[ReconciliationExecutor] Deadline reached before stale recipient check.");
+      return { recoveredDeliveries, failedDeliveries, recoveredRecipients, failedRecipients, recoveredJobs, failedJobs, completedCampaigns, durationMs: Date.now() - startTime };
+    }
     const staleRecipients = await prisma.emailCampaignRecipient.findMany({
       where: {
         status: "PROCESSING",
@@ -103,6 +116,7 @@ export class ReconciliationExecutor {
     });
 
     for (const recipient of staleRecipients) {
+      if (checkTime()) break;
       if ((recipient.attemptCount || 0) >= maxAttempts) {
         await prisma.emailCampaignRecipient.updateMany({
           where: { id: recipient.id, status: "PROCESSING" },
@@ -129,6 +143,10 @@ export class ReconciliationExecutor {
     }
 
     // 3. Stale BackgroundJob in 'PROCESSING'
+    if (checkTime()) {
+      logger.warn("[ReconciliationExecutor] Deadline reached before stale job check.");
+      return { recoveredDeliveries, failedDeliveries, recoveredRecipients, failedRecipients, recoveredJobs, failedJobs, completedCampaigns, durationMs: Date.now() - startTime };
+    }
     const staleJobs = await prisma.backgroundJob.findMany({
       where: {
         status: BackgroundJobStatus.PROCESSING,
@@ -142,6 +160,7 @@ export class ReconciliationExecutor {
     });
 
     for (const job of staleJobs) {
+      if (checkTime()) break;
       if (job.attemptCount >= job.maxAttempts) {
         await prisma.backgroundJob.updateMany({
           where: { id: job.id, status: BackgroundJobStatus.PROCESSING },
@@ -169,6 +188,10 @@ export class ReconciliationExecutor {
     }
 
     // 4. Stale Campaigns: Complete any RUNNING or PAUSED campaign that has 0 active recipients
+    if (checkTime()) {
+      logger.warn("[ReconciliationExecutor] Deadline reached before stale campaign check.");
+      return { recoveredDeliveries, failedDeliveries, recoveredRecipients, failedRecipients, recoveredJobs, failedJobs, completedCampaigns, durationMs: Date.now() - startTime };
+    }
     const activeCampaigns = await prisma.emailCampaign.findMany({
       where: {
         status: { in: [EmailCampaignStatus.RUNNING, EmailCampaignStatus.PAUSED] },
@@ -178,6 +201,7 @@ export class ReconciliationExecutor {
     });
 
     for (const camp of activeCampaigns) {
+      if (checkTime()) break;
       const completed = await CampaignTriggerService.checkAndCompleteCampaign(camp.id);
       if (completed) {
         completedCampaigns++;
@@ -192,6 +216,7 @@ export class ReconciliationExecutor {
       recoveredJobs,
       failedJobs,
       completedCampaigns,
+      durationMs: Date.now() - startTime,
     };
 
     logger.info(`[ReconciliationExecutor] Reconciliation cycle complete`, report as unknown as Record<string, unknown>);

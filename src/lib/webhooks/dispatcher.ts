@@ -292,21 +292,32 @@ export async function executeDeliveryAttempt(
  * Safe for multi-worker concurrency using PostgreSQL FOR UPDATE SKIP LOCKED.
  */
 export async function processWebhookDeliveryQueue(
-  options: { batchSize?: number; maxRetries?: number } = {}
+  options: {
+    batchSize?: number;
+    maxRetries?: number;
+    isTimeExhausted?: () => boolean;
+    reclaimStale?: boolean;
+  } = {}
 ): Promise<{ claimed: number; succeeded: number; failed: number }> {
   const batchSize = options.batchSize || 10;
   const maxRetries = options.maxRetries ?? env.OUTBOUND_WEBHOOK_MAX_RETRIES;
 
+  if (options.isTimeExhausted && options.isTimeExhausted()) {
+    return { claimed: 0, succeeded: 0, failed: 0 };
+  }
+
   // 1. Reclaim stale locked deliveries (worker crash recovery after 2 minutes)
-  await prisma.$executeRawUnsafe(`
-    UPDATE "WebhookDelivery"
-    SET "status" = 'PENDING',
-        "lockedAt" = NULL
-    WHERE "status" = 'PROCESSING'
-      AND "lockedAt" < NOW() - INTERVAL '2 minutes';
-  `).catch((err) => {
-    logger.warn("Failed to reclaim stale locked webhook deliveries:", err);
-  });
+  if (options.reclaimStale !== false) {
+    await prisma.$executeRawUnsafe(`
+      UPDATE "WebhookDelivery"
+      SET "status" = 'PENDING',
+          "lockedAt" = NULL
+      WHERE "status" = 'PROCESSING'
+        AND "lockedAt" < NOW() - INTERVAL '2 minutes';
+    `).catch((err) => {
+      logger.warn("Failed to reclaim stale locked webhook deliveries:", err);
+    });
+  }
 
   const safeBatchSize = Math.min(50, Math.max(1, batchSize));
   const safeMaxRetries = Math.min(10, Math.max(1, maxRetries));
@@ -345,7 +356,24 @@ export async function processWebhookDeliveryQueue(
   let succeeded = 0;
   let failed = 0;
 
-  for (const job of claimedJobs) {
+  for (let i = 0; i < claimedJobs.length; i++) {
+    if (options.isTimeExhausted && options.isTimeExhausted()) {
+      logger.warn(
+        `[WebhookDelivery] Approaching execution deadline. Releasing remaining ${claimedJobs.length - i} claimed deliveries.`
+      );
+      const unstartedIds = claimedJobs.slice(i).map((j) => j.id);
+      if (unstartedIds.length > 0) {
+        await prisma.webhookDelivery
+          .updateMany({
+            where: { id: { in: unstartedIds }, status: DeliveryStatus.PROCESSING },
+            data: { status: DeliveryStatus.PENDING, lockedAt: null },
+          })
+          .catch(() => {});
+      }
+      break;
+    }
+
+    const job = claimedJobs[i];
     let signingSecret: string;
     try {
       signingSecret = decryptWebhookSecret(job.encryptedSecret);

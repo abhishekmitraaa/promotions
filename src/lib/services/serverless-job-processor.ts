@@ -23,7 +23,7 @@ import { CampaignTriggerService } from "./executors/campaign-trigger-service";
 import { AutomationExecutor } from "./executors/automation-executor";
 import { EmailEventProcessor } from "./executors/email-event-processor";
 import { WebhookDeliveryProcessor } from "./executors/webhook-delivery-processor";
-import { ReconciliationExecutor } from "./executors/reconciliation-executor";
+import { ReconciliationExecutor, ReconciliationReport } from "./executors/reconciliation-executor";
 import { PermanentError } from "../errors/job-errors";
 import { logger } from "../logger";
 
@@ -44,16 +44,27 @@ export interface ServerlessProcessingResult {
   success: boolean;
   timestamp: string;
   durationMs: number;
+  timingBreakdownMs?: {
+    webhooks: number;
+    backgroundJobs: number;
+    transactional: number;
+    scheduledCampaigns: number;
+    campaignRecipients: number;
+    recurringAutomations: number;
+    automationEnrollments: number;
+    events: number;
+    reconciliation?: number;
+  };
   errors?: string[];
   results: {
-    backgroundJobs: { claimed: number; succeeded: number; failed: number; error?: string };
-    webhooks: { claimed: number; succeeded: number; failed: number; error?: string };
-    transactional: { processed: number; succeeded: number; failed: number; error?: string };
-    scheduledCampaigns: { processed: number; succeeded: number; failed: number; error?: string };
-    campaignRecipients: { processed: number; succeeded: number; failed: number; error?: string };
-    recurringAutomations: { processed: number; succeeded: number; failed: number; error?: string };
-    automationEnrollments: { processed: number; succeeded: number; failed: number; error?: string };
-    events: { processed: number; succeeded: number; failed: number; error?: string };
+    backgroundJobs: { claimed: number; succeeded: number; failed: number; durationMs?: number; error?: string };
+    webhooks: { claimed: number; succeeded: number; failed: number; durationMs?: number; error?: string };
+    transactional: { processed: number; succeeded: number; failed: number; durationMs?: number; error?: string };
+    scheduledCampaigns: { processed: number; succeeded: number; failed: number; durationMs?: number; error?: string };
+    campaignRecipients: { processed: number; succeeded: number; failed: number; durationMs?: number; error?: string };
+    recurringAutomations: { processed: number; succeeded: number; failed: number; durationMs?: number; error?: string };
+    automationEnrollments: { processed: number; succeeded: number; failed: number; durationMs?: number; error?: string };
+    events: { processed: number; succeeded: number; failed: number; durationMs?: number; error?: string };
     reconciliation: {
       recoveredDeliveries: number;
       failedDeliveries: number;
@@ -62,6 +73,7 @@ export interface ServerlessProcessingResult {
       recoveredJobs: number;
       failedJobs: number;
       completedCampaigns: number;
+      durationMs?: number;
     } | null;
   };
 }
@@ -70,13 +82,27 @@ export class ServerlessJobProcessor {
   /**
    * 1. Process Outbound Webhooks
    */
-  static async processWebhooks(batchSize = 25) {
+  static async processWebhooks(
+    batchSize = 25,
+    isTimeExhausted?: () => boolean
+  ): Promise<{ claimed: number; succeeded: number; failed: number; durationMs?: number; error?: string }> {
+    const startTime = Date.now();
     try {
       const safeSize = Math.min(50, Math.max(1, batchSize));
-      return await WebhookDeliveryProcessor.processBatch({ batchSize: safeSize });
+      const result = await WebhookDeliveryProcessor.processBatch({
+        batchSize: safeSize,
+        isTimeExhausted,
+      });
+      return { ...result, durationMs: Date.now() - startTime };
     } catch (err) {
       logger.error("[ServerlessProcessor] Webhook processing error:", err);
-      return { claimed: 0, succeeded: 0, failed: 0, error: err instanceof Error ? err.message : String(err) };
+      return {
+        claimed: 0,
+        succeeded: 0,
+        failed: 0,
+        durationMs: Date.now() - startTime,
+        error: err instanceof Error ? err.message : String(err),
+      };
     }
   }
 
@@ -87,7 +113,8 @@ export class ServerlessJobProcessor {
   static async processBackgroundJobs(
     batchSize = 30,
     isTimeExhausted?: () => boolean
-  ): Promise<{ claimed: number; succeeded: number; failed: number; error?: string }> {
+  ): Promise<{ claimed: number; succeeded: number; failed: number; durationMs?: number; error?: string }> {
+    const startTime = Date.now();
     let claimedCount = 0;
     let succeeded = 0;
     let failed = 0;
@@ -95,6 +122,10 @@ export class ServerlessJobProcessor {
 
     const safeBatchSize = Math.min(100, Math.max(1, batchSize));
     const lockedBy = `serverless-processor-${Date.now()}`;
+
+    if (isTimeExhausted && isTimeExhausted()) {
+      return { claimed: 0, succeeded: 0, failed: 0, durationMs: Date.now() - startTime };
+    }
 
     let claimedJobs: Array<{
       id: string;
@@ -264,7 +295,13 @@ export class ServerlessJobProcessor {
       logger.error("[ServerlessProcessor] Error in processBackgroundJobs:", err);
     }
 
-    return { claimed: claimedCount, succeeded, failed, ...(claimError ? { error: claimError } : {}) };
+    return {
+      claimed: claimedCount,
+      succeeded,
+      failed,
+      durationMs: Date.now() - startTime,
+      ...(claimError ? { error: claimError } : {}),
+    };
   }
 
   /**
@@ -274,7 +311,8 @@ export class ServerlessJobProcessor {
   static async processTransactionalEmails(
     batchSize = 25,
     isTimeExhausted?: () => boolean
-  ): Promise<{ processed: number; succeeded: number; failed: number; error?: string }> {
+  ): Promise<{ processed: number; succeeded: number; failed: number; durationMs?: number; error?: string }> {
+    const startTime = Date.now();
     let processed = 0;
     let succeeded = 0;
     let failed = 0;
@@ -282,6 +320,10 @@ export class ServerlessJobProcessor {
 
     const safeBatchSize = Math.min(50, Math.max(1, batchSize));
     const lockedBy = `serverless-processor-${Date.now()}`;
+
+    if (isTimeExhausted && isTimeExhausted()) {
+      return { processed: 0, succeeded: 0, failed: 0, durationMs: Date.now() - startTime };
+    }
 
     try {
       const claimedDeliveries = await prisma.$queryRaw<Array<{ id: string; clientId: string }>>(Prisma.sql`
@@ -353,7 +395,13 @@ export class ServerlessJobProcessor {
       logger.error("[ServerlessProcessor] Transactional processing batch error:", err);
     }
 
-    return { processed, succeeded, failed, ...(claimError ? { error: claimError } : {}) };
+    return {
+      processed,
+      succeeded,
+      failed,
+      durationMs: Date.now() - startTime,
+      ...(claimError ? { error: claimError } : {}),
+    };
   }
 
   /**
@@ -362,11 +410,16 @@ export class ServerlessJobProcessor {
   static async processScheduledCampaigns(
     batchSize = 5,
     isTimeExhausted?: () => boolean
-  ): Promise<{ processed: number; succeeded: number; failed: number; error?: string }> {
+  ): Promise<{ processed: number; succeeded: number; failed: number; durationMs?: number; error?: string }> {
+    const startTime = Date.now();
     let processed = 0;
     let succeeded = 0;
     let failed = 0;
     let batchError: string | undefined;
+
+    if (isTimeExhausted && isTimeExhausted()) {
+      return { processed: 0, succeeded: 0, failed: 0, durationMs: Date.now() - startTime };
+    }
 
     try {
       const safeBatchSize = Math.min(20, Math.max(1, batchSize));
@@ -391,7 +444,13 @@ export class ServerlessJobProcessor {
       logger.error("[ServerlessProcessor] Scheduled campaign processing error:", err);
     }
 
-    return { processed, succeeded, failed, ...(batchError ? { error: batchError } : {}) };
+    return {
+      processed,
+      succeeded,
+      failed,
+      durationMs: Date.now() - startTime,
+      ...(batchError ? { error: batchError } : {}),
+    };
   }
 
   /**
@@ -401,7 +460,8 @@ export class ServerlessJobProcessor {
   static async processCampaignRecipients(
     batchSize = 30,
     isTimeExhausted?: () => boolean
-  ): Promise<{ processed: number; succeeded: number; failed: number; error?: string }> {
+  ): Promise<{ processed: number; succeeded: number; failed: number; durationMs?: number; error?: string }> {
+    const startTime = Date.now();
     let processed = 0;
     let succeeded = 0;
     let failed = 0;
@@ -409,6 +469,10 @@ export class ServerlessJobProcessor {
 
     const safeBatchSize = Math.min(100, Math.max(1, batchSize));
     const lockedBy = `serverless-processor-${Date.now()}`;
+
+    if (isTimeExhausted && isTimeExhausted()) {
+      return { processed: 0, succeeded: 0, failed: 0, durationMs: Date.now() - startTime };
+    }
 
     try {
       const claimedRecipients = await prisma.$queryRaw<Array<{ id: string; campaignId: string }>>(Prisma.sql`
@@ -482,7 +546,13 @@ export class ServerlessJobProcessor {
       logger.error("[ServerlessProcessor] Campaign recipient batch processing error:", err);
     }
 
-    return { processed, succeeded, failed, ...(claimError ? { error: claimError } : {}) };
+    return {
+      processed,
+      succeeded,
+      failed,
+      durationMs: Date.now() - startTime,
+      ...(claimError ? { error: claimError } : {}),
+    };
   }
 
   /**
@@ -491,11 +561,16 @@ export class ServerlessJobProcessor {
   static async processRecurringAutomations(
     batchSize = 5,
     isTimeExhausted?: () => boolean
-  ): Promise<{ processed: number; succeeded: number; failed: number; error?: string }> {
+  ): Promise<{ processed: number; succeeded: number; failed: number; durationMs?: number; error?: string }> {
+    const startTime = Date.now();
     let processed = 0;
     let succeeded = 0;
     let failed = 0;
     let batchError: string | undefined;
+
+    if (isTimeExhausted && isTimeExhausted()) {
+      return { processed: 0, succeeded: 0, failed: 0, durationMs: Date.now() - startTime };
+    }
 
     try {
       const safeBatchSize = Math.min(20, Math.max(1, batchSize));
@@ -520,7 +595,13 @@ export class ServerlessJobProcessor {
       logger.error("[ServerlessProcessor] Recurring automations processing error:", err);
     }
 
-    return { processed, succeeded, failed, ...(batchError ? { error: batchError } : {}) };
+    return {
+      processed,
+      succeeded,
+      failed,
+      durationMs: Date.now() - startTime,
+      ...(batchError ? { error: batchError } : {}),
+    };
   }
 
   /**
@@ -529,11 +610,16 @@ export class ServerlessJobProcessor {
   static async processAutomationEnrollments(
     batchSize = 25,
     isTimeExhausted?: () => boolean
-  ): Promise<{ processed: number; succeeded: number; failed: number; error?: string }> {
+  ): Promise<{ processed: number; succeeded: number; failed: number; durationMs?: number; error?: string }> {
+    const startTime = Date.now();
     let processed = 0;
     let succeeded = 0;
     let failed = 0;
     let batchError: string | undefined;
+
+    if (isTimeExhausted && isTimeExhausted()) {
+      return { processed: 0, succeeded: 0, failed: 0, durationMs: Date.now() - startTime };
+    }
 
     try {
       const safeBatchSize = Math.min(50, Math.max(1, batchSize));
@@ -559,7 +645,13 @@ export class ServerlessJobProcessor {
       logger.error("[ServerlessProcessor] Automation enrollment processing error:", err);
     }
 
-    return { processed, succeeded, failed, ...(batchError ? { error: batchError } : {}) };
+    return {
+      processed,
+      succeeded,
+      failed,
+      durationMs: Date.now() - startTime,
+      ...(batchError ? { error: batchError } : {}),
+    };
   }
 
   /**
@@ -568,11 +660,16 @@ export class ServerlessJobProcessor {
   static async processEvents(
     batchSize = 25,
     isTimeExhausted?: () => boolean
-  ): Promise<{ processed: number; succeeded: number; failed: number; error?: string }> {
+  ): Promise<{ processed: number; succeeded: number; failed: number; durationMs?: number; error?: string }> {
+    const startTime = Date.now();
     let processed = 0;
     let succeeded = 0;
     let failed = 0;
     let batchError: string | undefined;
+
+    if (isTimeExhausted && isTimeExhausted()) {
+      return { processed: 0, succeeded: 0, failed: 0, durationMs: Date.now() - startTime };
+    }
 
     try {
       const safeBatchSize = Math.min(50, Math.max(1, batchSize));
@@ -594,22 +691,31 @@ export class ServerlessJobProcessor {
       logger.error("[ServerlessProcessor] Event processing batch error:", err);
     }
 
-    return { processed, succeeded, failed, ...(batchError ? { error: batchError } : {}) };
+    return {
+      processed,
+      succeeded,
+      failed,
+      durationMs: Date.now() - startTime,
+      ...(batchError ? { error: batchError } : {}),
+    };
   }
 
   static async processEmailEvents(
     batchSize = 25,
     isTimeExhausted?: () => boolean
-  ): Promise<{ processed: number; succeeded: number; failed: number }> {
+  ): Promise<{ processed: number; succeeded: number; failed: number; durationMs?: number }> {
     return this.processEvents(batchSize, isTimeExhausted);
   }
 
   /**
    * 9. Job Reconciliation
    */
-  static async reconcileJobs(staleMinutes = 10) {
+  static async reconcileJobs(staleMinutes = 10, isTimeExhausted?: () => boolean) {
+    if (isTimeExhausted && isTimeExhausted()) {
+      return null;
+    }
     try {
-      return await ReconciliationExecutor.reconcile({ staleMinutes });
+      return await ReconciliationExecutor.reconcile({ staleMinutes, isTimeExhausted });
     } catch (err) {
       logger.error("[ServerlessProcessor] Reconciliation error:", err);
       return null;
@@ -621,69 +727,105 @@ export class ServerlessJobProcessor {
    */
   static async processAll(options: ServerlessProcessingOptions = {}): Promise<ServerlessProcessingResult> {
     const startTime = Date.now();
-    const maxDurationMs = options.maxExecutionTimeMs || 25000; // 25s default
-    const isTimeExhausted = () => Date.now() - startTime >= maxDurationMs - 4000;
+    const maxDurationMs =
+      options.maxExecutionTimeMs || (options.runReconciliation ? 35000 : 25000);
+    const safetyBufferMs = Math.min(5000, Math.max(1000, Math.floor(maxDurationMs * 0.2)));
+    const isTimeExhausted = () => Date.now() - startTime >= maxDurationMs - safetyBufferMs;
 
-    logger.info("[ServerlessProcessor] Starting workerless execution cycle");
-
-    // 1. Webhooks
-    const webhooks = await this.processWebhooks(options.webhookBatchSize || 25);
-
-    // 2. Durable BackgroundJobs (Unified primary asynchronous queue)
-    const bgJobs = await this.processBackgroundJobs(
-      options.backgroundJobBatchSize || 30,
-      isTimeExhausted
+    logger.info(
+      `[ServerlessProcessor] Starting workerless execution cycle (budget: ${maxDurationMs}ms, safetyBuffer: ${safetyBufferMs}ms)`
     );
 
-    // 3. Transactional Emails (Legacy direct EmailDelivery table sweep)
-    const transactional = await this.processTransactionalEmails(
-      options.transactionalBatchSize || 25,
-      isTimeExhausted
-    );
+    // Stage 1: Primary Workloads (Webhooks & BackgroundJobs - completely disjoint tables)
+    const [webhooks, bgJobs] = await Promise.all([
+      this.processWebhooks(options.webhookBatchSize || 25, isTimeExhausted),
+      this.processBackgroundJobs(options.backgroundJobBatchSize || 30, isTimeExhausted),
+    ]);
 
-    // 4. Scheduled Campaigns
-    const scheduledCampaigns = await this.processScheduledCampaigns(
-      options.scheduledCampaignBatchSize || 5,
-      isTimeExhausted
-    );
+    type CategoryResult = {
+      processed: number;
+      succeeded: number;
+      failed: number;
+      durationMs?: number;
+      error?: string;
+    };
 
-    // 5. Campaign Recipients
-    const campaignRecipients = await this.processCampaignRecipients(
-      options.recipientBatchSize || 30,
-      isTimeExhausted
-    );
+    // Stage 2: Scheduled Triggers (Campaigns & Recurring Automations - completely disjoint tables)
+    let scheduledCampaigns: CategoryResult = { processed: 0, succeeded: 0, failed: 0, durationMs: 0 };
+    let recurringAutomations: CategoryResult = { processed: 0, succeeded: 0, failed: 0, durationMs: 0 };
 
-    // 6. Recurring Automations
-    const recurringAutomations = await this.processRecurringAutomations(
-      options.recurringAutomationBatchSize || 5,
-      isTimeExhausted
-    );
+    if (!isTimeExhausted()) {
+      [scheduledCampaigns, recurringAutomations] = await Promise.all([
+        this.processScheduledCampaigns(options.scheduledCampaignBatchSize || 5, isTimeExhausted),
+        this.processRecurringAutomations(options.recurringAutomationBatchSize || 5, isTimeExhausted),
+      ]);
+    } else {
+      logger.warn("[ServerlessProcessor] Time budget exhausted before scheduled triggers stage");
+    }
 
-    // 7. Automation Enrollments
-    const automationEnrollments = await this.processAutomationEnrollments(
-      options.enrollmentBatchSize || 25,
-      isTimeExhausted
-    );
+    // Stage 3: Event & Journey Step Sweeps (EmailEvent & AutomationEnrollment - disjoint tables)
+    let events: CategoryResult = { processed: 0, succeeded: 0, failed: 0, durationMs: 0 };
+    let automationEnrollments: CategoryResult = { processed: 0, succeeded: 0, failed: 0, durationMs: 0 };
 
-    // 8. Inbound Webhook Events
-    const events = await this.processEvents(
-      options.eventBatchSize || 25,
-      isTimeExhausted
-    );
+    if (!isTimeExhausted()) {
+      [events, automationEnrollments] = await Promise.all([
+        this.processEvents(options.eventBatchSize || 25, isTimeExhausted),
+        this.processAutomationEnrollments(options.enrollmentBatchSize || 25, isTimeExhausted),
+      ]);
+    } else {
+      logger.warn("[ServerlessProcessor] Time budget exhausted before events/enrollments stage");
+    }
 
-    // 9. Reconciliation: only executed when explicitly requested (e.g. via separate 5-minute cron)
-    let reconciliationResult = null;
-    if (options.runReconciliation) {
-      reconciliationResult = await this.reconcileJobs();
+    // Stage 4: Legacy Fallback Sweeps (EmailDelivery & CampaignRecipient - disjoint tables)
+    let transactional: CategoryResult = { processed: 0, succeeded: 0, failed: 0, durationMs: 0 };
+    let campaignRecipients: CategoryResult = { processed: 0, succeeded: 0, failed: 0, durationMs: 0 };
+
+    if (!isTimeExhausted()) {
+      [transactional, campaignRecipients] = await Promise.all([
+        this.processTransactionalEmails(options.transactionalBatchSize || 25, isTimeExhausted),
+        this.processCampaignRecipients(options.recipientBatchSize || 30, isTimeExhausted),
+      ]);
+    } else {
+      logger.warn("[ServerlessProcessor] Time budget exhausted before fallback delivery/recipient sweeps");
+    }
+
+    // Stage 5: Reconciliation: only executed when explicitly requested (e.g. via separate 5-minute cron)
+    let reconciliationResult: ReconciliationReport | null = null;
+    if (options.runReconciliation && !isTimeExhausted()) {
+      reconciliationResult = await this.reconcileJobs(10, isTimeExhausted);
     }
 
     const durationMs = Date.now() - startTime;
     logger.info(`[ServerlessProcessor] Execution cycle completed in ${durationMs}ms`);
 
+    const errors: string[] = [];
+    if (webhooks.error) errors.push(`webhooks: ${webhooks.error}`);
+    if (bgJobs.error) errors.push(`backgroundJobs: ${bgJobs.error}`);
+    if (transactional.error) errors.push(`transactional: ${transactional.error}`);
+    if (scheduledCampaigns.error) errors.push(`scheduledCampaigns: ${scheduledCampaigns.error}`);
+    if (campaignRecipients.error) errors.push(`campaignRecipients: ${campaignRecipients.error}`);
+    if (recurringAutomations.error) errors.push(`recurringAutomations: ${recurringAutomations.error}`);
+    if (automationEnrollments.error) errors.push(`automationEnrollments: ${automationEnrollments.error}`);
+    if (events.error) errors.push(`events: ${events.error}`);
+
+    const timingBreakdownMs = {
+      webhooks: webhooks.durationMs || 0,
+      backgroundJobs: bgJobs.durationMs || 0,
+      transactional: transactional.durationMs || 0,
+      scheduledCampaigns: scheduledCampaigns.durationMs || 0,
+      campaignRecipients: campaignRecipients.durationMs || 0,
+      recurringAutomations: recurringAutomations.durationMs || 0,
+      automationEnrollments: automationEnrollments.durationMs || 0,
+      events: events.durationMs || 0,
+      reconciliation: reconciliationResult?.durationMs || 0,
+    };
+
     return {
-      success: true,
+      success: errors.length === 0,
       timestamp: new Date().toISOString(),
       durationMs,
+      timingBreakdownMs,
+      ...(errors.length > 0 ? { errors } : {}),
       results: {
         backgroundJobs: bgJobs,
         webhooks,

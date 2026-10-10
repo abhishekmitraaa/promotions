@@ -13,6 +13,8 @@ import { logger } from "../../logger";
 
 export interface ProcessWebhookQueueOptions {
   batchSize?: number;
+  isTimeExhausted?: () => boolean;
+  reclaimStale?: boolean;
 }
 
 export class WebhookDeliveryProcessor {
@@ -22,6 +24,10 @@ export class WebhookDeliveryProcessor {
   static async processBatch(options?: ProcessWebhookQueueOptions) {
     const batchSize = options?.batchSize || 25;
     logger.info(`[WebhookDeliveryProcessor] Processing up to ${batchSize} webhook deliveries`);
-    return await processWebhookDeliveryQueue({ batchSize });
+    return await processWebhookDeliveryQueue({
+      batchSize,
+      isTimeExhausted: options?.isTimeExhausted,
+      reclaimStale: options?.reclaimStale,
+    });
   }
 }

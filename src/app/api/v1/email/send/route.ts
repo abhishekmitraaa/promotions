@@ -7,7 +7,7 @@ import { TemplateEngine } from "@/lib/email/template-engine";
 import { EmailSuppressionService } from "@/lib/services/email-suppression-service";
 import { prisma } from "@/lib/prisma";
 import { normalizeEmail } from "@/lib/email/normalization";
-import { EmailDeliveryStatus, EmailProviderType, EmailType, BackgroundJobStatus } from "@prisma/client";
+import { EmailDeliveryStatus, EmailProviderType, EmailType } from "@prisma/client";
 import { providerRegistry } from "@/lib/email/registry";
 import { getTransactionalQueue, getCampaignQueue } from "@/lib/email/queue/queues";
 import {

@@ -8,6 +8,9 @@ import { logger } from "@/lib/logger";
  *
  * Allows authenticated administrators to manually trigger job execution and reconciliation cycles.
  */
+export const maxDuration = 60;
+export const dynamic = "force-dynamic";
+
 export async function POST(req: NextRequest) {
   const auth = await requireUser(req, "ADMIN");
   if (auth.response) return auth.response;
