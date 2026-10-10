@@ -215,54 +215,28 @@ export async function POST(req: NextRequest) {
     // Falls back to mock provider in testing/development
   }
 
-  // 8. Atomically create Authoritative Delivery Record & Durable BackgroundJob
+  // 8. Create Authoritative Delivery Record
   const idempotencyKey = req.headers.get("idempotency-key") || undefined;
 
   let delivery;
   try {
-    const result = await prisma.$transaction(async (tx) => {
-      const d = await tx.emailDelivery.create({
-        data: {
-          clientId,
-          category: input.type as EmailType,
-          providerType,
-          from: fromAddress,
-          to: recipientEmail,
-          replyTo: input.replyTo || null,
-          subject: finalSubject,
-          htmlContent: finalHtml || null,
-          textContent: finalText || null,
-          templateId: resolvedTemplateId || null,
-          templateVersionId: resolvedTemplateVersionId || null,
-          status: EmailDeliveryStatus.QUEUED,
-          idempotencyKey,
-        },
-      });
-
-      const deduplicationKey = input.type === "PROMOTIONAL"
-        ? getPromotionalJobId(d.id)
-        : getTransactionalJobId(d.id);
-
-      const bg = await tx.backgroundJob.create({
-        data: {
-          clientId,
-          type: input.type === "PROMOTIONAL" ? "PROMOTIONAL_EMAIL" : "TRANSACTIONAL_EMAIL",
-          status: BackgroundJobStatus.QUEUED,
-          payload: JSON.stringify({
-            deliveryId: d.id,
-            clientId,
-            category: input.type,
-          }),
-          scheduledAt: new Date(),
-          availableAt: new Date(),
-          deduplicationKey,
-        },
-      });
-
-      return { delivery: d, backgroundJob: bg };
+    delivery = await prisma.emailDelivery.create({
+      data: {
+        clientId,
+        category: input.type as EmailType,
+        providerType,
+        from: fromAddress,
+        to: recipientEmail,
+        replyTo: input.replyTo || null,
+        subject: finalSubject,
+        htmlContent: finalHtml || null,
+        textContent: finalText || null,
+        templateId: resolvedTemplateId || null,
+        templateVersionId: resolvedTemplateVersionId || null,
+        status: EmailDeliveryStatus.QUEUED,
+        idempotencyKey,
+      },
     });
-
-    delivery = result.delivery;
   } catch (err: unknown) {
     if (typeof err === "object" && err !== null && "code" in err && (err as { code: string }).code === "P2002") {
       // Idempotency conflict

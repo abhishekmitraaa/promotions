@@ -909,6 +909,7 @@
      - `npm run test:email:events`: 50/50 PASSED.
      - `npm run test:workerless`: 22/22 PASSED.
      - `npm run test:communication`: 8/8 PASSED.
+     - `npm run test:email:certify`: 130/130 PASSED (All 23 master flows & 14 adversarial outage scenarios certified).
      - `npm test`: 24/24 scripts PASSED (100% sequential pass across all 24 verification suites).
      - `npx tsc --noEmit`: 0 errors.
      - `npm run lint`: 0 errors, 0 warnings.
