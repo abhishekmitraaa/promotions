@@ -33,6 +33,7 @@ export interface ReconciliationReport {
   failedJobs: number;
   completedCampaigns: number;
   durationMs?: number;
+  error?: string;
 }
 
 export class ReconciliationExecutor {

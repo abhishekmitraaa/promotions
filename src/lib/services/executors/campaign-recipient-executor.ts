@@ -32,6 +32,7 @@ import { CampaignTriggerService } from "./campaign-trigger-service";
 
 export interface ExecuteCampaignRecipientOptions {
   recipientId: string;
+  claimToken?: string;
   providerOverride?: EmailProvider;
   maxAttempts?: number;
 }
@@ -52,9 +53,9 @@ export class CampaignRecipientExecutor {
   static async executeRecipient(
     options: ExecuteCampaignRecipientOptions
   ): Promise<ExecuteCampaignRecipientResult> {
-    const { recipientId, maxAttempts = 5 } = options;
+    const { recipientId, claimToken, maxAttempts = 5 } = options;
 
-    logger.info(`[CampaignRecipientExecutor] Executing recipient ${recipientId}`);
+    logger.info(`[CampaignRecipientExecutor] Executing recipient ${recipientId} (claimToken: ${claimToken || "none"})`);
 
     // 1. Load Recipient
     const recipient = await prisma.emailCampaignRecipient.findUnique({
@@ -73,20 +74,79 @@ export class CampaignRecipientExecutor {
       return { success: false, recipientId, status: recipient.status, skipped: true, reason: `RECIPIENT_${recipient.status}` };
     }
 
-    // 3. Mark Recipient as PROCESSING
-    await prisma.emailCampaignRecipient.updateMany({
-      where: {
-        id: recipient.id,
-        status: { in: ["PENDING", "RETRYING", "FAILED"] },
-      },
-      data: {
-        status: "PROCESSING",
-        attemptCount: { increment: 1 },
-        lastAttemptAt: new Date(),
-        lockedAt: new Date(),
-        lockedBy: "serverless-processor",
-      },
-    });
+    // 3. Authoritative Atomic Claim Mechanism
+    if (claimToken) {
+      if (recipient.status !== "PROCESSING" || recipient.lockedBy !== claimToken) {
+        logger.warn(
+          `[CampaignRecipientExecutor] Recipient ${recipientId} claimToken mismatch or lock lost. Current status: ${recipient.status}, lockedBy: ${recipient.lockedBy}. Skipping.`
+        );
+        return {
+          success: true,
+          recipientId,
+          status: recipient.status,
+          skipped: true,
+          reason: "CLAIM_TOKEN_MISMATCH",
+        };
+      }
+    } else {
+      const workerClaimToken = `camp-recip-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const staleCutoff = new Date(Date.now() - 10 * 60 * 1000);
+
+      const claimResult = await prisma.emailCampaignRecipient.updateMany({
+        where: {
+          id: recipient.id,
+          OR: [
+            { status: { in: ["PENDING", "RETRYING"] } },
+            { status: "FAILED", attemptCount: { lt: maxAttempts } },
+            {
+              status: "PROCESSING",
+              OR: [
+                { lockedAt: { lt: staleCutoff } },
+                { lockedAt: null, lastAttemptAt: { lt: staleCutoff } },
+              ],
+            },
+          ],
+        },
+        data: {
+          status: "PROCESSING",
+          attemptCount: { increment: 1 },
+          lastAttemptAt: new Date(),
+          lockedAt: new Date(),
+          lockedBy: workerClaimToken,
+        },
+      });
+
+      if (claimResult.count === 0) {
+        const fresh = await prisma.emailCampaignRecipient.findUnique({
+          where: { id: recipient.id },
+        });
+
+        if (fresh?.status === "SENT") {
+          return { success: true, recipientId, status: "SENT", skipped: true, reason: "ALREADY_SENT" };
+        }
+
+        if (fresh?.status === "PROCESSING") {
+          logger.info(
+            `[CampaignRecipientExecutor] Recipient ${recipientId} actively held by claimant '${fresh.lockedBy}'. Skipping without external dispatch.`
+          );
+          return {
+            success: true,
+            recipientId,
+            status: fresh.status,
+            skipped: true,
+            reason: "CONTENTION_LOCK_HELD",
+          };
+        }
+
+        return {
+          success: false,
+          recipientId,
+          status: fresh?.status || recipient.status,
+          skipped: true,
+          reason: "CLAIM_CONTENTION",
+        };
+      }
+    }
 
     const currentAttempt = (recipient.attemptCount || 0) + 1;
 
@@ -213,6 +273,7 @@ export class CampaignRecipientExecutor {
     }
 
     // 9. Dispatch
+    const idempotencyKey = `campaign-${campaign.id}-recipient-${recipient.id}`;
     try {
       const sendResult = await provider.send({
         clientId,
@@ -224,6 +285,7 @@ export class CampaignRecipientExecutor {
         replyTo: replyToAddress,
         type: "PROMOTIONAL",
         headers: unsubscribeHeaders,
+        idempotencyKey,
       });
 
       if (!sendResult.success) {
@@ -251,11 +313,12 @@ export class CampaignRecipientExecutor {
           status: EmailDeliveryStatus.SENT,
           sentAt: new Date(),
           smtpCode: sendResult.error?.statusCode ? String(sendResult.error.statusCode) : null,
+          idempotencyKey,
         },
       });
 
-      await prisma.emailCampaignRecipient.update({
-        where: { id: recipient.id },
+      await prisma.emailCampaignRecipient.updateMany({
+        where: { id: recipient.id, status: "PROCESSING" },
         data: {
           status: "SENT",
           lockedAt: null,

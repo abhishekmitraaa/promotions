@@ -51,13 +51,21 @@ export class EmailEventProcessor {
   }
 
   /**
-   * Finds pending or retrying email events ready for processing
+   * Finds pending or retrying email events ready for processing.
+   * Excludes active PROCESSING events (only claims RECEIVED or stale abandoned PROCESSING >10m).
    */
   static async findPendingEvents(limit = 50) {
+    const staleCutoff = new Date(Date.now() - 10 * 60 * 1000);
     return prisma.emailEvent.findMany({
       where: {
-        status: { in: ["RECEIVED", "PROCESSING"] },
         attempts: { lt: 5 },
+        OR: [
+          { status: "RECEIVED" },
+          {
+            status: "PROCESSING",
+            lastAttemptAt: { lt: staleCutoff },
+          },
+        ],
       },
       take: limit,
       orderBy: { createdAt: "asc" },

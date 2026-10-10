@@ -28,6 +28,7 @@ import { logger } from "../../logger";
 export interface ExecuteEmailDeliveryOptions {
   deliveryId: string;
   clientId?: string;
+  claimToken?: string;
   providerOverride?: EmailProvider;
   maxAttempts?: number;
 }
@@ -37,6 +38,7 @@ export interface ExecuteEmailDeliveryResult {
   deliveryId: string;
   status: EmailDeliveryStatus;
   skipped?: boolean;
+  reason?: string;
   providerMessageId?: string;
   errorCode?: string;
   errorMessage?: string;
@@ -44,9 +46,9 @@ export interface ExecuteEmailDeliveryResult {
 
 export class EmailDeliveryExecutor {
   static async execute(options: ExecuteEmailDeliveryOptions): Promise<ExecuteEmailDeliveryResult> {
-    const { deliveryId, maxAttempts = 5 } = options;
+    const { deliveryId, claimToken, maxAttempts = 5 } = options;
 
-    logger.info(`[EmailDeliveryExecutor] Executing delivery ${deliveryId}`);
+    logger.info(`[EmailDeliveryExecutor] Executing delivery ${deliveryId} (claimToken: ${claimToken || "none"})`);
 
     // 1. Load Authoritative Delivery Record
     let delivery: EmailDelivery | null = null;
@@ -71,29 +73,99 @@ export class EmailDeliveryExecutor {
       delivery.status === EmailDeliveryStatus.BOUNCED ||
       delivery.status === EmailDeliveryStatus.COMPLAINED
     ) {
-      logger.info(`[EmailDeliveryExecutor] Delivery ${deliveryId} is already in state ${delivery.status}. Skipping.`);
+      logger.info(`[EmailDeliveryExecutor] Delivery ${deliveryId} is already in terminal state ${delivery.status}. Skipping.`);
       return {
         success: true,
         deliveryId,
         status: delivery.status,
         skipped: true,
+        reason: "ALREADY_TERMINAL",
       };
     }
 
-    // 3. Mark as PROCESSING atomically
-    await prisma.emailDelivery.updateMany({
-      where: {
-        id: delivery.id,
-        status: { in: [EmailDeliveryStatus.QUEUED, EmailDeliveryStatus.FAILED] },
-      },
-      data: {
-        status: EmailDeliveryStatus.PROCESSING,
-        attemptCount: { increment: 1 },
-        lastAttemptAt: new Date(),
-        lockedAt: new Date(),
-        lockedBy: "serverless-processor",
-      },
-    });
+    // 3. Authoritative Atomic Claim Mechanism
+    if (claimToken) {
+      // Caller has pre-claimed the row. Verify ownership.
+      if (delivery.status !== EmailDeliveryStatus.PROCESSING || delivery.lockedBy !== claimToken) {
+        logger.warn(
+          `[EmailDeliveryExecutor] Delivery ${deliveryId} claimToken mismatch or lock lost. Current status: ${delivery.status}, lockedBy: ${delivery.lockedBy}. Skipping.`
+        );
+        return {
+          success: true,
+          deliveryId,
+          status: delivery.status,
+          skipped: true,
+          reason: "CLAIM_TOKEN_MISMATCH",
+        };
+      }
+    } else {
+      // Caller has NOT pre-claimed. Atomically claim via conditional update.
+      const workerClaimToken = `executor-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const staleCutoff = new Date(Date.now() - 10 * 60 * 1000);
+
+      const claimResult = await prisma.emailDelivery.updateMany({
+        where: {
+          id: delivery.id,
+          OR: [
+            { status: EmailDeliveryStatus.QUEUED },
+            { status: EmailDeliveryStatus.FAILED, attemptCount: { lt: maxAttempts } },
+            // Stale lock recovery: in PROCESSING but abandoned (>10m)
+            {
+              status: EmailDeliveryStatus.PROCESSING,
+              OR: [
+                { lockedAt: { lt: staleCutoff } },
+                { lockedAt: null, lastAttemptAt: { lt: staleCutoff } },
+              ],
+            },
+          ],
+        },
+        data: {
+          status: EmailDeliveryStatus.PROCESSING,
+          attemptCount: { increment: 1 },
+          lastAttemptAt: new Date(),
+          lockedAt: new Date(),
+          lockedBy: workerClaimToken,
+        },
+      });
+
+      if (claimResult.count === 0) {
+        // We are a losing claimant. Check fresh state.
+        const fresh = await prisma.emailDelivery.findUnique({
+          where: { id: delivery.id },
+        });
+
+        if (fresh?.status === EmailDeliveryStatus.SENT || fresh?.status === EmailDeliveryStatus.DELIVERED) {
+          return {
+            success: true,
+            deliveryId,
+            status: fresh.status,
+            skipped: true,
+            reason: "ALREADY_TERMINAL",
+          };
+        }
+
+        if (fresh?.status === EmailDeliveryStatus.PROCESSING) {
+          logger.info(
+            `[EmailDeliveryExecutor] Delivery ${deliveryId} actively held by claimant '${fresh.lockedBy}'. Skipping without external send.`
+          );
+          return {
+            success: true,
+            deliveryId,
+            status: fresh.status,
+            skipped: true,
+            reason: "CONTENTION_LOCK_HELD",
+          };
+        }
+
+        return {
+          success: false,
+          deliveryId,
+          status: fresh?.status || delivery.status,
+          skipped: true,
+          reason: "CLAIM_CONTENTION",
+        };
+      }
+    }
 
     const currentAttempt = (delivery.attemptCount || 0) + 1;
 
@@ -198,6 +270,7 @@ export class EmailDeliveryExecutor {
         text: outgoingText,
         replyTo: delivery.replyTo || undefined,
         type: delivery.category,
+        idempotencyKey: delivery.idempotencyKey || `delivery-${delivery.id}`,
       });
 
       if (!sendResult.success) {
@@ -206,7 +279,7 @@ export class EmailDeliveryExecutor {
 
       // 7. Update to SENT
       await prisma.emailDelivery.updateMany({
-        where: { id: delivery.id },
+        where: { id: delivery.id, status: EmailDeliveryStatus.PROCESSING },
         data: {
           status: EmailDeliveryStatus.SENT,
           sentAt: new Date(),

@@ -151,6 +151,8 @@ export interface RecordEventResult {
 export interface ProcessEventResult {
   success: boolean;
   deduplicated?: boolean;
+  skipped?: boolean;
+  reason?: string;
   eventId?: string;
   statusUpdated?: boolean;
   suppressionCreated?: boolean;
@@ -418,15 +420,56 @@ export class EmailEventService {
       };
     }
 
-    // 2. Atomic Transition: RECEIVED -> PROCESSING
-    await prisma.emailEvent.update({
-      where: { id: eventRecordId },
+    // 2. Authoritative Atomic Claim: Conditional Transition to PROCESSING
+    const staleCutoff = new Date(Date.now() - 10 * 60 * 1000);
+    const claimResult = await prisma.emailEvent.updateMany({
+      where: {
+        id: eventRecordId,
+        OR: [
+          { status: EmailEventProcessingStatus.RECEIVED },
+          {
+            status: EmailEventProcessingStatus.PROCESSING,
+            lastAttemptAt: { lt: staleCutoff },
+          },
+          {
+            status: EmailEventProcessingStatus.FAILED,
+            attempts: { lt: 5 },
+          },
+        ],
+      },
       data: {
         status: EmailEventProcessingStatus.PROCESSING,
         attempts: { increment: 1 },
         lastAttemptAt: new Date(),
       },
     });
+
+    if (claimResult.count === 0) {
+      const fresh = await prisma.emailEvent.findUnique({
+        where: { id: eventRecordId },
+      });
+
+      if (fresh?.status === EmailEventProcessingStatus.PROCESSED) {
+        logger.info(
+          `[EventService] EmailEvent ${eventRecordId} already PROCESSED by concurrent claimant. Idempotent skip.`
+        );
+        return {
+          success: true,
+          deduplicated: true,
+          eventId: eventRecordId,
+        };
+      }
+
+      logger.info(
+        `[EventService] EmailEvent ${eventRecordId} actively held by another claimant (${fresh?.status}). Skipping without executing side effects.`
+      );
+      return {
+        success: true,
+        skipped: true,
+        reason: "CONTENTION_LOCK_HELD",
+        eventId: eventRecordId,
+      };
+    }
 
     try {
       // 3. Parse raw payload to extract bounce/complaint metadata
@@ -535,8 +578,8 @@ export class EmailEventService {
       }
 
       // 7. Transition: PROCESSING -> PROCESSED
-      await prisma.emailEvent.update({
-        where: { id: eventRecordId },
+      await prisma.emailEvent.updateMany({
+        where: { id: eventRecordId, status: EmailEventProcessingStatus.PROCESSING },
         data: {
           status: EmailEventProcessingStatus.PROCESSED,
           processedAt: new Date(),
@@ -574,8 +617,8 @@ export class EmailEventService {
         procErr
       );
 
-      await prisma.emailEvent.update({
-        where: { id: eventRecordId },
+      await prisma.emailEvent.updateMany({
+        where: { id: eventRecordId, status: EmailEventProcessingStatus.PROCESSING },
         data: {
           status: EmailEventProcessingStatus.FAILED,
           errorMessage: msg,

@@ -1009,6 +1009,46 @@
 
 ---
 
+### Entry: 2026-10-11 — Final Duplicate-Processing Audit and Repair
+- **Prompt / Phase**: Final Duplicate-Processing Audit and Repair (Establish Single Authoritative Claim per Work Item, Idempotency & Concurrency Hardening)
+- **Status**: ✅ Clean (All checks clean)
+- **Key Architectures Implemented & Verified**:
+  1. **Authoritative Cross-Path Claim Invariants**:
+     - Audited all overlapping paths (`BackgroundJob` vs direct table sweeps for `EmailDelivery`, `EmailCampaignRecipient`, and `EmailEvent`).
+     - Established database-enforced conditional atomic claims using `updateMany` with affected-row count validation (`count === 0` identifies losing claimants).
+     - Added `claimToken` authorization to `EmailDeliveryExecutor` and `CampaignRecipientExecutor`, enabling pre-claimed batch sweeps to verify lease ownership while direct or background job claimants atomically compete on the authoritative record.
+     - Competing/losing claimants now safely yield with `CONTENTION_LOCK_HELD` or `ALREADY_TERMINAL`, completely preventing duplicate provider sends, duplicate recipient dispatches, and double event executions.
+  2. **External Side Effect & Idempotency Safeguards**:
+     - `EmailDeliveryExecutor` and `CampaignRecipientExecutor` now pass deterministic `idempotencyKey` strings directly to the provider send request.
+     - `EmailCampaignRecipient` delivery creation enforces `idempotencyKey` uniqueness.
+     - `EmailEventService` atomically transitions `RECEIVED -> PROCESSING` and avoids double execution of suppression policies or customer journey automations.
+  3. **Reconciliation Error Surfacing (Zero Silent Swallowing)**:
+     - `ServerlessJobProcessor.reconcileJobs` now records database errors into a structured `ReconciliationReport` object (`error: errMsg`) instead of returning `null`.
+     - `ServerlessJobProcessor.processAll` surfaces reconciliation errors in the top-level `errors` array and reports `success: false`.
+  4. **Adversarial Concurrency Verification Suite**:
+     - Built dedicated test suite `scripts/verify-cross-path-concurrency.ts` running against disposable PostgreSQL (`127.0.0.1:5433`) with jittered mock providers.
+     - Formally validated simultaneous cross-path races:
+       - `BackgroundJob` vs `processTransactionalEmails` on identical `EmailDelivery` -> exactly 1 provider send.
+       - `BackgroundJob` vs `processCampaignRecipients` on identical recipient -> exactly 1 provider send, exactly 1 delivery record, 1 campaign sentCount increment.
+       - `BackgroundJob` vs `processEvents` on identical `EmailEvent` -> exactly 1 event processing cycle, 1 suppression policy entry.
+       - Stale-lock recovery (>10m) claimed cleanly while active work (<10m) remained protected against contention.
+       - Simulated reconciliation failure correctly reported `success: false` and populated error telemetry.
+  5. **Comprehensive Verification Results**:
+     - `npx prisma validate`: Schema valid.
+     - `npm run test:guard`: 16/16 PASSED.
+     - `npm run test:workerless` (including `test:concurrency`): 91/91 PASSED.
+     - `npm run test:email:events`: 50/50 PASSED.
+     - `npm run test:email:lifecycle`: 56/56 PASSED.
+     - `npm run test:communication`: 8/8 PASSED.
+     - `npm run test:email:certify`: 130/130 PASSED.
+     - `npx tsc --noEmit`: 0 errors.
+     - `npm run lint`: 0 errors, 0 warnings.
+     - `npm run build`: 100% SUCCESS (all 74 Next.js routes compiled cleanly).
+- **Unresolved Concerns**:
+  - `None (all checks clean)`.
+
+---
+
 ## Flag Template for Subsequent Prompts
 
 ```markdown

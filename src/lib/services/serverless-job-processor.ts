@@ -74,6 +74,7 @@ export interface ServerlessProcessingResult {
       failedJobs: number;
       completedCampaigns: number;
       durationMs?: number;
+      error?: string;
     } | null;
   };
 }
@@ -206,22 +207,30 @@ export class ServerlessJobProcessor {
             throw new PermanentError(`Malformed JSON payload in BackgroundJob '${job.id}'`);
           }
 
+          let yieldContention = false;
+
           if (
             job.type === "EMAIL_DELIVERY" ||
             job.type === "TRANSACTIONAL_EMAIL" ||
             job.type === "PROMOTIONAL_EMAIL"
           ) {
             const deliveryId = (payload.deliveryId as string) || job.id;
-            await EmailDeliveryExecutor.execute({
+            const execResult = await EmailDeliveryExecutor.execute({
               deliveryId,
               clientId: job.clientId,
             });
+            if (execResult.skipped && execResult.reason === "CONTENTION_LOCK_HELD") {
+              yieldContention = true;
+            }
           } else if (job.type === "CAMPAIGN_RECIPIENT") {
             const recipientId = (payload.campaignRecipientId as string) || (payload.recipientId as string);
             if (!recipientId) throw new PermanentError("Missing campaignRecipientId in payload");
-            await CampaignRecipientExecutor.executeRecipient({
+            const execResult = await CampaignRecipientExecutor.executeRecipient({
               recipientId,
             });
+            if (execResult.skipped && execResult.reason === "CONTENTION_LOCK_HELD") {
+              yieldContention = true;
+            }
           } else if (job.type === "CAMPAIGN_TRIGGER") {
             const campaignId = (payload.campaignId as string);
             if (!campaignId) throw new PermanentError("Missing campaignId in payload");
@@ -248,9 +257,28 @@ export class ServerlessJobProcessor {
           } else if (job.type === "EMAIL_EVENT") {
             const eventId = (payload.eventId as string) || (payload.eventRecordId as string);
             if (!eventId) throw new PermanentError("Missing eventId in payload");
-            await EmailEventProcessor.process({ eventId });
+            const execResult = await EmailEventProcessor.process({ eventId });
+            if (execResult && typeof execResult === "object" && "reason" in execResult && execResult.reason === "CONTENTION_LOCK_HELD") {
+              yieldContention = true;
+            }
           } else {
             throw new PermanentError(`Unrecognized job type '${job.type}' in BackgroundJob '${job.id}'`);
+          }
+
+          if (yieldContention) {
+            logger.info(
+              `[ServerlessProcessor] BackgroundJob ${job.id} yielded due to contention lock on authoritative work item.`
+            );
+            await prisma.backgroundJob.updateMany({
+              where: { id: job.id, status: BackgroundJobStatus.PROCESSING },
+              data: {
+                status: BackgroundJobStatus.QUEUED,
+                availableAt: new Date(Date.now() + 5000),
+                lockedAt: null,
+                lockedBy: null,
+              },
+            });
+            continue;
           }
 
           // Mark job COMPLETED
@@ -383,6 +411,7 @@ export class ServerlessJobProcessor {
           await EmailDeliveryExecutor.execute({
             deliveryId: item.id,
             clientId: item.clientId,
+            claimToken: lockedBy,
           });
           succeeded++;
         } catch (jobErr) {
@@ -534,6 +563,7 @@ export class ServerlessJobProcessor {
         try {
           await CampaignRecipientExecutor.executeRecipient({
             recipientId: item.id,
+            claimToken: lockedBy,
           });
           succeeded++;
         } catch (jobErr) {
@@ -710,15 +740,27 @@ export class ServerlessJobProcessor {
   /**
    * 9. Job Reconciliation
    */
-  static async reconcileJobs(staleMinutes = 10, isTimeExhausted?: () => boolean) {
+  static async reconcileJobs(staleMinutes = 10, isTimeExhausted?: () => boolean): Promise<ReconciliationReport | null> {
     if (isTimeExhausted && isTimeExhausted()) {
       return null;
     }
+    const startTime = Date.now();
     try {
       return await ReconciliationExecutor.reconcile({ staleMinutes, isTimeExhausted });
     } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
       logger.error("[ServerlessProcessor] Reconciliation error:", err);
-      return null;
+      return {
+        recoveredDeliveries: 0,
+        failedDeliveries: 0,
+        recoveredRecipients: 0,
+        failedRecipients: 0,
+        recoveredJobs: 0,
+        failedJobs: 0,
+        completedCampaigns: 0,
+        durationMs: Date.now() - startTime,
+        error: errMsg,
+      };
     }
   }
 
@@ -807,6 +849,7 @@ export class ServerlessJobProcessor {
     if (recurringAutomations.error) errors.push(`recurringAutomations: ${recurringAutomations.error}`);
     if (automationEnrollments.error) errors.push(`automationEnrollments: ${automationEnrollments.error}`);
     if (events.error) errors.push(`events: ${events.error}`);
+    if (reconciliationResult?.error) errors.push(`reconciliation: ${reconciliationResult.error}`);
 
     const timingBreakdownMs = {
       webhooks: webhooks.durationMs || 0,
