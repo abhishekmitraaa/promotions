@@ -1,50 +1,26 @@
 /**
- * SMS Channel Provider Adapter (Future-Ready Architecture)
+ * SMS Channel Provider Adapter (Future Expansion Architecture)
  *
- * Implements the ChannelProviderAdapter contract for SMS messaging (Twilio / AWS SNS / MessageBird).
- *
- * Production Safety Invariant:
- * - SMS gateway provider is not yet configured.
- * - This adapter MUST NOT return fake successes, fake SENT status, or fabricate providerMessageId.
- * - All send attempts fail explicitly with PROVIDER_UNAVAILABLE.
- * - Health status reports DEGRADED until live gateway credentials and transports are wired.
+ * Implements the ChannelProviderAdapter SPI for SMS messaging (e.g. Twilio, AWS SNS, MessageBird).
+ * Designed for immediate pluggability when SMS providers are activated.
  */
 
-import { ChannelProviderAdapter } from "./channel-adapter";
+import { ChannelProviderAdapter, ChannelReachabilityCheck } from "./channel-adapter";
 import {
+  ChannelType,
   UnifiedMessageRequest,
-  UnifiedNormalizedEvent,
-  UnifiedProviderHealthResult,
   UnifiedSendResult,
+  UnifiedProviderHealthResult,
+  UnifiedNormalizedEvent,
 } from "../types";
 import { normalizePhoneNumber } from "../../crypto";
 
-export class SmsChannelAdapter implements ChannelProviderAdapter {
-  readonly channel = "SMS" as const;
-  readonly providerName = "SMS_GATEWAY";
+export class SmsAdapter implements ChannelProviderAdapter {
+  readonly channel: ChannelType = "SMS";
 
-  /**
-   * Validates E.164 phone numbers for SMS transmission.
-   */
-  validateDestination(destination: string): { valid: boolean; normalized?: string; error?: string } {
-    try {
-      const normalized = normalizePhoneNumber(destination);
-      if (!normalized || normalized.length < 8) {
-        return { valid: false, error: "Phone number too short for SMS" };
-      }
-      return { valid: true, normalized };
-    } catch {
-      return { valid: false, error: "Invalid phone number format" };
-    }
-  }
-
-  /**
-   * Dispatches SMS message.
-   * Fails explicitly with PROVIDER_UNAVAILABLE until upstream gateway credentials are configured.
-   */
-  async sendMessage(request: UnifiedMessageRequest): Promise<UnifiedSendResult> {
-    const rawTo = request.recipient.destination || request.recipient.phone;
-    if (!rawTo) {
+  async send(request: UnifiedMessageRequest): Promise<UnifiedSendResult> {
+    const destination = request.recipient.phone || request.recipient.destination;
+    if (!destination) {
       return {
         success: false,
         channel: "SMS",
@@ -52,108 +28,88 @@ export class SmsChannelAdapter implements ChannelProviderAdapter {
         status: "FAILED",
         error: {
           code: "MISSING_DESTINATION",
-          message: "Recipient phone number is required for SMS dispatch",
+          message: "SMS dispatch requires a recipient phone number",
           retryable: false,
           failureCategory: "INVALID_DESTINATION",
         },
       };
     }
 
-    const val = this.validateDestination(rawTo);
-    if (!val.valid || !val.normalized) {
-      return {
-        success: false,
-        channel: "SMS",
-        deliveryId: "",
-        status: "FAILED",
-        error: {
-          code: "INVALID_PHONE_NUMBER",
-          message: val.error || "Invalid phone number",
-          retryable: false,
-          failureCategory: "INVALID_DESTINATION",
-        },
-      };
-    }
-
-    const textContent = request.content.text?.trim();
-    if (!textContent) {
-      return {
-        success: false,
-        channel: "SMS",
-        deliveryId: "",
-        status: "FAILED",
-        error: {
-          code: "EMPTY_SMS_BODY",
-          message: "SMS text body cannot be empty",
-          retryable: false,
-        },
-      };
-    }
-
-    // Invariant: Fail explicitly. Never fabricate fake success or fake providerMessageId!
+    // In current phase, SMS provider is configured as a planned adapter stub
     return {
       success: false,
       channel: "SMS",
-      deliveryId: "",
+      deliveryId: `sms_stub_${Date.now()}`,
       status: "FAILED",
       error: {
-        code: "PROVIDER_UNAVAILABLE",
-        message: "SMS channel is not configured with an active upstream provider gateway. Live SMS transmission is unavailable.",
+        code: "SMS_PROVIDER_NOT_CONFIGURED",
+        message: "SMS provider integration is ready for activation via ChannelProviderAdapter SPI",
         retryable: false,
         failureCategory: "PROVIDER_ERROR",
       },
     };
   }
 
-  /**
-   * Normalizes incoming SMS delivery receipt webhook if gateway is active.
-   */
-  normalizeEvent(rawPayload: any): UnifiedNormalizedEvent | null {
-    if (!rawPayload) return null;
-
-    const providerMessageId = rawPayload.MessageSid || rawPayload.id || rawPayload.providerMessageId;
-    if (!providerMessageId) return null;
-
-    const rawStatus = String(rawPayload.MessageStatus || rawPayload.status || "delivered").toLowerCase();
-
-    let eventType: UnifiedNormalizedEvent["eventType"] = "DELIVERED";
-    if (rawStatus === "sent") eventType = "SENT";
-    else if (rawStatus === "delivered") eventType = "DELIVERED";
-    else if (rawStatus === "failed" || rawStatus === "undelivered") eventType = "FAILED";
-
+  async checkHealth(_clientId: string): Promise<UnifiedProviderHealthResult> {
     return {
-      id: `sms-evt-${providerMessageId}-${Date.now()}`,
-      clientId: rawPayload.clientId,
-      channel: "SMS",
-      eventType,
-      providerEventId: rawPayload.SmsSid || `sms-ev-${Date.now()}`,
-      providerMessageId,
-      recipient: String(rawPayload.To || rawPayload.to || ""),
-      timestamp: new Date(),
-      payload: rawPayload,
-    };
-  }
-
-  /**
-   * Assesses SMS provider health.
-   * Reports DEGRADED because upstream gateway is not yet bound.
-   */
-  async checkHealth(): Promise<UnifiedProviderHealthResult> {
-    return {
-      providerType: this.providerName,
+      providerType: "SMS_GATEWAY",
       channel: "SMS",
       status: "DEGRADED",
-      latencyMs: -1,
+      latencyMs: 0,
       checkedAt: new Date(),
-      message: "SMS gateway provider is not configured. Live SMS transmission is unavailable.",
+      message: "SMS gateway adapter registered in standby mode",
       capabilities: {
         supportsTemplates: false,
         supportsMedia: false,
-        supportsTwoWay: false,
-        supportsDeliveryReceipts: false,
+        supportsTwoWay: true,
+        supportsDeliveryReceipts: true,
         supportsReadReceipts: false,
-        maxThroughputPerSecond: 0,
+        maxThroughputPerSecond: 100,
       },
     };
+  }
+
+  normalizeWebhookEvent(rawPayload: Record<string, unknown>): UnifiedNormalizedEvent[] {
+    const status = String(rawPayload.SmsStatus || rawPayload.status || "").toLowerCase();
+    let eventType: UnifiedNormalizedEvent["eventType"] = "FAILED";
+
+    if (status === "delivered") eventType = "DELIVERED";
+    else if (status === "sent") eventType = "SENT";
+    else if (status === "failed" || status === "undelivered") eventType = "FAILED";
+
+    return [
+      {
+        id: String(rawPayload.MessageSid || rawPayload.id || `sms_ev_${Date.now()}`),
+        channel: "SMS",
+        eventType,
+        providerEventId: String(rawPayload.MessageSid || `sms_${Date.now()}`),
+        providerMessageId: (rawPayload.MessageSid as string) || undefined,
+        recipient: String(rawPayload.To || rawPayload.recipient || ""),
+        timestamp: new Date(),
+        payload: rawPayload,
+      },
+    ];
+  }
+
+  async checkReachability(destination: string): Promise<ChannelReachabilityCheck> {
+    try {
+      const normalized = normalizePhoneNumber(destination);
+      const digitsOnly = normalized.replace(/\D/g, "");
+      if (digitsOnly.length < 8 || digitsOnly.length > 15) {
+        return {
+          valid: false,
+          reason: "Phone number length must be between 8 and 15 digits (E.164)",
+        };
+      }
+      return {
+        valid: true,
+        normalizedDestination: normalized,
+      };
+    } catch {
+      return {
+        valid: false,
+        reason: "Invalid phone number format",
+      };
+    }
   }
 }

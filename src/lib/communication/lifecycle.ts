@@ -1,312 +1,180 @@
 /**
- * Shared Lifecycle Abstractions
+ * Unified Lifecycle State Machines
  *
- * Implements monotonic delivery state transitions and campaign lifecycle state machines
- * across all communication channels (WhatsApp, Email, SMS, Push).
- *
- * Enforces:
- * 1. Monotonic status progression (e.g., READ cannot regress to SENT; terminal states cannot revert).
- * 2. Out-of-order event resilience (common in webhooks from Meta, Resend, SendGrid, Twilio).
- * 3. Channel-specific status normalization to unified lifecycle states.
+ * Implements monotonic progression rules and validation for:
+ * 1. Delivery State Machine (QUEUED -> PROCESSING -> SENT -> DELIVERED -> READ_OR_OPENED)
+ *    Ensures out-of-order webhook events (e.g. DELIVERED arriving before SENT)
+ *    never regress authoritative delivery state.
+ * 2. Campaign State Machine (DRAFT -> SCHEDULED/RUNNING -> COMPLETED/FAILED/CANCELLED)
+ * 3. Channel status mappers (WhatsApp & Email status normalization)
  */
 
 import {
-  ChannelType,
-  UnifiedCampaignStatus,
   UnifiedDeliveryStatus,
-  UnifiedEventType,
+  UnifiedCampaignStatus,
 } from "./types";
 
 // =============================================================================
-// 1. Monotonic Delivery State Machine
+// 1. Delivery Monotonic State Precedence
 // =============================================================================
 
-/**
- * Rank assigned to progressive delivery states.
- * Higher rank always supersedes lower rank unless the target is a terminal failure.
- */
-export const DELIVERY_STATUS_RANK: Record<UnifiedDeliveryStatus, number> = {
+const DELIVERY_PRECEDENCE: Record<UnifiedDeliveryStatus, number> = {
   QUEUED: 0,
-  PROCESSING: 10,
-  SENT: 20,
-  DELIVERED: 30,
-  READ_OR_OPENED: 40,
-  // Terminal failure states have distinct representation
-  FAILED: 90,
-  BOUNCED: 95,
-  COMPLAINED: 100,
+  PROCESSING: 1,
+  SENT: 2,
+  DELIVERED: 3,
+  READ_OR_OPENED: 4,
+  BOUNCED: 99,     // Terminal negative state
+  COMPLAINED: 99,  // Terminal negative state
+  FAILED: 99,      // Terminal negative state
 };
 
-export const TERMINAL_DELIVERY_STATUSES: readonly UnifiedDeliveryStatus[] = [
-  "FAILED",
+const TERMINAL_DELIVERY_STATUSES: ReadonlySet<UnifiedDeliveryStatus> = new Set([
+  "READ_OR_OPENED",
   "BOUNCED",
   "COMPLAINED",
-] as const;
+  "FAILED",
+]);
 
+/**
+ * Returns true if the delivery status is terminal and cannot transition further.
+ */
 export function isTerminalDeliveryStatus(status: UnifiedDeliveryStatus): boolean {
-  return (
-    status === "FAILED" ||
-    status === "BOUNCED" ||
-    status === "COMPLAINED"
-  );
-}
-
-export interface TransitionEvaluation {
-  allowed: boolean;
-  newStatus: UnifiedDeliveryStatus;
-  isTerminal: boolean;
-  reason?: string;
+  return TERMINAL_DELIVERY_STATUSES.has(status);
 }
 
 /**
- * Evaluates whether a delivery status transition is valid according to monotonic rules.
- * If out-of-order event arrives (e.g. SENT arrives after DELIVERED), it gracefully preserves
- * the higher-rank status without corrupting the record.
+ * Validates whether a delivery status can transition to target status.
+ * Enforces monotonic progression so states never regress.
  */
-export function evaluateDeliveryStatusTransition(
-  currentStatus: UnifiedDeliveryStatus,
-  incomingStatus: UnifiedDeliveryStatus
-): TransitionEvaluation {
-  // If already identical, no-op allowed
-  if (currentStatus === incomingStatus) {
-    return {
-      allowed: true,
-      newStatus: currentStatus,
-      isTerminal: isTerminalDeliveryStatus(currentStatus),
-    };
+export function canTransitionDelivery(
+  current: UnifiedDeliveryStatus,
+  target: UnifiedDeliveryStatus
+): boolean {
+  if (current === target) return true;
+
+  // Once terminal failed/bounced/complained, cannot transition to non-terminal
+  if ((current === "BOUNCED" || current === "COMPLAINED" || current === "FAILED") &&
+      target !== "BOUNCED" && target !== "COMPLAINED" && target !== "FAILED") {
+    return false;
   }
 
-  // Terminal failure states cannot be overridden by non-terminal progressive events
-  if (isTerminalDeliveryStatus(currentStatus)) {
-    // If incoming is COMPLAINED and current is BOUNCED/FAILED, complaint supersedes
-    if (incomingStatus === "COMPLAINED") {
-      return {
-        allowed: true,
-        newStatus: "COMPLAINED",
-        isTerminal: true,
-      };
-    }
-    return {
-      allowed: false,
-      newStatus: currentStatus,
-      isTerminal: true,
-      reason: `Cannot transition from terminal state ${currentStatus} to ${incomingStatus}`,
-    };
+  // Once READ_OR_OPENED, cannot regress to lower states
+  if (current === "READ_OR_OPENED") {
+    // Only complaint or bounce can record on top if needed, otherwise no regression
+    return target === "COMPLAINED" || target === "BOUNCED";
   }
 
-  // If incoming is terminal, it always overrides progressive states
-  if (isTerminalDeliveryStatus(incomingStatus)) {
-    return {
-      allowed: true,
-      newStatus: incomingStatus,
-      isTerminal: true,
-    };
+  // Terminal failures can always be accepted from non-terminal states
+  if (target === "FAILED" || target === "BOUNCED" || target === "COMPLAINED") {
+    return true;
   }
 
-  // Progressive states: strictly monotonic (cannot regress)
-  const currentRank = DELIVERY_STATUS_RANK[currentStatus];
-  const incomingRank = DELIVERY_STATUS_RANK[incomingStatus];
+  const currentRank = DELIVERY_PRECEDENCE[current] ?? 0;
+  const targetRank = DELIVERY_PRECEDENCE[target] ?? 0;
 
-  if (incomingRank > currentRank) {
-    return {
-      allowed: true,
-      newStatus: incomingStatus,
-      isTerminal: false,
-    };
+  return targetRank >= currentRank;
+}
+
+/**
+ * Resolves the next delivery status given current state and an incoming state,
+ * preventing regression if events arrive out of chronological order.
+ */
+export function resolveNextDeliveryStatus(
+  current: UnifiedDeliveryStatus,
+  incoming: UnifiedDeliveryStatus
+): UnifiedDeliveryStatus {
+  if (canTransitionDelivery(current, incoming)) {
+    return incoming;
   }
-
-  // Out-of-order progression (e.g., received SENT after DELIVERED)
-  return {
-    allowed: false,
-    newStatus: currentStatus,
-    isTerminal: false,
-    reason: `Ignored out-of-order transition from higher rank ${currentStatus} (rank ${currentRank}) to lower rank ${incomingStatus} (rank ${incomingRank})`,
-  };
+  return current;
 }
 
 // =============================================================================
 // 2. Campaign Lifecycle State Machine
 // =============================================================================
 
-export const VALID_CAMPAIGN_TRANSITIONS: Record<
-  UnifiedCampaignStatus,
-  readonly UnifiedCampaignStatus[]
-> = {
-  DRAFT: ["SCHEDULED", "RUNNING", "CANCELLED"],
-  SCHEDULED: ["RUNNING", "CANCELLED", "PAUSED"],
-  RUNNING: ["PAUSED", "COMPLETED", "FAILED", "CANCELLED"],
-  PAUSED: ["RUNNING", "CANCELLED"],
-  COMPLETED: [], // Terminal
-  FAILED: ["RUNNING"], // Can retry failed campaigns
-  CANCELLED: [], // Terminal
+const VALID_CAMPAIGN_TRANSITIONS: Record<UnifiedCampaignStatus, ReadonlySet<UnifiedCampaignStatus>> = {
+  DRAFT: new Set(["SCHEDULED", "RUNNING", "CANCELLED"]),
+  SCHEDULED: new Set(["RUNNING", "CANCELLED"]),
+  RUNNING: new Set(["PAUSED", "COMPLETED", "FAILED", "CANCELLED"]),
+  PAUSED: new Set(["RUNNING", "CANCELLED"]),
+  COMPLETED: new Set([]), // Terminal
+  FAILED: new Set(["RUNNING", "CANCELLED"]), // Can retry or cancel
+  CANCELLED: new Set([]), // Terminal
 };
 
-export function canTransitionCampaignStatus(
+/**
+ * Validates whether a campaign can transition from current to target status.
+ */
+export function canTransitionCampaign(
   current: UnifiedCampaignStatus,
-  next: UnifiedCampaignStatus
+  target: UnifiedCampaignStatus
 ): boolean {
-  if (current === next) return true;
-  const allowed = VALID_CAMPAIGN_TRANSITIONS[current] || [];
-  return allowed.includes(next);
+  if (current === target) return true;
+  const allowed = VALID_CAMPAIGN_TRANSITIONS[current];
+  return allowed ? allowed.has(target) : false;
 }
 
+/**
+ * Returns true if the campaign status is terminal.
+ */
 export function isTerminalCampaignStatus(status: UnifiedCampaignStatus): boolean {
   return status === "COMPLETED" || status === "CANCELLED";
 }
 
 // =============================================================================
-// 3. Channel Normalizers (Anti-Corruption Layer)
+// 3. Status Normalizers (Channel to Unified)
 // =============================================================================
 
 /**
- * Normalizes WhatsApp webhook delivery status to UnifiedDeliveryStatus.
- * WhatsApp Meta Cloud API statuses: sent, delivered, read, failed.
+ * Normalizes WhatsApp message status string into UnifiedDeliveryStatus.
  */
-export function normalizeWhatsAppDeliveryStatus(rawStatus: string): UnifiedDeliveryStatus {
-  const normalized = rawStatus.toLowerCase().trim();
-  switch (normalized) {
-    case "sent":
-      return "SENT";
-    case "delivered":
-      return "DELIVERED";
-    case "read":
-      return "READ_OR_OPENED";
-    case "failed":
-      return "FAILED";
-    case "queued":
-    case "accepted":
+export function mapWhatsAppStatus(status: string): UnifiedDeliveryStatus {
+  switch (status.toUpperCase()) {
+    case "QUEUED":
+    case "PENDING":
       return "QUEUED";
-    case "processing":
-    case "sending":
+    case "SENDING":
+    case "PROCESSING":
       return "PROCESSING";
+    case "SENT":
+      return "SENT";
+    case "DELIVERED":
+      return "DELIVERED";
+    case "READ":
+    case "OPENED":
+      return "READ_OR_OPENED";
+    case "FAILED":
+      return "FAILED";
     default:
-      return "PROCESSING";
+      return "FAILED";
   }
 }
 
 /**
- * Normalizes Email delivery status (from Resend, SendGrid, SMTP worker, or DB) to UnifiedDeliveryStatus.
+ * Normalizes Email delivery status string into UnifiedDeliveryStatus.
  */
-export function normalizeEmailDeliveryStatus(rawStatus: string): UnifiedDeliveryStatus {
-  const normalized = rawStatus.toLowerCase().trim();
-  switch (normalized) {
-    case "queued":
+export function mapEmailStatus(status: string): UnifiedDeliveryStatus {
+  switch (status.toUpperCase()) {
+    case "QUEUED":
       return "QUEUED";
-    case "processing":
-    case "sending":
+    case "PROCESSING":
       return "PROCESSING";
-    case "sent":
+    case "SENT":
       return "SENT";
-    case "delivered":
+    case "DELIVERED":
       return "DELIVERED";
-    case "opened":
-    case "clicked":
+    case "OPENED":
+    case "CLICKED":
       return "READ_OR_OPENED";
-    case "bounced":
+    case "BOUNCED":
       return "BOUNCED";
-    case "complained":
-    case "spam":
+    case "COMPLAINED":
       return "COMPLAINED";
-    case "failed":
-    case "rejected":
+    case "FAILED":
       return "FAILED";
     default:
-      return "PROCESSING";
-  }
-}
-
-/**
- * Normalizes channel-specific event types to UnifiedEventType.
- */
-export function normalizeChannelEventType(
-  channel: ChannelType,
-  rawEventType: string
-): UnifiedEventType {
-  const clean = rawEventType.toLowerCase().trim();
-
-  switch (channel) {
-    case "WHATSAPP":
-      switch (clean) {
-        case "sent":
-          return "SENT";
-        case "delivered":
-          return "DELIVERED";
-        case "read":
-          return "READ_OR_OPENED";
-        case "failed":
-          return "FAILED";
-        case "opt_out":
-        case "stop":
-          return "OPT_OUT";
-        default:
-          return "DELIVERED";
-      }
-
-    case "EMAIL":
-      switch (clean) {
-        case "queued":
-          return "QUEUED";
-        case "sent":
-          return "SENT";
-        case "delivered":
-          return "DELIVERED";
-        case "open":
-        case "opened":
-          return "READ_OR_OPENED";
-        case "click":
-        case "clicked":
-          return "CLICKED";
-        case "bounce":
-        case "bounced":
-          return "BOUNCED";
-        case "complaint":
-        case "complained":
-        case "spam":
-          return "COMPLAINT";
-        case "unsubscribe":
-        case "unsubscribed":
-          return "OPT_OUT";
-        case "failed":
-        case "rejected":
-          return "FAILED";
-        default:
-          return "DELIVERED";
-      }
-
-    case "SMS":
-      switch (clean) {
-        case "sent":
-          return "SENT";
-        case "delivered":
-          return "DELIVERED";
-        case "failed":
-        case "undelivered":
-          return "FAILED";
-        case "opt_out":
-        case "stop":
-          return "OPT_OUT";
-        default:
-          return "DELIVERED";
-      }
-
-    case "PUSH":
-      switch (clean) {
-        case "sent":
-          return "SENT";
-        case "delivered":
-        case "received":
-          return "DELIVERED";
-        case "opened":
-        case "interacted":
-          return "READ_OR_OPENED";
-        case "failed":
-        case "unregistered":
-          return "FAILED";
-        default:
-          return "DELIVERED";
-      }
-
-    default:
-      return "DELIVERED";
+      return "FAILED";
   }
 }

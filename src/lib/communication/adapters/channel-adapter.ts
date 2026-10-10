@@ -1,52 +1,59 @@
 /**
  * Channel Provider Adapter Service Provider Interface (SPI)
  *
- * Defines the contract that every channel-specific adapter (WhatsApp, Email, SMS, Push)
- * must implement to plug into the Unified Multi-Channel Communication Platform.
- *
- * Principles:
- * 1. Strict Typing: Every adapter consumes `UnifiedMessageRequest` and emits `UnifiedSendResult`.
- * 2. Event Normalization: Each adapter is responsible for parsing its provider's raw webhook
- *    payloads into `UnifiedNormalizedEvent`.
- * 3. Health & Capabilities: Each adapter declares provider health status, latencies, and features.
+ * Defines the contract that every channel-specific implementation must fulfill.
+ * Enables the unified platform to route messages, check provider health,
+ * normalize inbound webhooks, and validate destination reachability uniformly.
  */
 
 import {
   ChannelType,
   UnifiedMessageRequest,
-  UnifiedNormalizedEvent,
-  UnifiedProviderHealthResult,
   UnifiedSendResult,
+  UnifiedProviderHealthResult,
+  UnifiedNormalizedEvent,
 } from "../types";
+
+export interface ChannelReachabilityCheck {
+  valid: boolean;
+  normalizedDestination?: string;
+  reason?: string;
+}
 
 export interface ChannelProviderAdapter {
   /**
-   * The communication channel this adapter handles.
+   * The channel supported by this adapter.
    */
   readonly channel: ChannelType;
 
   /**
-   * Distinct provider identifier (e.g. 'META_CLOUD_API', 'SMTP', 'RESEND', 'TWILIO', 'FCM').
+   * Dispatches a message request through the channel-specific delivery pipeline.
    */
-  readonly providerName: string;
+  send(request: UnifiedMessageRequest): Promise<UnifiedSendResult>;
 
   /**
-   * Dispatches a message to the target channel.
+   * Alias for send() for backward/forward compatibility.
    */
   sendMessage(request: UnifiedMessageRequest): Promise<UnifiedSendResult>;
 
   /**
-   * Parses and normalizes incoming provider webhook payloads into standard domain events.
+   * Performs an active health check on the underlying provider configuration for a tenant.
    */
-  normalizeEvent(rawPayload: unknown): UnifiedNormalizedEvent | null;
+  checkHealth(clientId: string): Promise<UnifiedProviderHealthResult>;
 
   /**
-   * Checks real-time connectivity, latency, and credentials for the provider.
+   * Normalizes incoming raw webhook payloads from the provider into the unified event structure.
    */
-  checkHealth(): Promise<UnifiedProviderHealthResult>;
+  normalizeWebhookEvent(rawPayload: Record<string, unknown>): UnifiedNormalizedEvent[];
 
   /**
-   * Optional destination reachability or format validator (e.g., E.164 phone check, RFC 5322 email syntax).
+   * Validates whether a destination (e.g. phone number, email address, push token) is syntactically
+   * valid and reachable according to channel rules.
    */
-  validateDestination?(destination: string): { valid: boolean; normalized?: string; error?: string };
+  checkReachability(destination: string): Promise<ChannelReachabilityCheck>;
+
+  /**
+   * Synchronous destination syntax validation.
+   */
+  validateDestination(destination: string): ChannelReachabilityCheck;
 }

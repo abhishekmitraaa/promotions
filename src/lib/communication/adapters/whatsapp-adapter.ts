@@ -1,47 +1,33 @@
 /**
  * WhatsApp Channel Provider Adapter
  *
- * Implements ChannelProviderAdapter for WhatsApp (Meta Cloud API).
- * Delegates send operations to the existing, battle-tested `MessageService` to guarantee
- * 100% backward compatibility with zero behavioral regression.
+ * Implements the ChannelProviderAdapter SPI for WhatsApp messaging.
+ * Delegates execution to the authoritative MessageService without introducing
+ * breaking changes to existing WhatsApp tables, schemas, or webhook handlers.
  */
 
-import { ChannelProviderAdapter } from "./channel-adapter";
+import { ChannelProviderAdapter, ChannelReachabilityCheck } from "./channel-adapter";
 import {
+  ChannelType,
   UnifiedMessageRequest,
-  UnifiedNormalizedEvent,
-  UnifiedProviderHealthResult,
   UnifiedSendResult,
+  UnifiedProviderHealthResult,
+  UnifiedNormalizedEvent,
 } from "../types";
 import { MessageService } from "../../services/message-service";
-import { CreateMessageInput } from "../../validation/messages";
+import { mapWhatsAppStatus } from "../lifecycle";
 import { normalizePhoneNumber } from "../../crypto";
-import { normalizeWhatsAppDeliveryStatus } from "../lifecycle";
+import { isMetaConfigured } from "../../env";
+import { prisma } from "../../prisma";
 
-export class WhatsAppChannelAdapter implements ChannelProviderAdapter {
-  readonly channel = "WHATSAPP" as const;
-  readonly providerName = "META_CLOUD_API";
-
-  /**
-   * Validates and normalizes E.164 phone numbers for WhatsApp.
-   */
-  validateDestination(destination: string): { valid: boolean; normalized?: string; error?: string } {
-    try {
-      const normalized = normalizePhoneNumber(destination);
-      if (!normalized || normalized.length < 8) {
-        return { valid: false, error: "Phone number too short for WhatsApp delivery" };
-      }
-      return { valid: true, normalized };
-    } catch {
-      return { valid: false, error: "Invalid phone number format" };
-    }
-  }
+export class WhatsAppAdapter implements ChannelProviderAdapter {
+  readonly channel: ChannelType = "WHATSAPP";
 
   /**
-   * Dispatches WhatsApp message via existing MessageService.
+   * Dispatches a WhatsApp message through MessageService.
    */
-  async sendMessage(request: UnifiedMessageRequest): Promise<UnifiedSendResult> {
-    const destination = request.recipient.destination || request.recipient.phone;
+  async send(request: UnifiedMessageRequest): Promise<UnifiedSendResult> {
+    const destination = request.recipient.phone || request.recipient.destination;
     if (!destination) {
       return {
         success: false,
@@ -50,64 +36,44 @@ export class WhatsAppChannelAdapter implements ChannelProviderAdapter {
         status: "FAILED",
         error: {
           code: "MISSING_DESTINATION",
-          message: "Recipient phone number is required for WhatsApp message",
+          message: "WhatsApp dispatch requires a recipient phone number or destination",
           retryable: false,
           failureCategory: "INVALID_DESTINATION",
         },
       };
     }
-
-    const val = this.validateDestination(destination);
-    if (!val.valid || !val.normalized) {
-      return {
-        success: false,
-        channel: "WHATSAPP",
-        deliveryId: "",
-        status: "FAILED",
-        error: {
-          code: "INVALID_PHONE_NUMBER",
-          message: val.error || "Invalid phone number",
-          retryable: false,
-          failureCategory: "INVALID_DESTINATION",
-        },
-      };
-    }
-
-    const isTemplate = Boolean(request.content.templateName || request.content.templateId);
-
-    const input: CreateMessageInput = {
-      to: val.normalized,
-      type: isTemplate ? "template" : "text",
-      body: request.content.text || undefined,
-      templateName: request.content.templateName || undefined,
-      templateLanguage: (request.metadata?.templateLanguage as string) || "en_US",
-      templateParameters: (request.content.templateParameters as any) || undefined,
-      metadata: request.metadata,
-    };
 
     try {
-      const sendResult = await MessageService.send(input, {
-        clientId: request.clientId,
-        idempotencyKey: request.idempotencyKey,
-      });
+      const isTemplate = Boolean(request.content.templateName);
+      const result = await MessageService.send(
+        {
+          to: destination,
+          type: isTemplate ? "template" : "text",
+          body: request.content.text,
+          templateName: request.content.templateName,
+          templateParameters: request.content.templateParameters as any,
+          metadata: request.metadata,
+        },
+        {
+          clientId: request.clientId,
+          idempotencyKey: request.idempotencyKey,
+        }
+      );
 
-      const unifiedStatus = normalizeWhatsAppDeliveryStatus(sendResult.status);
-      const isFailed = sendResult.status === "FAILED";
+      const unifiedStatus = mapWhatsAppStatus(result.status);
+      const isSuccess = unifiedStatus !== "FAILED";
 
       return {
-        success: !isFailed,
+        success: isSuccess,
         channel: "WHATSAPP",
-        deliveryId: sendResult.id,
-        providerMessageId: sendResult.providerMessageId || undefined,
+        deliveryId: result.id,
+        providerMessageId: result.providerMessageId || undefined,
         status: unifiedStatus,
-        sentAt: sendResult.sentAt || new Date(),
-        error: isFailed
+        sentAt: result.sentAt || (isSuccess ? new Date() : undefined),
+        error: result.error
           ? {
-              code: sendResult.errorCode || sendResult.error?.code || "WHATSAPP_SEND_FAILED",
-              message:
-                sendResult.errorMessage ||
-                sendResult.error?.message ||
-                "Failed to dispatch WhatsApp message",
+              code: result.errorCode || result.error.code || "WHATSAPP_ERROR",
+              message: result.errorMessage || result.error.message || "WhatsApp dispatch error",
               retryable: false,
               failureCategory: "PROVIDER_ERROR",
             }
@@ -121,8 +87,8 @@ export class WhatsAppChannelAdapter implements ChannelProviderAdapter {
         status: "FAILED",
         error: {
           code: err.code || "WHATSAPP_DISPATCH_EXCEPTION",
-          message: err.message || "Exception occurred during WhatsApp dispatch",
-          retryable: true,
+          message: err.message || "Failed to dispatch WhatsApp message",
+          retryable: err.status >= 500,
           failureCategory: "PROVIDER_ERROR",
         },
       };
@@ -130,70 +96,115 @@ export class WhatsAppChannelAdapter implements ChannelProviderAdapter {
   }
 
   /**
-   * Normalizes incoming WhatsApp Meta webhook payload into standard domain event.
+   * Health check for WhatsApp client/tenant configuration.
    */
-  normalizeEvent(rawPayload: any): UnifiedNormalizedEvent | null {
-    if (!rawPayload) return null;
+  async checkHealth(clientId: string): Promise<UnifiedProviderHealthResult> {
+    const startTime = Date.now();
+    try {
+      const client = await prisma.apiClient.findUnique({
+        where: { id: clientId },
+      });
 
-    // Direct status update shape from Meta Webhook
-    // e.g. { id: 'wamid.HBg...', status: 'delivered', timestamp: '1727... ', recipient_id: '1234...' }
-    if (rawPayload.status && (rawPayload.id || rawPayload.wamid)) {
-      const providerMsgId = rawPayload.id || rawPayload.wamid;
-      const rawStatus = String(rawPayload.status).toLowerCase();
-
-      let eventType: UnifiedNormalizedEvent["eventType"] = "DELIVERED";
-      if (rawStatus === "sent") eventType = "SENT";
-      else if (rawStatus === "delivered") eventType = "DELIVERED";
-      else if (rawStatus === "read") eventType = "READ_OR_OPENED";
-      else if (rawStatus === "failed") eventType = "FAILED";
-
-      const ts = rawPayload.timestamp
-        ? new Date(Number(rawPayload.timestamp) * 1000)
-        : new Date();
+      const isConfigured = isMetaConfigured();
+      const latencyMs = Date.now() - startTime;
 
       return {
-        id: `wa-evt-${providerMsgId}-${rawStatus}-${Date.now()}`,
+        providerType: "META_CLOUD_API",
         channel: "WHATSAPP",
-        eventType,
-        providerEventId: rawPayload.eventId || `meta-evt-${providerMsgId}-${rawStatus}`,
-        providerMessageId: providerMsgId,
-        recipient: String(rawPayload.recipient_id || ""),
-        timestamp: isNaN(ts.getTime()) ? new Date() : ts,
-        payload: rawPayload,
+        status: isConfigured && client?.active ? "HEALTHY" : isConfigured ? "DEGRADED" : "UNHEALTHY",
+        latencyMs,
+        checkedAt: new Date(),
+        message: isConfigured
+          ? "WhatsApp Meta Cloud API configured"
+          : "Meta Cloud API credentials missing",
+        capabilities: {
+          supportsTemplates: true,
+          supportsMedia: true,
+          supportsTwoWay: true,
+          supportsDeliveryReceipts: true,
+          supportsReadReceipts: true,
+          maxThroughputPerSecond: 80,
+        },
+      };
+    } catch (err: any) {
+      return {
+        providerType: "META_CLOUD_API",
+        channel: "WHATSAPP",
+        status: "UNHEALTHY",
+        latencyMs: Date.now() - startTime,
+        checkedAt: new Date(),
+        message: err.message,
+        capabilities: {
+          supportsTemplates: true,
+          supportsMedia: true,
+          supportsTwoWay: true,
+          supportsDeliveryReceipts: true,
+          supportsReadReceipts: true,
+        },
       };
     }
-
-    return null;
   }
 
   /**
-   * Assesses WhatsApp Meta API configuration health.
+   * Normalizes incoming raw WhatsApp webhook payloads into UnifiedNormalizedEvents.
    */
-  async checkHealth(): Promise<UnifiedProviderHealthResult> {
-    const hasToken = Boolean(
-      process.env.WHATSAPP_API_TOKEN || process.env.WHATSAPP_ACCESS_TOKEN
-    );
-    const hasPhoneId = Boolean(process.env.WHATSAPP_PHONE_NUMBER_ID);
+  normalizeWebhookEvent(rawPayload: Record<string, unknown>): UnifiedNormalizedEvent[] {
+    const events: UnifiedNormalizedEvent[] = [];
+    const entry = (rawPayload.entry as any[]) || [];
 
-    const isHealthy = hasToken && hasPhoneId;
+    for (const item of entry) {
+      const changes = (item.changes as any[]) || [];
+      for (const change of changes) {
+        const value = change.value || {};
+        const statuses = (value.statuses as any[]) || [];
+        for (const statusObj of statuses) {
+          const providerStatus = String(statusObj.status || "").toLowerCase();
+          let eventType: UnifiedNormalizedEvent["eventType"] = "FAILED";
 
-    return {
-      providerType: this.providerName,
-      channel: "WHATSAPP",
-      status: isHealthy ? "HEALTHY" : "DEGRADED",
-      latencyMs: 12,
-      checkedAt: new Date(),
-      message: isHealthy
-        ? "WhatsApp Meta Cloud API configured and ready"
-        : "Missing WHATSAPP_API_TOKEN or WHATSAPP_PHONE_NUMBER_ID in environment",
-      capabilities: {
-        supportsTemplates: true,
-        supportsMedia: true,
-        supportsTwoWay: true,
-        supportsDeliveryReceipts: true,
-        supportsReadReceipts: true,
-        maxThroughputPerSecond: 80,
-      },
-    };
+          if (providerStatus === "sent") eventType = "SENT";
+          else if (providerStatus === "delivered") eventType = "DELIVERED";
+          else if (providerStatus === "read") eventType = "READ_OR_OPENED";
+          else if (providerStatus === "failed") eventType = "FAILED";
+
+          events.push({
+            id: statusObj.id ? `wa_${statusObj.id}_${statusObj.timestamp}` : `wa_${Date.now()}`,
+            channel: "WHATSAPP",
+            eventType,
+            providerEventId: statusObj.id || `wa_event_${Date.now()}`,
+            providerMessageId: statusObj.id,
+            recipient: statusObj.recipient_id || "",
+            timestamp: statusObj.timestamp ? new Date(Number(statusObj.timestamp) * 1000) : new Date(),
+            payload: statusObj,
+          });
+        }
+      }
+    }
+
+    return events;
+  }
+
+  /**
+   * Checks WhatsApp destination phone number reachability (E.164 validity).
+   */
+  async checkReachability(destination: string): Promise<ChannelReachabilityCheck> {
+    try {
+      const normalized = normalizePhoneNumber(destination);
+      const digitsOnly = normalized.replace(/\D/g, "");
+      if (digitsOnly.length < 8 || digitsOnly.length > 15) {
+        return {
+          valid: false,
+          reason: "Phone number length must be between 8 and 15 digits (E.164)",
+        };
+      }
+      return {
+        valid: true,
+        normalizedDestination: normalized,
+      };
+    } catch {
+      return {
+        valid: false,
+        reason: "Invalid phone number format",
+      };
+    }
   }
 }

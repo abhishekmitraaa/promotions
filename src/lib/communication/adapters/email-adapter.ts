@@ -1,48 +1,32 @@
 /**
  * Email Channel Provider Adapter
  *
- * Implements ChannelProviderAdapter for Email.
- * Delegates send operations to the existing `EmailService` while preserving all
- * deliverability safeguards, idempotency controls, and DKIM/SPF domain resolution.
+ * Implements the ChannelProviderAdapter SPI for Email messaging.
+ * Delegates execution to the authoritative EmailDispatchService / EmailService
+ * without altering existing EmailDelivery, EmailCampaign, or EmailEvent models.
  */
 
-import { ChannelProviderAdapter } from "./channel-adapter";
+import { ChannelProviderAdapter, ChannelReachabilityCheck } from "./channel-adapter";
 import {
+  ChannelType,
   UnifiedMessageRequest,
-  UnifiedNormalizedEvent,
-  UnifiedProviderHealthResult,
   UnifiedSendResult,
+  UnifiedProviderHealthResult,
+  UnifiedNormalizedEvent,
 } from "../types";
-import { EmailService } from "../../services/email-service";
+import { EmailDispatchService } from "../../services/email-dispatch-service";
 import { isValidEmail, normalizeEmail } from "../../email/normalization";
-import { normalizeEmailDeliveryStatus } from "../lifecycle";
-import { EmailSendRequest } from "../../email/types";
-import { providerRegistry } from "../../email/registry";
+import { prisma } from "../../prisma";
 
-export class EmailChannelAdapter implements ChannelProviderAdapter {
-  readonly channel = "EMAIL" as const;
-  readonly providerName = "EMAIL_ENGINE";
+export class EmailAdapter implements ChannelProviderAdapter {
+  readonly channel: ChannelType = "EMAIL";
 
   /**
-   * Validates and normalizes email addresses according to RFC 5322.
+   * Dispatches an email through EmailDispatchService.
    */
-  validateDestination(destination: string): { valid: boolean; normalized?: string; error?: string } {
-    if (!destination || typeof destination !== "string") {
-      return { valid: false, error: "Email destination is missing" };
-    }
-    const clean = destination.trim();
-    if (!isValidEmail(clean)) {
-      return { valid: false, error: `Invalid email address: '${clean}'` };
-    }
-    return { valid: true, normalized: normalizeEmail(clean) };
-  }
-
-  /**
-   * Dispatches an outbound email via existing EmailService.
-   */
-  async sendMessage(request: UnifiedMessageRequest): Promise<UnifiedSendResult> {
-    const rawTo = request.recipient.destination || request.recipient.email;
-    if (!rawTo) {
+  async send(request: UnifiedMessageRequest): Promise<UnifiedSendResult> {
+    const destination = request.recipient.email || request.recipient.destination;
+    if (!destination) {
       return {
         success: false,
         channel: "EMAIL",
@@ -50,122 +34,41 @@ export class EmailChannelAdapter implements ChannelProviderAdapter {
         status: "FAILED",
         error: {
           code: "MISSING_DESTINATION",
-          message: "Recipient email address is required for Email dispatch",
+          message: "Email dispatch requires a recipient email address",
           retryable: false,
           failureCategory: "INVALID_DESTINATION",
         },
       };
     }
-
-    const val = this.validateDestination(rawTo);
-    if (!val.valid || !val.normalized) {
-      return {
-        success: false,
-        channel: "EMAIL",
-        deliveryId: "",
-        status: "FAILED",
-        error: {
-          code: "INVALID_EMAIL_ADDRESS",
-          message: val.error || "Invalid email address",
-          retryable: false,
-          failureCategory: "INVALID_DESTINATION",
-        },
-      };
-    }
-
-    const subject =
-      request.content.subject?.trim() ||
-      request.content.templateName ||
-      "Notification";
-
-    const htmlContent = request.content.html || (request.content.text ? `<p>${request.content.text}</p>` : undefined);
-    const textContent = request.content.text || undefined;
-
-    if (!htmlContent && !textContent) {
-      return {
-        success: false,
-        channel: "EMAIL",
-        deliveryId: "",
-        status: "FAILED",
-        error: {
-          code: "EMPTY_EMAIL_CONTENT",
-          message: "Email message must have either text or html content",
-          retryable: false,
-        },
-      };
-    }
-
-    let finalSubject = subject;
-    let finalHtml = htmlContent;
-    let finalText = textContent;
-    let resolvedTemplateId: string | undefined = request.content.templateId || (request.metadata?.templateId as string);
-    let resolvedTemplateVersionId: string | undefined = (request.metadata?.templateVersionId as string) || undefined;
-
-    if (resolvedTemplateId) {
-      try {
-        const { EmailTemplateService } = await import("../../services/email-template-service");
-        const { TemplateEngine } = await import("../../email/template-engine");
-
-        const template = await EmailTemplateService.getTemplateById(request.clientId, resolvedTemplateId);
-        if (template) {
-          const version = resolvedTemplateVersionId
-            ? template.versions.find((v) => v.id === resolvedTemplateVersionId)
-            : template.versions.find((v) => v.status === "ACTIVE") || template.versions[0];
-
-          if (version) {
-            const vars = {
-              email: val.normalized,
-              name: request.recipient.name || "",
-              ...(request.recipient.variables || {}),
-              ...(request.metadata || {}),
-            };
-            const rendered = TemplateEngine.renderTemplate(version, vars);
-            finalSubject = rendered.subject;
-            finalHtml = rendered.html;
-            finalText = rendered.text;
-            resolvedTemplateVersionId = version.id;
-          }
-        }
-      } catch (err: any) {
-        console.warn(`[EmailChannelAdapter] Template resolution warning: ${err.message}`);
-      }
-    }
-
-    const emailSendRequest: EmailSendRequest = {
-      clientId: request.clientId,
-      to: val.normalized,
-      from: request.sender?.fromAddress,
-      replyTo: request.sender?.replyTo,
-      subject: finalSubject,
-      html: finalHtml,
-      text: finalText,
-      type: request.category === "PROMOTIONAL" ? "PROMOTIONAL" : "TRANSACTIONAL",
-      idempotencyKey: request.idempotencyKey,
-      campaignId: request.campaignId,
-      templateId: resolvedTemplateId,
-      templateVersionId: resolvedTemplateVersionId,
-      providerConfigId: (request.metadata?.providerConfigId as string) || undefined,
-      senderIdentityId: request.sender?.identityId || (request.metadata?.senderIdentityId as string) || undefined,
-      metadata: request.metadata,
-    };
 
     try {
-      const result = await EmailService.send(emailSendRequest);
+      const result = await EmailDispatchService.sendImmediate({
+        clientId: request.clientId,
+        to: destination,
+        subject: request.content.subject || "Notification",
+        html: request.content.html,
+        text: request.content.text,
+        from: request.sender?.fromAddress ? { email: request.sender.fromAddress } : undefined,
+        replyTo: request.sender?.replyTo,
+        idempotencyKey: request.idempotencyKey,
+      });
 
-      const unifiedStatus = normalizeEmailDeliveryStatus(result.providerStatus);
+      const isSuccess = result.success;
+      const unifiedStatus = isSuccess ? "SENT" : "FAILED";
 
       return {
-        success: result.success,
+        success: isSuccess,
         channel: "EMAIL",
         deliveryId: result.deliveryId || "",
         providerMessageId: result.providerMessageId,
         status: unifiedStatus,
-        sentAt: result.sentAt || new Date(),
-        error: !result.success
+        sentAt: result.sentAt,
+        error: result.error
           ? {
-              code: result.error?.code || "EMAIL_SEND_FAILED",
-              message: result.error?.message || "Failed to dispatch email",
-              retryable: Boolean(result.error?.retryable),
+              code: result.error.code,
+              message: result.error.message,
+              retryable: result.error.retryable,
+              failureCategory: "PROVIDER_ERROR",
             }
           : undefined,
       };
@@ -177,8 +80,8 @@ export class EmailChannelAdapter implements ChannelProviderAdapter {
         status: "FAILED",
         error: {
           code: err.code || "EMAIL_DISPATCH_EXCEPTION",
-          message: err.message || "Exception occurred during Email dispatch",
-          retryable: true,
+          message: err.message || "Failed to dispatch email",
+          retryable: false,
           failureCategory: "PROVIDER_ERROR",
         },
       };
@@ -186,72 +89,105 @@ export class EmailChannelAdapter implements ChannelProviderAdapter {
   }
 
   /**
-   * Normalizes incoming Email webhook event to standard domain event.
+   * Health check for active email provider configuration.
    */
-  normalizeEvent(rawPayload: any): UnifiedNormalizedEvent | null {
-    if (!rawPayload) return null;
+  async checkHealth(clientId: string): Promise<UnifiedProviderHealthResult> {
+    const startTime = Date.now();
+    try {
+      const config = await prisma.emailProviderConfig.findFirst({
+        where: { clientId, status: "ACTIVE" },
+      });
 
-    // Matches NormalizedEmailWebhookEvent structure or raw webhook shape
-    const providerEventId =
-      rawPayload.providerEventId ||
-      rawPayload.id ||
-      `email-evt-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+      const identity = await prisma.emailSenderIdentity.findFirst({
+        where: { clientId },
+      });
 
-    const rawType = String(rawPayload.eventType || rawPayload.type || "delivered").toLowerCase();
+      const isConfigured = Boolean(config || identity);
+      const latencyMs = Date.now() - startTime;
 
-    let eventType: UnifiedNormalizedEvent["eventType"] = "DELIVERED";
-    if (rawType.includes("sent")) eventType = "SENT";
-    else if (rawType.includes("deliver")) eventType = "DELIVERED";
-    else if (rawType.includes("open")) eventType = "READ_OR_OPENED";
-    else if (rawType.includes("click")) eventType = "CLICKED";
-    else if (rawType.includes("bounce")) eventType = "BOUNCED";
-    else if (rawType.includes("complaint") || rawType.includes("spam")) eventType = "COMPLAINT";
-    else if (rawType.includes("unsubscribe")) eventType = "OPT_OUT";
-    else if (rawType.includes("fail") || rawType.includes("reject")) eventType = "FAILED";
-
-    const timestamp = rawPayload.occurredAt
-      ? new Date(rawPayload.occurredAt)
-      : rawPayload.timestamp
-      ? new Date(rawPayload.timestamp)
-      : new Date();
-
-    return {
-      id: `email-evt-${providerEventId}`,
-      clientId: rawPayload.clientId,
-      channel: "EMAIL",
-      eventType,
-      deliveryId: rawPayload.deliveryId,
-      providerEventId,
-      providerMessageId: rawPayload.providerMessageId,
-      recipient: String(rawPayload.recipient || rawPayload.email || ""),
-      timestamp: isNaN(timestamp.getTime()) ? new Date() : timestamp,
-      payload: rawPayload,
-      bounceType: rawPayload.bounceClassification?.isPermanent ? "HARD" : "SOFT",
-      clickUrl: rawPayload.url || rawPayload.clickUrl,
-    };
+      return {
+        providerType: config?.providerType || "GMAIL",
+        channel: "EMAIL",
+        status: isConfigured ? "HEALTHY" : "DEGRADED",
+        latencyMs,
+        checkedAt: new Date(),
+        message: isConfigured
+          ? `Active identity configured (${identity?.email || config?.senderEmail || "default"})`
+          : "No active email sender configuration found for client",
+        capabilities: {
+          supportsTemplates: true,
+          supportsMedia: true,
+          supportsTwoWay: false,
+          supportsDeliveryReceipts: true,
+          supportsReadReceipts: true,
+          maxThroughputPerSecond: 50,
+        },
+      };
+    } catch (err: any) {
+      return {
+        providerType: "GMAIL",
+        channel: "EMAIL",
+        status: "UNHEALTHY",
+        latencyMs: Date.now() - startTime,
+        checkedAt: new Date(),
+        message: err.message,
+        capabilities: {
+          supportsTemplates: true,
+          supportsMedia: true,
+          supportsTwoWay: false,
+          supportsDeliveryReceipts: true,
+          supportsReadReceipts: true,
+        },
+      };
+    }
   }
 
   /**
-   * Assesses Email provider registry status and connectivity.
+   * Normalizes incoming raw email webhook event (e.g. bounce, delivery, open, click).
    */
-  async checkHealth(): Promise<UnifiedProviderHealthResult> {
-    const hasGmail = providerRegistry.has("GMAIL" as any);
+  normalizeWebhookEvent(rawPayload: Record<string, unknown>): UnifiedNormalizedEvent[] {
+    const events: UnifiedNormalizedEvent[] = [];
+    const eventTypeRaw = String(rawPayload.type || rawPayload.event || "").toLowerCase();
 
-    return {
-      providerType: this.providerName,
+    let eventType: UnifiedNormalizedEvent["eventType"] = "FAILED";
+    if (eventTypeRaw.includes("deliver")) eventType = "DELIVERED";
+    else if (eventTypeRaw.includes("open")) eventType = "READ_OR_OPENED";
+    else if (eventTypeRaw.includes("click")) eventType = "CLICKED";
+    else if (eventTypeRaw.includes("bounce")) eventType = "BOUNCED";
+    else if (eventTypeRaw.includes("complaint") || eventTypeRaw.includes("spam")) eventType = "COMPLAINT";
+    else if (eventTypeRaw.includes("unsubscribe")) eventType = "OPT_OUT";
+    else if (eventTypeRaw.includes("sent")) eventType = "SENT";
+
+    events.push({
+      id: String(rawPayload.id || `email_ev_${Date.now()}`),
       channel: "EMAIL",
-      status: hasGmail ? "HEALTHY" : "DEGRADED",
-      latencyMs: 15,
-      checkedAt: new Date(),
-      message: hasGmail ? "Email engine operational with Gmail provider" : "No active email provider factory registered",
-      capabilities: {
-        supportsTemplates: true,
-        supportsMedia: true,
-        supportsTwoWay: false,
-        supportsDeliveryReceipts: true,
-        supportsReadReceipts: true,
-        maxThroughputPerSecond: 100,
-      },
+      eventType,
+      deliveryId: (rawPayload.deliveryId as string) || undefined,
+      providerEventId: String(rawPayload.eventId || rawPayload.id || `ev_${Date.now()}`),
+      providerMessageId: (rawPayload.messageId as string) || (rawPayload.providerMessageId as string),
+      recipient: String(rawPayload.recipient || rawPayload.email || ""),
+      timestamp: rawPayload.timestamp ? new Date(rawPayload.timestamp as string | number) : new Date(),
+      payload: rawPayload,
+      bounceType: eventTypeRaw.includes("hard") ? "HARD" : eventTypeRaw.includes("soft") ? "SOFT" : undefined,
+      clickUrl: (rawPayload.url as string) || (rawPayload.clickUrl as string) || undefined,
+    });
+
+    return events;
+  }
+
+  /**
+   * Checks email destination reachability (RFC 5322 syntax validation and normalization).
+   */
+  async checkReachability(destination: string): Promise<ChannelReachabilityCheck> {
+    if (!isValidEmail(destination)) {
+      return {
+        valid: false,
+        reason: "Invalid email address format (RFC 5322 check failed)",
+      };
+    }
+    return {
+      valid: true,
+      normalizedDestination: normalizeEmail(destination),
     };
   }
 }

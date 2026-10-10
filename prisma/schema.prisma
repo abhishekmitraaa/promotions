@@ -173,6 +173,7 @@ model ApiClient {
   emailDomains        EmailDomain[]
   emailAutomations    EmailAutomation[]
   emailEnrollments    EmailAutomationEnrollment[]
+  backgroundJobs      BackgroundJob[]
 }
 
 model ApiKey {
@@ -675,6 +676,8 @@ model EmailCampaign {
   @@index([templateVersionId])
   @@index([senderIdentityId])
   @@index([automationId])
+  @@index([listId])
+  @@index([segmentId])
 }
 
 model EmailCampaignRecipient {
@@ -684,6 +687,13 @@ model EmailCampaignRecipient {
   email            String
   metadataSnapshot String?
   status           String          @default("PENDING")
+  attemptCount     Int             @default(0)
+  lastAttemptAt    DateTime?
+  nextAttemptAt    DateTime?
+  lockedAt         DateTime?
+  lockedBy         String?
+  errorCode        String?
+  errorMessage     String?
   createdAt        DateTime        @default(now())
   updatedAt        DateTime        @updatedAt
 
@@ -695,6 +705,8 @@ model EmailCampaignRecipient {
   @@index([campaignId])
   @@index([contactId])
   @@index([status])
+  @@index([status, nextAttemptAt])
+  @@index([lockedAt])
 }
 
 model EmailDelivery {
@@ -729,6 +741,8 @@ model EmailDelivery {
   diagnosticDetails      String?
   smtpCode               String?
   idempotencyKey         String?
+  lockedAt               DateTime?
+  lockedBy               String?
   createdAt              DateTime                @default(now())
   updatedAt              DateTime                @updatedAt
 
@@ -751,9 +765,12 @@ model EmailDelivery {
   @@index([campaignRecipientId])
   @@index([campaignId])
   @@index([templateId])
+  @@index([templateVersionId])
   @@index([providerConfigId])
   @@index([senderIdentityId])
   @@index([clientId, failureCategory])
+  @@index([status, nextAttemptAt])
+  @@index([lockedAt])
 }
 
 model EmailEvent {
@@ -846,6 +863,8 @@ model EmailAutomationEnrollment {
   abandonedReason   String?
   contextData       String?                // JSON: execution history, variables, branch decisions
   nextActionAt      DateTime?
+  lockedAt          DateTime?
+  lockedBy          String?
   enrolledAt        DateTime               @default(now())
   completedAt       DateTime?
   abandonedAt       DateTime?
@@ -861,5 +880,49 @@ model EmailAutomationEnrollment {
   @@index([clientId])
   @@index([status])
   @@index([nextActionAt])
+  @@index([lockedAt])
+}
+
+enum BackgroundJobStatus {
+  QUEUED
+  PROCESSING
+  RETRYING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+model BackgroundJob {
+  id               String              @id @default(uuid())
+  clientId         String
+  type             String
+  status           BackgroundJobStatus @default(QUEUED)
+  payload          String              // JSON payload (strictly sanitized, no secrets/tokens)
+  priority         Int                 @default(0)
+  scheduledAt      DateTime            @default(now())
+  availableAt      DateTime            @default(now())
+  attemptCount     Int                 @default(0)
+  maxAttempts      Int                 @default(5)
+  lastAttemptAt    DateTime?
+  nextAttemptAt    DateTime?
+  lockedAt         DateTime?
+  lockedBy         String?
+  completedAt      DateTime?
+  failedAt         DateTime?
+  lastErrorCode    String?
+  lastErrorMessage String?
+  deduplicationKey String?
+  createdAt        DateTime            @default(now())
+  updatedAt        DateTime            @updatedAt
+
+  client           ApiClient           @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@unique([clientId, deduplicationKey])
+  @@index([clientId, status])
+  @@index([status, availableAt])
+  @@index([status, nextAttemptAt])
+  @@index([type, status])
+  @@index([lockedAt])
+  @@index([scheduledAt])
 }
 

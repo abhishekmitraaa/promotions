@@ -5,12 +5,16 @@
  * Enables dynamic resolution, custom adapter injection, and system-wide health checks.
  */
 
-import { ChannelType } from "./types";
+import { ChannelType, UnifiedProviderHealthResult } from "./types";
 import { ChannelProviderAdapter } from "./adapters/channel-adapter";
-import { WhatsAppChannelAdapter } from "./adapters/whatsapp-adapter";
-import { EmailChannelAdapter } from "./adapters/email-adapter";
-import { SmsChannelAdapter } from "./adapters/sms-adapter";
-import { PushChannelAdapter } from "./adapters/push-adapter";
+import { WhatsAppAdapter } from "./adapters/whatsapp-adapter";
+import { EmailAdapter } from "./adapters/email-adapter";
+import { SmsAdapter } from "./adapters/sms-adapter";
+import { PushAdapter } from "./adapters/push-adapter";
+
+// Re-export adapters for convenience
+export { WhatsAppAdapter, EmailAdapter, SmsAdapter, PushAdapter };
+export { WhatsAppAdapter as WhatsAppChannelAdapter, EmailAdapter as EmailChannelAdapter, SmsAdapter as SmsChannelAdapter, PushAdapter as PushChannelAdapter };
 
 export class CommunicationRegistry {
   private adapters: Map<ChannelType, ChannelProviderAdapter> = new Map();
@@ -23,10 +27,10 @@ export class CommunicationRegistry {
    * Registers default adapters for WhatsApp, Email, SMS, and Push.
    */
   private registerDefaults(): void {
-    this.adapters.set("WHATSAPP", new WhatsAppChannelAdapter());
-    this.adapters.set("EMAIL", new EmailChannelAdapter());
-    this.adapters.set("SMS", new SmsChannelAdapter());
-    this.adapters.set("PUSH", new PushChannelAdapter());
+    this.adapters.set("WHATSAPP", new WhatsAppAdapter());
+    this.adapters.set("EMAIL", new EmailAdapter());
+    this.adapters.set("SMS", new SmsAdapter());
+    this.adapters.set("PUSH", new PushAdapter());
   }
 
   /**
@@ -55,22 +59,28 @@ export class CommunicationRegistry {
   }
 
   /**
-   * Runs diagnostic health checks across all registered channel adapters.
+   * Runs diagnostic health checks across all registered channel adapters for a client.
    */
-  async checkAllHealth() {
-    const results: Record<string, any> = {};
+  async checkAllHealth(clientId: string = "default"): Promise<Record<ChannelType, UnifiedProviderHealthResult>> {
+    const results = {} as Record<ChannelType, UnifiedProviderHealthResult>;
     for (const [channel, adapter] of this.adapters.entries()) {
       try {
-        results[channel] = await adapter.checkHealth();
+        results[channel] = await adapter.checkHealth(clientId);
       } catch (err: any) {
         results[channel] = {
-          providerType: adapter.providerName,
+          providerType: channel,
           channel,
           status: "UNHEALTHY",
           latencyMs: -1,
           checkedAt: new Date(),
           message: err.message || "Failed health check",
-          capabilities: {},
+          capabilities: {
+            supportsTemplates: false,
+            supportsMedia: false,
+            supportsTwoWay: false,
+            supportsDeliveryReceipts: false,
+            supportsReadReceipts: false,
+          },
         };
       }
     }

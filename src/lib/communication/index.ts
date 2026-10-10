@@ -1,5 +1,14 @@
 /**
- * Unified Multi-Channel Communication Platform Barrel Exports
+ * Unified Communication Layer
+ *
+ * Entry point exposing the shared omnichannel abstractions:
+ * - Domain contracts (10 shared concepts: Contact, Message, Campaign, Template, Delivery, Event, Suppression, Consent, Provider, Analytics)
+ * - Monotonic delivery & campaign lifecycle state machines
+ * - Multi-tenant context and isolation validation
+ * - Cross-channel analytics aggregation contracts
+ * - Channel provider adapter SPI & concrete adapters (WhatsApp, Email, SMS, Push)
+ * - Channel adapter registry
+ * - Unified message router facade
  */
 
 export * from "./types";

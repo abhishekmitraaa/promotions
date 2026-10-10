@@ -13,8 +13,10 @@
 import { assertTenantContext, isChannelEnabledForTenant } from "./tenant";
 import { communicationRegistry } from "./registry";
 import {
+  ChannelType,
   UnifiedMessageRequest,
   UnifiedSendResult,
+  UnifiedProviderHealthResult,
 } from "./types";
 import { EmailSuppressionService } from "../services/email-suppression-service";
 import { normalizePhoneNumber } from "../crypto";
@@ -25,10 +27,11 @@ export class UnifiedMessageRouter {
    */
   static async route(request: UnifiedMessageRequest): Promise<UnifiedSendResult> {
     // 1. Tenant boundary assertion
-    const tenant = assertTenantContext(request.clientId);
+    assertTenantContext(request, "UnifiedMessageRequest");
+    const clientId = request.clientId;
 
     // 2. Check tenant channel permissions
-    if (!isChannelEnabledForTenant(tenant, request.channel)) {
+    if (!isChannelEnabledForTenant(clientId, request.channel)) {
       return {
         success: false,
         channel: request.channel,
@@ -36,7 +39,7 @@ export class UnifiedMessageRouter {
         status: "FAILED",
         error: {
           code: "CHANNEL_NOT_ENABLED",
-          message: `Channel '${request.channel}' is not enabled for tenant '${tenant.clientId}'`,
+          message: `Channel '${request.channel}' is not enabled for tenant '${clientId}'`,
           retryable: false,
           failureCategory: "AUTHENTICATION_FAILED",
         },
@@ -70,32 +73,32 @@ export class UnifiedMessageRouter {
       };
     }
 
-    // 5. Destination syntax validation
-    if (adapter.validateDestination) {
-      const validation = adapter.validateDestination(destination);
-      if (!validation.valid) {
-        return {
-          success: false,
-          channel: request.channel,
-          deliveryId: "",
-          status: "FAILED",
-          error: {
-            code: "INVALID_DESTINATION",
-            message: validation.error || "Invalid destination address",
-            retryable: false,
-            failureCategory: "INVALID_DESTINATION",
-          },
-        };
-      }
+    // 5. Destination syntax and reachability validation
+    const reachability = await adapter.checkReachability(destination);
+    if (!reachability.valid) {
+      return {
+        success: false,
+        channel: request.channel,
+        deliveryId: "",
+        status: "FAILED",
+        error: {
+          code: "INVALID_DESTINATION",
+          message: reachability.reason || "Invalid destination address",
+          retryable: false,
+          failureCategory: "INVALID_DESTINATION",
+        },
+      };
     }
+
+    const normalizedDestination = reachability.normalizedDestination || destination;
 
     // 6. Unified Suppression Enforcement (FAIL-CLOSED)
     // Production Invariant: Never dispatch when suppression state is unverified or active.
     try {
       if (request.channel === "EMAIL") {
         const suppCheck = await EmailSuppressionService.isSuppressed(
-          tenant.clientId,
-          destination
+          clientId,
+          normalizedDestination
         );
         if (suppCheck.suppressed) {
           return {
@@ -105,7 +108,7 @@ export class UnifiedMessageRouter {
             status: "FAILED",
             error: {
               code: "RECIPIENT_SUPPRESSED",
-              message: `Recipient '${destination}' is suppressed for tenant '${tenant.clientId}' (reason: ${suppCheck.reason || "SUPPRESSED"})`,
+              message: `Recipient '${normalizedDestination}' is suppressed for tenant '${clientId}' (reason: ${suppCheck.reason || "SUPPRESSED"})`,
               retryable: false,
               failureCategory: "OPTED_OUT_OR_SUPPRESSED",
             },
@@ -115,7 +118,7 @@ export class UnifiedMessageRouter {
         // Phone-based suppression verification
         const normalizedPhone = normalizePhoneNumber(destination);
         const suppCheck = await EmailSuppressionService.isSuppressed(
-          tenant.clientId,
+          clientId,
           normalizedPhone
         );
         if (suppCheck.suppressed) {
@@ -126,7 +129,7 @@ export class UnifiedMessageRouter {
             status: "FAILED",
             error: {
               code: "RECIPIENT_SUPPRESSED",
-              message: `Recipient '${destination}' is suppressed for tenant '${tenant.clientId}' (reason: ${suppCheck.reason || "SUPPRESSED"})`,
+              message: `Recipient '${destination}' is suppressed for tenant '${clientId}' (reason: ${suppCheck.reason || "SUPPRESSED"})`,
               retryable: false,
               failureCategory: "OPTED_OUT_OR_SUPPRESSED",
             },
@@ -150,12 +153,12 @@ export class UnifiedMessageRouter {
     }
 
     // 7. Dispatch message via Adapter
-    return await adapter.sendMessage({
+    return await adapter.send({
       ...request,
-      clientId: tenant.clientId,
+      clientId,
       recipient: {
         ...request.recipient,
-        destination,
+        destination: normalizedDestination,
       },
     });
   }
@@ -163,7 +166,7 @@ export class UnifiedMessageRouter {
   /**
    * System-wide diagnostic health assessment across all channels.
    */
-  static async getHealth() {
-    return await communicationRegistry.checkAllHealth();
+  static async getHealth(clientId: string = "default"): Promise<Record<ChannelType, UnifiedProviderHealthResult>> {
+    return await communicationRegistry.checkAllHealth(clientId);
   }
 }
