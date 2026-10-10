@@ -154,6 +154,24 @@ function setupMockPrisma() {
     return evt;
   };
 
+  (prisma.emailEvent.updateMany as any) = async ({ where, data }: any) => {
+    let count = 0;
+    for (const evt of store.events) {
+      if (where.id && evt.id !== where.id) continue;
+      if (where.status && evt.status !== where.status) continue;
+      if (where.OR) {
+        const matchesOr = where.OR.some((clause: any) => {
+          if (clause.status && evt.status !== clause.status) return false;
+          return true;
+        });
+        if (!matchesOr) continue;
+      }
+      Object.assign(evt, data);
+      count++;
+    }
+    return { count };
+  };
+
   (prisma.emailContact.findFirst as any) = async ({ where }: any) => {
     return (
       store.contacts.find((c) => {
