@@ -17,6 +17,15 @@
  * 13. RBAC Enforcement (VIEWER read-only vs ADMIN suppression management)
  */
 
+if (!process.env.DATABASE_URL || process.env.DATABASE_URL.includes("peqynzeioiauynfpdsdv") || process.env.DATABASE_URL.includes("supabase.co")) {
+  process.env.DATABASE_URL = "postgresql://postgres:postgres@127.0.0.1:5433/email_test";
+}
+if (!process.env.DIRECT_URL || process.env.DIRECT_URL.includes("peqynzeioiauynfpdsdv") || process.env.DIRECT_URL.includes("supabase.co")) {
+  process.env.DIRECT_URL = "postgresql://postgres:postgres@127.0.0.1:5433/email_test";
+}
+process.env.ALLOW_DESTRUCTIVE_TESTS = "true";
+process.env.NODE_ENV = "test";
+
 import crypto from "crypto";
 import {
   verifyHmacWebhookSignature,
@@ -284,6 +293,19 @@ async function runPhase7Tests() {
   const tenantBeta = "tenant-beta";
   const secret = "test-webhook-secret-key-32-chars-long!";
 
+  // Create valid ApiClient fixtures for test tenants in the disposable database
+  await prisma.apiClient.upsert({
+    where: { id: tenantAlpha },
+    create: { id: tenantAlpha, name: "Tenant Alpha Test", active: true },
+    update: { active: true },
+  });
+  await prisma.apiClient.upsert({
+    where: { id: tenantBeta },
+    create: { id: tenantBeta, name: "Tenant Beta Test", active: true },
+    update: { active: true },
+  });
+
+  try {
   // -------------------------------------------------------------------------
   // 1. Webhook Signature Verification
   // -------------------------------------------------------------------------
@@ -628,6 +650,16 @@ async function runPhase7Tests() {
 
   const viewerAnalytics = await EmailAnalyticsService.getCampaignAnalytics(tenantAlpha, campaignId);
   testAssert(viewerAnalytics.campaignId === campaignId, "VIEWER authorized to view campaign analytics");
+
+  } finally {
+    // Safely remove test jobs and fixtures from the test database
+    await prisma.backgroundJob.deleteMany({
+      where: { clientId: { in: [tenantAlpha, tenantBeta] } },
+    }).catch(() => {});
+    await prisma.apiClient.deleteMany({
+      where: { id: { in: [tenantAlpha, tenantBeta] } },
+    }).catch(() => {});
+  }
 
   console.log("\n-------------------------------------------------");
   console.log(`Summary: ${passed} PASSED, ${failed} FAILED`);

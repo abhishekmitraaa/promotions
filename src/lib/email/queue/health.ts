@@ -16,6 +16,7 @@ import {
   getTransactionalQueue,
   getCampaignQueue,
   getEventsQueue,
+  isWorkerlessMode,
 } from "./queues";
 import { prisma } from "../../prisma";
 import { workerLogger, sanitizeLogValue } from "./worker-logger";
@@ -68,7 +69,8 @@ export interface EmailQueueHealthReport {
 }
 
 export async function getEmailQueueHealth(): Promise<EmailQueueHealthReport> {
-  const safeTarget = sanitizeRedisUrl(getRedisUrl());
+  const isWorkerless = isWorkerlessMode();
+  const safeTarget = isWorkerless ? "workerless (PostgreSQL backed)" : sanitizeRedisUrl(getRedisUrl());
   let redisConnected = false;
   let redisLatencyMs: number | undefined;
   let redisError: string | undefined;
@@ -77,16 +79,18 @@ export async function getEmailQueueHealth(): Promise<EmailQueueHealthReport> {
   let postgresLatencyMs: number | undefined;
   let postgresError: string | undefined;
 
-  // 1. Check Redis Ping
-  try {
-    const redis = getRedisConnection();
-    const start = Date.now();
-    const pong = await redis.ping();
-    redisLatencyMs = Date.now() - start;
-    redisConnected = pong === "PONG";
-  } catch (err) {
-    redisError = err instanceof Error ? err.message : "Redis connection failed";
-    workerLogger.error("[QueueHealth] Redis ping error", err);
+  // 1. Check Redis Ping (if in Redis worker mode)
+  if (!isWorkerless) {
+    try {
+      const redis = getRedisConnection();
+      const start = Date.now();
+      const pong = await redis.ping();
+      redisLatencyMs = Date.now() - start;
+      redisConnected = pong === "PONG";
+    } catch (err) {
+      redisError = err instanceof Error ? err.message : "Redis connection failed";
+      workerLogger.error("[QueueHealth] Redis ping error", err);
+    }
   }
 
   // 2. Check PostgreSQL Ping
@@ -103,7 +107,7 @@ export async function getEmailQueueHealth(): Promise<EmailQueueHealthReport> {
   // 3. Helper to safely get counts
   async function safeJobCounts(queueGetter: () => Queue): Promise<QueueJobCounts> {
     try {
-      if (!redisConnected) {
+      if (!isWorkerless && !redisConnected) {
         return { waiting: 0, active: 0, completed: 0, failed: 0, delayed: 0 };
       }
       const queue = queueGetter();
@@ -132,7 +136,7 @@ export async function getEmailQueueHealth(): Promise<EmailQueueHealthReport> {
   // 4. Helper to inspect recent failed jobs (dead-letter visibility)
   async function getRecentFailedJobs(queueGetter: () => Queue): Promise<FailedJobSummary[]> {
     try {
-      if (!redisConnected) return [];
+      if (!isWorkerless && !redisConnected) return [];
       const queue = queueGetter();
       const failed = await queue.getFailed(0, 4); // Latest 5 failed jobs
       return failed.map((job) => ({
@@ -160,7 +164,7 @@ export async function getEmailQueueHealth(): Promise<EmailQueueHealthReport> {
 
   // 5. Query active worker heartbeats from Redis
   let activeClusterWorkers: WorkerTelemetrySnapshot[] = [];
-  if (redisConnected) {
+  if (redisConnected && !isWorkerless) {
     try {
       const redis = getRedisConnection();
       activeClusterWorkers = await getActiveWorkerHeartbeats(redis);
@@ -173,12 +177,12 @@ export async function getEmailQueueHealth(): Promise<EmailQueueHealthReport> {
 
   // 6. Overall Status Determination
   let status: "HEALTHY" | "DEGRADED" | "DOWN" = "HEALTHY";
-  if (!redisConnected || !postgresConnected) {
+  if (!postgresConnected || (!isWorkerless && !redisConnected)) {
     status = "DOWN";
   } else if (
     transactionalCounts.failed > 50 ||
     campaignCounts.failed > 50 ||
-    (redisLatencyMs && redisLatencyMs > 500) ||
+    (!isWorkerless && redisLatencyMs && redisLatencyMs > 500) ||
     (postgresLatencyMs && postgresLatencyMs > 500)
   ) {
     status = "DEGRADED";

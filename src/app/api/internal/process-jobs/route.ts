@@ -26,17 +26,15 @@ export async function POST(req: NextRequest) {
 
   const authHeader = req.headers.get("authorization");
   const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.substring(7).trim() : null;
-  const headerSecret = req.headers.get("x-processor-secret")?.trim() || req.headers.get("x-worker-secret")?.trim();
-  const candidateSecret = bearerToken || headerSecret;
 
-  if (!candidateSecret) {
+  if (!bearerToken) {
     return NextResponse.json(
       { success: false, error: "Missing authorization credential" },
       { status: 401 }
     );
   }
 
-  const isAuthorized = await timingSafeEqualSecret(candidateSecret, configuredSecret);
+  const isAuthorized = await timingSafeEqualSecret(bearerToken, configuredSecret);
   if (!isAuthorized) {
     logger.warn("[API:ProcessJobs] Unauthorized invocation attempt with invalid secret.");
     return NextResponse.json(

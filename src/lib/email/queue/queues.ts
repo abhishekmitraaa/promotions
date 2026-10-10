@@ -132,6 +132,121 @@ class WorkerlessQueueAdapter<T = unknown> {
     }
   }
 
+  async getJobCounts(...types: string[]): Promise<Record<string, number>> {
+    try {
+      const now = new Date();
+      const [waiting, active, completed, failed, delayed] = await Promise.all([
+        prisma.backgroundJob.count({
+          where: { status: BackgroundJobStatus.QUEUED, availableAt: { lte: now } },
+        }),
+        prisma.backgroundJob.count({
+          where: { status: BackgroundJobStatus.PROCESSING },
+        }),
+        prisma.backgroundJob.count({
+          where: { status: BackgroundJobStatus.COMPLETED },
+        }),
+        prisma.backgroundJob.count({
+          where: { status: BackgroundJobStatus.FAILED },
+        }),
+        prisma.backgroundJob.count({
+          where: { status: BackgroundJobStatus.QUEUED, availableAt: { gt: now } },
+        }),
+      ]);
+
+      const counts: Record<string, number> = {
+        waiting,
+        active,
+        completed,
+        failed,
+        delayed,
+      };
+
+      if (types.length === 0) return counts;
+      const filtered: Record<string, number> = {};
+      for (const t of types) {
+        filtered[t] = counts[t] || 0;
+      }
+      return filtered;
+    } catch (err) {
+      logger.error("[WorkerlessQueue] Failed to get job counts:", err);
+      return { waiting: 0, active: 0, completed: 0, failed: 0, delayed: 0 };
+    }
+  }
+
+  async getFailed(start = 0, end = 10) {
+    try {
+      const take = Math.max(1, end - start + 1);
+      const failedJobs = await prisma.backgroundJob.findMany({
+        where: { status: BackgroundJobStatus.FAILED },
+        orderBy: { failedAt: "desc" },
+        skip: start,
+        take,
+      });
+
+      return failedJobs.map((j) => ({
+        id: j.id,
+        name: j.type,
+        data: JSON.parse(j.payload || "{}") as T,
+        failedReason: j.lastErrorMessage || "Execution failed",
+        attemptsMade: j.attemptCount,
+        finishedOn: j.failedAt ? j.failedAt.getTime() : undefined,
+      }));
+    } catch {
+      return [];
+    }
+  }
+
+  async drain() {
+    try {
+      await prisma.backgroundJob.deleteMany({
+        where: { status: BackgroundJobStatus.QUEUED },
+      });
+    } catch (err) {
+      logger.warn("[WorkerlessQueue] Failed to drain queue:", err);
+    }
+  }
+
+  async clean(grace: number, limit = 1000, type = "completed"): Promise<string[]> {
+    try {
+      const statusMap: Record<string, BackgroundJobStatus> = {
+        completed: BackgroundJobStatus.COMPLETED,
+        failed: BackgroundJobStatus.FAILED,
+        active: BackgroundJobStatus.PROCESSING,
+        wait: BackgroundJobStatus.QUEUED,
+      };
+      const targetStatus = statusMap[type.toLowerCase()] || BackgroundJobStatus.COMPLETED;
+      const graceDate = new Date(Date.now() - grace);
+
+      const toClean = await prisma.backgroundJob.findMany({
+        where: {
+          status: targetStatus,
+          updatedAt: { lte: graceDate },
+        },
+        select: { id: true },
+        take: limit,
+      });
+
+      if (toClean.length > 0) {
+        const ids = toClean.map((j) => j.id);
+        await prisma.backgroundJob.deleteMany({
+          where: { id: { in: ids } },
+        });
+        return ids;
+      }
+      return [];
+    } catch {
+      return [];
+    }
+  }
+
+  async isPaused(): Promise<boolean> {
+    return false;
+  }
+
+  async pause(): Promise<void> {}
+
+  async resume(): Promise<void> {}
+
   async close() {}
 }
 

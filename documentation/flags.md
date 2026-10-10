@@ -856,6 +856,41 @@
 
 ---
 
+### Entry: 2026-10-10 — Master Prompt: Fix Verified Production Blockers & Recertify WhatsApp Hub
+- **Prompt / Phase**: Fix Verified Production Blockers & Recertify WhatsApp Hub (Event-Processing CI Fix, Bearer-Only Auth Contract, Workerless Queue Compatibility)
+- **Status**: ✅ Clean (Code Deficiencies Remediated; Production Environment Setting Pending in Vercel Dashboard)
+- **Resolved Issues**:
+  1. **Event-Processing Foreign Key Fixture Fix**:
+     - Root cause: In `scripts/verify-email-phase7.ts`, `tenant-alpha` and `tenant-beta` were used in tests without creating corresponding `ApiClient` rows. When `EmailEventService.recordAndEnqueueEvent` attempted to enqueue durable jobs via `WorkerlessQueueAdapter.add()`, PostgreSQL rejected the insertion with `BackgroundJob_clientId_fkey`.
+     - Remediation: Added explicit `ApiClient` upserts for `tenant-alpha` and `tenant-beta` in `scripts/verify-email-phase7.ts`, with safe cleanup in a `finally` block scoped to the disposable test database.
+     - Enqueue Integrity: Removed silent error swallowing and false `{ success: true }` returns in `EmailEventService.recordAndEnqueueEvent`. Enqueue failures now mark the event `FAILED` with `QUEUE_ENQUEUE_FAILED` and fail visibly.
+  2. **Bearer-Only Authentication Contract Enforced**:
+     - In `src/app/api/internal/process-jobs/route.ts`, removed legacy fallback headers `x-processor-secret` and `x-worker-secret`.
+     - Route strictly enforces `Authorization: Bearer <token>` using constant-time `timingSafeEqualSecret` against `process.env.INTERNAL_PROCESSOR_SECRET`.
+     - Rejects unauthorized invocations with HTTP 401/403 and rejects GET requests with HTTP 405 Method Not Allowed.
+  3. **Queue Health & Workerless Compatibility**:
+     - Root cause: `queue.getJobCounts is not a function` occurred because `WorkerlessQueueAdapter` did not implement BullMQ queue metric queries.
+     - Remediation: Implemented `getJobCounts(...types)`, `getFailed(start, end)`, `drain()`, `clean(grace, limit, type)`, `isPaused()`, `pause()`, and `resume()` directly on `WorkerlessQueueAdapter`, backed by durable queries on `prisma.backgroundJob`.
+     - In `src/lib/email/queue/health.ts`, integrated `isWorkerlessMode()` so health checks query PostgreSQL status counts without Redis connection requirements.
+  4. **Verification Suites Passed**:
+     - `npx prisma validate`: Schema valid.
+     - `npx prisma generate`: Client generated (v6.19.0).
+     - `npm run test:guard`: 16/16 PASSED (Unconditional production protection).
+     - `npm run test:email-phase7`: 49/49 PASSED.
+     - `npm run test:email:events`: 50/50 PASSED.
+     - `npm run test:workerless`: 22/22 PASSED.
+     - `npm run test:communication`: 8/8 PASSED.
+     - `npm run test:email:deliverability`: 55/55 PASSED.
+     - `npx tsc --noEmit`: 0 errors.
+     - `npm run lint`: 0 errors, 0 warnings.
+     - `npm run build`: 100% SUCCESS (all 74 routes compiled cleanly).
+- **Unresolved Concerns**:
+  - `None (all checks clean)`.
+- **Manual Operational Actions Required**:
+  - The live endpoint `https://promotions-lime.vercel.app/api/internal/process-jobs` returns HTTP 500 (`Server authentication misconfigured`) because `INTERNAL_PROCESSOR_SECRET` has not yet been set in the Vercel Production Environment Variables for team `team_m86fYQNTuPr5kMKkb6qWi32B`. The user must add `INTERNAL_PROCESSOR_SECRET` with the value matching Supabase Vault (`internal_processor_secret`) in the Vercel Dashboard and trigger a production redeploy.
+
+---
+
 ## Flag Template for Subsequent Prompts
 
 ```markdown

@@ -172,8 +172,7 @@ export class EmailEventService {
    */
   static async recordAndEnqueueEvent(
     event: NormalizedEmailWebhookEvent,
-    providerConfig?: { id: string; clientId: string } | null,
-    options?: { syncFallback?: boolean }
+    providerConfig?: { id: string; clientId: string } | null
   ): Promise<RecordEventResult> {
     const { providerEventId, recipient, eventType, occurredAt } = event;
 
@@ -345,29 +344,23 @@ export class EmailEventService {
         `[EventService] Failed to enqueue event job for ${createdEvent.id}: ${queueErrMsg}`
       );
 
-      // In offline tests without Redis, optionally process synchronously if requested
-      if (options?.syncFallback) {
-        logger.info(`[EventService] Processing event synchronously via fallback`);
-        await this.processEventFromWorker(createdEvent.id);
-      } else {
-        // Honest queue failure: update DB state and return visible failure
-        await prisma.emailEvent.update({
-          where: { id: createdEvent.id },
-          data: {
-            status: EmailEventProcessingStatus.FAILED,
-            errorCode: "QUEUE_ENQUEUE_FAILED",
-            errorMessage: `Failed to enqueue event job: ${queueErrMsg}`,
-          },
-        });
-
-        return {
-          success: false,
-          deduplicated: false,
-          eventId: createdEvent.id,
+      // Honest queue failure: update DB state and return visible failure
+      await prisma.emailEvent.update({
+        where: { id: createdEvent.id },
+        data: {
           status: EmailEventProcessingStatus.FAILED,
-          error: `QUEUE_ENQUEUE_FAILED: ${queueErrMsg}`,
-        };
-      }
+          errorCode: "QUEUE_ENQUEUE_FAILED",
+          errorMessage: `Failed to enqueue event job: ${queueErrMsg}`,
+        },
+      });
+
+      return {
+        success: false,
+        deduplicated: false,
+        eventId: createdEvent.id,
+        status: EmailEventProcessingStatus.FAILED,
+        error: `QUEUE_ENQUEUE_FAILED: ${queueErrMsg}`,
+      };
     }
 
     return {
@@ -921,9 +914,7 @@ export class EmailEventService {
     event: NormalizedEmailWebhookEvent,
     providerConfig?: { id: string; clientId: string } | null
   ): Promise<ProcessEventResult> {
-    const recordResult = await this.recordAndEnqueueEvent(event, providerConfig, {
-      syncFallback: true,
-    });
+    const recordResult = await this.recordAndEnqueueEvent(event, providerConfig);
 
     if (recordResult.deduplicated) {
       return {
@@ -933,8 +924,8 @@ export class EmailEventService {
       };
     }
 
-    if (!recordResult.eventId) {
-      throw new Error("Failed to record event");
+    if (!recordResult.success || !recordResult.eventId) {
+      throw new Error(recordResult.error || "Failed to record and enqueue event");
     }
 
     return await this.processEventFromWorker(recordResult.eventId);
