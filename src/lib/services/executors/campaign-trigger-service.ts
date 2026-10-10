@@ -12,7 +12,6 @@
 import { prisma } from "../../prisma";
 import {
   EmailCampaignStatus,
-  EmailProviderStatus,
   BackgroundJobStatus,
 } from "@prisma/client";
 import { EmailAudienceResolver } from "../email-audience-resolver";

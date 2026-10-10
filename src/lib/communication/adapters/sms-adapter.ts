@@ -42,7 +42,7 @@ export class SmsAdapter implements ChannelProviderAdapter {
       deliveryId: `sms_stub_${Date.now()}`,
       status: "FAILED",
       error: {
-        code: "SMS_PROVIDER_NOT_CONFIGURED",
+        code: "PROVIDER_UNAVAILABLE",
         message: "SMS provider integration is ready for activation via ChannelProviderAdapter SPI",
         retryable: false,
         failureCategory: "PROVIDER_ERROR",
@@ -51,6 +51,7 @@ export class SmsAdapter implements ChannelProviderAdapter {
   }
 
   async checkHealth(_clientId: string): Promise<UnifiedProviderHealthResult> {
+    void _clientId;
     return {
       providerType: "SMS_GATEWAY",
       channel: "SMS",
@@ -91,7 +92,18 @@ export class SmsAdapter implements ChannelProviderAdapter {
     ];
   }
 
+  /**
+   * Alias for send() for backward/forward compatibility.
+   */
+  async sendMessage(request: UnifiedMessageRequest): Promise<UnifiedSendResult> {
+    return this.send(request);
+  }
+
   async checkReachability(destination: string): Promise<ChannelReachabilityCheck> {
+    return this.validateDestination(destination);
+  }
+
+  validateDestination(destination: string): ChannelReachabilityCheck {
     try {
       const normalized = normalizePhoneNumber(destination);
       const digitsOnly = normalized.replace(/\D/g, "");

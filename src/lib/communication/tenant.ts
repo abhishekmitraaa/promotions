@@ -8,6 +8,14 @@
 
 import { ChannelType } from "./types";
 
+export interface TenantContext {
+  clientId: string;
+  name?: string;
+  enabledChannels?: ChannelType[];
+  rateLimits?: Partial<Record<ChannelType, { maxPerSecond: number; maxPerDay: number }>>;
+  metadata?: Record<string, unknown>;
+}
+
 export class TenantBoundaryViolationError extends Error {
   constructor(message: string, public readonly clientId?: string) {
     super(`[TenantBoundaryViolation] ${message}`);
@@ -15,17 +23,66 @@ export class TenantBoundaryViolationError extends Error {
   }
 }
 
+export class TenantIsolationViolationError extends TenantBoundaryViolationError {
+  constructor(message: string, clientId?: string) {
+    super(`[TenantIsolationViolationError] ${message}`, clientId);
+    this.name = "TenantIsolationViolationError";
+  }
+}
+
+export class TenantMissingError extends TenantBoundaryViolationError {
+  constructor(message: string = "clientId is required for all communication operations", clientId?: string) {
+    super(`[TenantMissingError] ${message}`, clientId);
+    this.name = "TenantMissingError";
+  }
+}
+
 /**
- * Validates that an entity possesses a non-empty, valid clientId.
+ * Validates and standardizes a tenant context or clientId string.
  */
-export function assertTenantContext<T extends { clientId: string }>(
-  entity: T,
+export function assertTenantContext(
+  context: TenantContext | { clientId: string } | string | undefined | null,
   contextName = "Entity"
-): asserts entity is T & { clientId: string } {
-  if (!entity || !entity.clientId || typeof entity.clientId !== "string" || entity.clientId.trim() === "") {
-    throw new TenantBoundaryViolationError(
-      `${contextName} is missing a required clientId. Multi-tenant isolation violation.`,
-      entity?.clientId
+): TenantContext {
+  if (!context) {
+    throw new TenantMissingError(`${contextName} is missing a required clientId.`);
+  }
+
+  const clientId = typeof context === "string" ? context.trim() : context.clientId?.trim();
+
+  if (!clientId || clientId.length === 0) {
+    throw new TenantMissingError(
+      `${contextName} is missing a required clientId. Multi-tenant isolation violation.`
+    );
+  }
+
+  if (typeof context === "string") {
+    return { clientId };
+  }
+
+  return {
+    ...context,
+    clientId,
+  };
+}
+
+/**
+ * Enforces that an entity's clientId matches the execution context clientId.
+ * Prevents horizontal privilege escalation and cross-tenant data leakage.
+ */
+export function assertTenantBoundary<T extends { clientId?: string | null }>(
+  entity: T,
+  expectedClientId: string,
+  entityName = "Entity"
+): void {
+  if (!expectedClientId || expectedClientId.trim() === "") {
+    throw new TenantMissingError(`Expected clientId is required to assert ${entityName} boundary`);
+  }
+
+  if (!entity.clientId || entity.clientId !== expectedClientId) {
+    throw new TenantIsolationViolationError(
+      `Cross-tenant access prohibited for ${entityName}: entity belongs to '${entity.clientId || "UNBOUND"}', but caller is '${expectedClientId}'`,
+      entity.clientId || undefined
     );
   }
 }
@@ -41,10 +98,8 @@ export function isChannelEnabledForTenant(
     if (clientOrId.enabledChannels && Array.isArray(clientOrId.enabledChannels)) {
       return clientOrId.enabledChannels.includes(channel);
     }
-    // Default to true if enabledChannels not explicitly restricted
     return true;
   }
-  // If string clientId provided, valid non-empty ID is enabled
   return typeof clientOrId === "string" && clientOrId.trim().length > 0;
 }
 

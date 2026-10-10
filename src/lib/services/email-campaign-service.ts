@@ -822,7 +822,7 @@ export class EmailCampaignService {
         delivered,
         bounced: camp.bouncedCount,
         complaints: camp.complaintCount,
-        unsubscribed: (camp as any).unsubscribedCount || 0,
+        unsubscribed: Number((camp as unknown as Record<string, unknown>).unsubscribedCount) || 0,
         uniqueOpens,
         uniqueClicks,
       });

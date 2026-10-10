@@ -3,19 +3,19 @@
  *
  * Implements durable, fair-dispatch, workerless background processing:
  * - Triggered periodically via Supabase Cron (pg_cron) -> pg_net HTTP POST
- * - Executes in bounded serverless function execution window (with 4s safety buffer)
+ * - Executes in bounded serverless function execution window with 4s safety buffer
  * - Concurrency control via PostgreSQL SELECT ... FOR UPDATE SKIP LOCKED
  * - Tenant Fair Dispatch: partitions queues by tenant (clientId) to prevent starvation
  * - Category Priority: TRANSACTIONAL is always dispatched before PROMOTIONAL
  * - Neutral Domain Executors: zero BullMQ coupling or fake Job wrappers
- * - Full backward and forward compatibility with both BackgroundJob table and table-specific queues
+ * - Safe claim release on approaching execution deadline
  */
 
 import { prisma } from "../prisma";
 import {
   EmailDeliveryStatus,
-  EmailCampaignStatus,
   BackgroundJobStatus,
+  Prisma,
 } from "@prisma/client";
 import { EmailDeliveryExecutor } from "./executors/email-delivery-executor";
 import { CampaignRecipientExecutor } from "./executors/campaign-recipient-executor";
@@ -24,6 +24,7 @@ import { AutomationExecutor } from "./executors/automation-executor";
 import { EmailEventProcessor } from "./executors/email-event-processor";
 import { WebhookDeliveryProcessor } from "./executors/webhook-delivery-processor";
 import { ReconciliationExecutor } from "./executors/reconciliation-executor";
+import { PermanentError } from "../errors/job-errors";
 import { logger } from "../logger";
 
 export interface ServerlessProcessingOptions {
@@ -43,15 +44,16 @@ export interface ServerlessProcessingResult {
   success: boolean;
   timestamp: string;
   durationMs: number;
+  errors?: string[];
   results: {
-    backgroundJobs: { claimed: number; succeeded: number; failed: number };
-    webhooks: { claimed: number; succeeded: number; failed: number };
-    transactional: { processed: number; succeeded: number; failed: number };
-    scheduledCampaigns: { processed: number; succeeded: number; failed: number };
-    campaignRecipients: { processed: number; succeeded: number; failed: number };
-    recurringAutomations: { processed: number; succeeded: number; failed: number };
-    automationEnrollments: { processed: number; succeeded: number; failed: number };
-    events: { processed: number; succeeded: number; failed: number };
+    backgroundJobs: { claimed: number; succeeded: number; failed: number; error?: string };
+    webhooks: { claimed: number; succeeded: number; failed: number; error?: string };
+    transactional: { processed: number; succeeded: number; failed: number; error?: string };
+    scheduledCampaigns: { processed: number; succeeded: number; failed: number; error?: string };
+    campaignRecipients: { processed: number; succeeded: number; failed: number; error?: string };
+    recurringAutomations: { processed: number; succeeded: number; failed: number; error?: string };
+    automationEnrollments: { processed: number; succeeded: number; failed: number; error?: string };
+    events: { processed: number; succeeded: number; failed: number; error?: string };
     reconciliation: {
       recoveredDeliveries: number;
       failedDeliveries: number;
@@ -64,19 +66,17 @@ export interface ServerlessProcessingResult {
   };
 }
 
-let lastReconciliationAt = 0;
-const RECONCILIATION_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
-
 export class ServerlessJobProcessor {
   /**
    * 1. Process Outbound Webhooks
    */
   static async processWebhooks(batchSize = 25) {
     try {
-      return await WebhookDeliveryProcessor.processBatch({ batchSize });
+      const safeSize = Math.min(50, Math.max(1, batchSize));
+      return await WebhookDeliveryProcessor.processBatch({ batchSize: safeSize });
     } catch (err) {
       logger.error("[ServerlessProcessor] Webhook processing error:", err);
-      return { claimed: 0, succeeded: 0, failed: 0 };
+      return { claimed: 0, succeeded: 0, failed: 0, error: err instanceof Error ? err.message : String(err) };
     }
   }
 
@@ -87,89 +87,139 @@ export class ServerlessJobProcessor {
   static async processBackgroundJobs(
     batchSize = 30,
     isTimeExhausted?: () => boolean
-  ): Promise<{ claimed: number; succeeded: number; failed: number }> {
+  ): Promise<{ claimed: number; succeeded: number; failed: number; error?: string }> {
     let claimedCount = 0;
     let succeeded = 0;
     let failed = 0;
+    let claimError: string | undefined;
+
+    const safeBatchSize = Math.min(100, Math.max(1, batchSize));
+    const lockedBy = `serverless-processor-${Date.now()}`;
+
+    let claimedJobs: Array<{
+      id: string;
+      clientId: string;
+      type: string;
+      payload: string;
+      attemptCount: number;
+      maxAttempts: number;
+    }> = [];
 
     try {
-      // Claim jobs atomically with tenant partition and lock
-      const claimedJobs = await prisma.$transaction(async (tx) => {
-        const rows = (await tx.$queryRawUnsafe(`
-          WITH ranked AS (
-            SELECT j.id, j."clientId", j."type", j."payload",
-                   ROW_NUMBER() OVER (PARTITION BY j."clientId" ORDER BY j."priority" DESC, j."availableAt" ASC) as rn
-            FROM "BackgroundJob" j
-            WHERE j."status" = 'QUEUED'
-              AND j."availableAt" <= NOW()
-              AND (j."lockedAt" IS NULL OR j."lockedAt" < NOW() - INTERVAL '10 minutes')
-            ORDER BY j."priority" DESC, j."availableAt" ASC
-            FOR UPDATE SKIP LOCKED
-          ),
-          selected AS (
-            SELECT id, "clientId", "type", "payload"
-            FROM ranked
-            WHERE rn <= 10
-            LIMIT ${batchSize}
-          )
-          UPDATE "BackgroundJob" j
-          SET "status" = 'PROCESSING',
-              "lockedAt" = NOW(),
-              "lockedBy" = 'serverless-processor',
-              "lastAttemptAt" = NOW(),
-              "attemptCount" = j."attemptCount" + 1
-          FROM selected s
-          WHERE j.id = s.id
-          RETURNING j.id, j."clientId", j."type", j."payload", j."attemptCount", j."maxAttempts";
-        `).catch(() => [])) as {
-          id: string;
-          clientId: string;
-          type: string;
-          payload: string;
-          attemptCount: number;
-          maxAttempts: number;
-        }[];
-
-        return rows;
-      });
+      claimedJobs = await prisma.$queryRaw<Array<{
+        id: string;
+        clientId: string;
+        type: string;
+        payload: string;
+        attemptCount: number;
+        maxAttempts: number;
+      }>>(Prisma.sql`
+        WITH candidates AS (
+          SELECT id, "clientId"
+          FROM "BackgroundJob"
+          WHERE "status" = 'QUEUED'
+            AND "availableAt" <= NOW()
+            AND ("lockedAt" IS NULL OR "lockedAt" < NOW() - INTERVAL '10 minutes')
+          ORDER BY "priority" DESC, "availableAt" ASC
+          LIMIT 50
+          FOR UPDATE SKIP LOCKED
+        ),
+        ranked AS (
+          SELECT id, ROW_NUMBER() OVER (PARTITION BY "clientId" ORDER BY id) as rn
+          FROM candidates
+        ),
+        selected AS (
+          SELECT id
+          FROM ranked
+          WHERE rn <= 10
+          LIMIT ${safeBatchSize}
+        )
+        UPDATE "BackgroundJob" j
+        SET "status" = 'PROCESSING',
+            "lockedAt" = NOW(),
+            "lockedBy" = ${lockedBy},
+            "lastAttemptAt" = NOW(),
+            "attemptCount" = j."attemptCount" + 1
+        FROM selected s
+        WHERE j.id = s.id
+        RETURNING j.id, j."clientId", j."type", j."payload", j."attemptCount", j."maxAttempts"
+      `);
 
       claimedCount = claimedJobs.length;
 
-      for (const job of claimedJobs) {
+      for (let i = 0; i < claimedJobs.length; i++) {
+        const job = claimedJobs[i];
+
         if (isTimeExhausted && isTimeExhausted()) {
-          logger.warn(`[ServerlessProcessor] Execution time limit reached. Stopping BackgroundJob loop.`);
+          logger.warn(`[ServerlessProcessor] Approaching execution deadline. Releasing remaining ${claimedJobs.length - i} claimed jobs.`);
+          const unstartedIds = claimedJobs.slice(i).map((u) => u.id);
+          if (unstartedIds.length > 0) {
+            await prisma.backgroundJob.updateMany({
+              where: { id: { in: unstartedIds } },
+              data: {
+                status: BackgroundJobStatus.QUEUED,
+                lockedAt: null,
+                lockedBy: null,
+                attemptCount: { decrement: 1 },
+              },
+            });
+          }
           break;
         }
 
         try {
-          const payload = JSON.parse(job.payload || "{}");
+          let payload: Record<string, unknown> = {};
+          try {
+            payload = JSON.parse(job.payload || "{}");
+          } catch {
+            throw new PermanentError(`Malformed JSON payload in BackgroundJob '${job.id}'`);
+          }
 
-          if (job.type === "EMAIL_DELIVERY" || job.type === "TRANSACTIONAL_EMAIL" || job.type === "PROMOTIONAL_EMAIL") {
+          if (
+            job.type === "EMAIL_DELIVERY" ||
+            job.type === "TRANSACTIONAL_EMAIL" ||
+            job.type === "PROMOTIONAL_EMAIL"
+          ) {
+            const deliveryId = (payload.deliveryId as string) || job.id;
             await EmailDeliveryExecutor.execute({
-              deliveryId: payload.deliveryId,
+              deliveryId,
               clientId: job.clientId,
             });
           } else if (job.type === "CAMPAIGN_RECIPIENT") {
+            const recipientId = (payload.campaignRecipientId as string) || (payload.recipientId as string);
+            if (!recipientId) throw new PermanentError("Missing campaignRecipientId in payload");
             await CampaignRecipientExecutor.executeRecipient({
-              recipientId: payload.campaignRecipientId,
+              recipientId,
             });
           } else if (job.type === "CAMPAIGN_TRIGGER") {
+            const campaignId = (payload.campaignId as string);
+            if (!campaignId) throw new PermanentError("Missing campaignId in payload");
             await CampaignTriggerService.triggerScheduledCampaign({
-              campaignId: payload.campaignId,
+              campaignId,
               clientId: job.clientId,
             });
           } else if (job.type === "AUTOMATION_STEP") {
+            const enrollmentId = (payload.enrollmentId as string);
+            if (!enrollmentId) throw new PermanentError("Missing enrollmentId in payload");
             await AutomationExecutor.executeStep({
               clientId: job.clientId,
-              enrollmentId: payload.enrollmentId,
-              stepId: payload.stepId,
-              isTimeout: payload.isTimeout,
+              enrollmentId,
+              stepId: (payload.stepId as string) || undefined,
+              isTimeout: Boolean(payload.isTimeout),
             });
           } else if (job.type === "RECURRING_AUTOMATION") {
+            const automationId = (payload.automationId as string);
+            if (!automationId) throw new PermanentError("Missing automationId in payload");
             await AutomationExecutor.executeRecurring({
               clientId: job.clientId,
-              automationId: payload.automationId,
+              automationId,
             });
+          } else if (job.type === "EMAIL_EVENT") {
+            const eventId = (payload.eventId as string) || (payload.eventRecordId as string);
+            if (!eventId) throw new PermanentError("Missing eventId in payload");
+            await EmailEventProcessor.process({ eventId });
+          } else {
+            throw new PermanentError(`Unrecognized job type '${job.type}' in BackgroundJob '${job.id}'`);
           }
 
           // Mark job COMPLETED
@@ -187,15 +237,20 @@ export class ServerlessJobProcessor {
           failed++;
           const errMsg = jobErr instanceof Error ? jobErr.message : String(jobErr);
           const reachedMax = job.attemptCount >= job.maxAttempts;
+          const isPermanent = jobErr instanceof PermanentError;
+          const shouldFail = reachedMax || isPermanent;
+
+          const jitterMs = Math.floor(Math.random() * 500);
+          const backoffDelay = Math.min(300000, 1000 * Math.pow(2, job.attemptCount) + jitterMs);
 
           await prisma.backgroundJob.updateMany({
             where: { id: job.id },
             data: {
-              status: reachedMax ? BackgroundJobStatus.FAILED : BackgroundJobStatus.QUEUED,
-              failedAt: reachedMax ? new Date() : null,
-              lastErrorCode: "EXECUTION_ERROR",
+              status: shouldFail ? BackgroundJobStatus.FAILED : BackgroundJobStatus.QUEUED,
+              failedAt: shouldFail ? new Date() : null,
+              lastErrorCode: isPermanent ? "PERMANENT_ERROR" : (reachedMax ? "MAX_ATTEMPTS_EXCEEDED" : "EXECUTION_ERROR"),
               lastErrorMessage: errMsg,
-              availableAt: reachedMax ? undefined : new Date(Date.now() + Math.min(300000, 1000 * Math.pow(2, job.attemptCount))),
+              availableAt: shouldFail ? undefined : new Date(Date.now() + backoffDelay),
               lockedAt: null,
               lockedBy: null,
             },
@@ -205,10 +260,11 @@ export class ServerlessJobProcessor {
         }
       }
     } catch (err) {
+      claimError = err instanceof Error ? err.message : String(err);
       logger.error("[ServerlessProcessor] Error in processBackgroundJobs:", err);
     }
 
-    return { claimed: claimedCount, succeeded, failed };
+    return { claimed: claimedCount, succeeded, failed, ...(claimError ? { error: claimError } : {}) };
   }
 
   /**
@@ -218,47 +274,68 @@ export class ServerlessJobProcessor {
   static async processTransactionalEmails(
     batchSize = 25,
     isTimeExhausted?: () => boolean
-  ): Promise<{ processed: number; succeeded: number; failed: number }> {
+  ): Promise<{ processed: number; succeeded: number; failed: number; error?: string }> {
     let processed = 0;
     let succeeded = 0;
     let failed = 0;
+    let claimError: string | undefined;
+
+    const safeBatchSize = Math.min(50, Math.max(1, batchSize));
+    const lockedBy = `serverless-processor-${Date.now()}`;
 
     try {
-      const claimedDeliveries = await prisma.$transaction(async (tx) => {
-        const rows = (await tx.$queryRawUnsafe(`
-          WITH ranked AS (
-            SELECT d.id, d."clientId",
-                   ROW_NUMBER() OVER (PARTITION BY d."clientId" ORDER BY d."createdAt" ASC) as rn
-            FROM "EmailDelivery" d
-            WHERE d."status" = 'QUEUED'
-              AND d."category" = 'TRANSACTIONAL'
-              AND (d."nextAttemptAt" IS NULL OR d."nextAttemptAt" <= NOW())
-              AND (d."lockedAt" IS NULL OR d."lockedAt" < NOW() - INTERVAL '10 minutes')
-            ORDER BY d."createdAt" ASC
-            FOR UPDATE SKIP LOCKED
-          ),
-          selected AS (
-            SELECT id, "clientId"
-            FROM ranked
-            WHERE rn <= 10
-            LIMIT ${batchSize}
-          )
-          UPDATE "EmailDelivery" d
-          SET "status" = 'PROCESSING',
-              "lockedAt" = NOW(),
-              "lockedBy" = 'serverless-processor',
-              "lastAttemptAt" = NOW(),
-              "attemptCount" = d."attemptCount" + 1
-          FROM selected s
-          WHERE d.id = s.id
-          RETURNING d.id, d."clientId";
-        `).catch(() => [])) as { id: string; clientId: string }[];
+      const claimedDeliveries = await prisma.$queryRaw<Array<{ id: string; clientId: string }>>(Prisma.sql`
+        WITH candidates AS (
+          SELECT d.id, d."clientId"
+          FROM "EmailDelivery" d
+          WHERE d."status" = 'QUEUED'
+            AND d."category" = 'TRANSACTIONAL'
+            AND (d."nextAttemptAt" IS NULL OR d."nextAttemptAt" <= NOW())
+            AND (d."lockedAt" IS NULL OR d."lockedAt" < NOW() - INTERVAL '10 minutes')
+          ORDER BY d."createdAt" ASC
+          LIMIT 50
+          FOR UPDATE SKIP LOCKED
+        ),
+        ranked AS (
+          SELECT id, ROW_NUMBER() OVER (PARTITION BY "clientId" ORDER BY id) as rn
+          FROM candidates
+        ),
+        selected AS (
+          SELECT id
+          FROM ranked
+          WHERE rn <= 10
+          LIMIT ${safeBatchSize}
+        )
+        UPDATE "EmailDelivery" d
+        SET "status" = 'PROCESSING',
+            "lockedAt" = NOW(),
+            "lockedBy" = ${lockedBy},
+            "lastAttemptAt" = NOW(),
+            "attemptCount" = d."attemptCount" + 1
+        FROM selected s
+        WHERE d.id = s.id
+        RETURNING d.id, d."clientId"
+      `);
 
-        return rows;
-      });
+      for (let i = 0; i < claimedDeliveries.length; i++) {
+        const item = claimedDeliveries[i];
 
-      for (const item of claimedDeliveries) {
-        if (isTimeExhausted && isTimeExhausted()) break;
+        if (isTimeExhausted && isTimeExhausted()) {
+          const unstarted = claimedDeliveries.slice(i).map((u) => u.id);
+          if (unstarted.length > 0) {
+            await prisma.emailDelivery.updateMany({
+              where: { id: { in: unstarted } },
+              data: {
+                status: EmailDeliveryStatus.QUEUED,
+                lockedAt: null,
+                lockedBy: null,
+                attemptCount: { decrement: 1 },
+              },
+            });
+          }
+          break;
+        }
+
         processed++;
         try {
           await EmailDeliveryExecutor.execute({
@@ -272,10 +349,11 @@ export class ServerlessJobProcessor {
         }
       }
     } catch (err) {
+      claimError = err instanceof Error ? err.message : String(err);
       logger.error("[ServerlessProcessor] Transactional processing batch error:", err);
     }
 
-    return { processed, succeeded, failed };
+    return { processed, succeeded, failed, ...(claimError ? { error: claimError } : {}) };
   }
 
   /**
@@ -284,13 +362,15 @@ export class ServerlessJobProcessor {
   static async processScheduledCampaigns(
     batchSize = 5,
     isTimeExhausted?: () => boolean
-  ): Promise<{ processed: number; succeeded: number; failed: number }> {
+  ): Promise<{ processed: number; succeeded: number; failed: number; error?: string }> {
     let processed = 0;
     let succeeded = 0;
     let failed = 0;
+    let batchError: string | undefined;
 
     try {
-      const scheduledCampaigns = await CampaignTriggerService.findDueScheduledCampaigns(batchSize);
+      const safeBatchSize = Math.min(20, Math.max(1, batchSize));
+      const scheduledCampaigns = await CampaignTriggerService.findDueScheduledCampaigns(safeBatchSize);
 
       for (const campaign of scheduledCampaigns) {
         if (isTimeExhausted && isTimeExhausted()) break;
@@ -307,10 +387,11 @@ export class ServerlessJobProcessor {
         }
       }
     } catch (err) {
+      batchError = err instanceof Error ? err.message : String(err);
       logger.error("[ServerlessProcessor] Scheduled campaign processing error:", err);
     }
 
-    return { processed, succeeded, failed };
+    return { processed, succeeded, failed, ...(batchError ? { error: batchError } : {}) };
   }
 
   /**
@@ -320,50 +401,71 @@ export class ServerlessJobProcessor {
   static async processCampaignRecipients(
     batchSize = 30,
     isTimeExhausted?: () => boolean
-  ): Promise<{ processed: number; succeeded: number; failed: number }> {
+  ): Promise<{ processed: number; succeeded: number; failed: number; error?: string }> {
     let processed = 0;
     let succeeded = 0;
     let failed = 0;
+    let claimError: string | undefined;
+
+    const safeBatchSize = Math.min(100, Math.max(1, batchSize));
+    const lockedBy = `serverless-processor-${Date.now()}`;
 
     try {
-      const claimedRecipients = await prisma.$transaction(async (tx) => {
-        const rows = (await tx.$queryRawUnsafe(`
-          WITH active_campaigns AS (
-            SELECT id FROM "EmailCampaign" WHERE "status" = 'RUNNING'
-          ),
-          ranked AS (
-            SELECT r.id, r."campaignId",
-                   ROW_NUMBER() OVER (PARTITION BY r."campaignId" ORDER BY r."createdAt" ASC) as rn
-            FROM "EmailCampaignRecipient" r
-            JOIN active_campaigns ac ON ac.id = r."campaignId"
-            WHERE r."status" IN ('PENDING', 'RETRYING')
-              AND (r."nextAttemptAt" IS NULL OR r."nextAttemptAt" <= NOW())
-              AND (r."lockedAt" IS NULL OR r."lockedAt" < NOW() - INTERVAL '10 minutes')
-            ORDER BY r."createdAt" ASC
-            FOR UPDATE SKIP LOCKED
-          ),
-          selected AS (
-            SELECT id, "campaignId"
-            FROM ranked
-            WHERE rn <= 10
-            LIMIT ${batchSize}
-          )
-          UPDATE "EmailCampaignRecipient" r
-          SET "status" = 'PROCESSING',
-              "lockedAt" = NOW(),
-              "lockedBy" = 'serverless-processor',
-              "lastAttemptAt" = NOW(),
-              "attemptCount" = r."attemptCount" + 1
-          FROM selected s
-          WHERE r.id = s.id
-          RETURNING r.id, r."campaignId";
-        `).catch(() => [])) as { id: string; campaignId: string }[];
+      const claimedRecipients = await prisma.$queryRaw<Array<{ id: string; campaignId: string }>>(Prisma.sql`
+        WITH active_campaigns AS (
+          SELECT id FROM "EmailCampaign" WHERE "status" = 'RUNNING'
+        ),
+        candidates AS (
+          SELECT r.id, r."campaignId"
+          FROM "EmailCampaignRecipient" r
+          JOIN active_campaigns ac ON ac.id = r."campaignId"
+          WHERE r."status" IN ('PENDING', 'RETRYING')
+            AND (r."nextAttemptAt" IS NULL OR r."nextAttemptAt" <= NOW())
+            AND (r."lockedAt" IS NULL OR r."lockedAt" < NOW() - INTERVAL '10 minutes')
+          ORDER BY r."createdAt" ASC
+          LIMIT 50
+          FOR UPDATE SKIP LOCKED
+        ),
+        ranked AS (
+          SELECT id, ROW_NUMBER() OVER (PARTITION BY "campaignId" ORDER BY id) as rn
+          FROM candidates
+        ),
+        selected AS (
+          SELECT id
+          FROM ranked
+          WHERE rn <= 10
+          LIMIT ${safeBatchSize}
+        )
+        UPDATE "EmailCampaignRecipient" r
+        SET "status" = 'PROCESSING',
+            "lockedAt" = NOW(),
+            "lockedBy" = ${lockedBy},
+            "lastAttemptAt" = NOW(),
+            "attemptCount" = r."attemptCount" + 1
+        FROM selected s
+        WHERE r.id = s.id
+        RETURNING r.id, r."campaignId"
+      `);
 
-        return rows;
-      });
+      for (let i = 0; i < claimedRecipients.length; i++) {
+        const item = claimedRecipients[i];
 
-      for (const item of claimedRecipients) {
-        if (isTimeExhausted && isTimeExhausted()) break;
+        if (isTimeExhausted && isTimeExhausted()) {
+          const unstarted = claimedRecipients.slice(i).map((u) => u.id);
+          if (unstarted.length > 0) {
+            await prisma.emailCampaignRecipient.updateMany({
+              where: { id: { in: unstarted } },
+              data: {
+                status: "PENDING",
+                lockedAt: null,
+                lockedBy: null,
+                attemptCount: { decrement: 1 },
+              },
+            });
+          }
+          break;
+        }
+
         processed++;
         try {
           await CampaignRecipientExecutor.executeRecipient({
@@ -376,10 +478,11 @@ export class ServerlessJobProcessor {
         }
       }
     } catch (err) {
+      claimError = err instanceof Error ? err.message : String(err);
       logger.error("[ServerlessProcessor] Campaign recipient batch processing error:", err);
     }
 
-    return { processed, succeeded, failed };
+    return { processed, succeeded, failed, ...(claimError ? { error: claimError } : {}) };
   }
 
   /**
@@ -388,13 +491,15 @@ export class ServerlessJobProcessor {
   static async processRecurringAutomations(
     batchSize = 5,
     isTimeExhausted?: () => boolean
-  ): Promise<{ processed: number; succeeded: number; failed: number }> {
+  ): Promise<{ processed: number; succeeded: number; failed: number; error?: string }> {
     let processed = 0;
     let succeeded = 0;
     let failed = 0;
+    let batchError: string | undefined;
 
     try {
-      const automations = await AutomationExecutor.findDueRecurringAutomations(batchSize);
+      const safeBatchSize = Math.min(20, Math.max(1, batchSize));
+      const automations = await AutomationExecutor.findDueRecurringAutomations(safeBatchSize);
 
       for (const auto of automations) {
         if (isTimeExhausted && isTimeExhausted()) break;
@@ -411,10 +516,11 @@ export class ServerlessJobProcessor {
         }
       }
     } catch (err) {
+      batchError = err instanceof Error ? err.message : String(err);
       logger.error("[ServerlessProcessor] Recurring automations processing error:", err);
     }
 
-    return { processed, succeeded, failed };
+    return { processed, succeeded, failed, ...(batchError ? { error: batchError } : {}) };
   }
 
   /**
@@ -423,13 +529,15 @@ export class ServerlessJobProcessor {
   static async processAutomationEnrollments(
     batchSize = 25,
     isTimeExhausted?: () => boolean
-  ): Promise<{ processed: number; succeeded: number; failed: number }> {
+  ): Promise<{ processed: number; succeeded: number; failed: number; error?: string }> {
     let processed = 0;
     let succeeded = 0;
     let failed = 0;
+    let batchError: string | undefined;
 
     try {
-      const enrollments = await AutomationExecutor.findDueEnrollments(batchSize);
+      const safeBatchSize = Math.min(50, Math.max(1, batchSize));
+      const enrollments = await AutomationExecutor.findDueEnrollments(safeBatchSize);
 
       for (const enrollment of enrollments) {
         if (isTimeExhausted && isTimeExhausted()) break;
@@ -447,10 +555,11 @@ export class ServerlessJobProcessor {
         }
       }
     } catch (err) {
+      batchError = err instanceof Error ? err.message : String(err);
       logger.error("[ServerlessProcessor] Automation enrollment processing error:", err);
     }
 
-    return { processed, succeeded, failed };
+    return { processed, succeeded, failed, ...(batchError ? { error: batchError } : {}) };
   }
 
   /**
@@ -459,13 +568,15 @@ export class ServerlessJobProcessor {
   static async processEvents(
     batchSize = 25,
     isTimeExhausted?: () => boolean
-  ): Promise<{ processed: number; succeeded: number; failed: number }> {
+  ): Promise<{ processed: number; succeeded: number; failed: number; error?: string }> {
     let processed = 0;
     let succeeded = 0;
     let failed = 0;
+    let batchError: string | undefined;
 
     try {
-      const pendingEvents = await EmailEventProcessor.findPendingEvents(batchSize);
+      const safeBatchSize = Math.min(50, Math.max(1, batchSize));
+      const pendingEvents = await EmailEventProcessor.findPendingEvents(safeBatchSize);
 
       for (const event of pendingEvents) {
         if (isTimeExhausted && isTimeExhausted()) break;
@@ -479,14 +590,22 @@ export class ServerlessJobProcessor {
         }
       }
     } catch (err) {
+      batchError = err instanceof Error ? err.message : String(err);
       logger.error("[ServerlessProcessor] Event processing batch error:", err);
     }
 
-    return { processed, succeeded, failed };
+    return { processed, succeeded, failed, ...(batchError ? { error: batchError } : {}) };
+  }
+
+  static async processEmailEvents(
+    batchSize = 25,
+    isTimeExhausted?: () => boolean
+  ): Promise<{ processed: number; succeeded: number; failed: number }> {
+    return this.processEvents(batchSize, isTimeExhausted);
   }
 
   /**
-   * 9. Periodic Job Reconciliation
+   * 9. Job Reconciliation
    */
   static async reconcileJobs(staleMinutes = 10) {
     try {
@@ -510,13 +629,13 @@ export class ServerlessJobProcessor {
     // 1. Webhooks
     const webhooks = await this.processWebhooks(options.webhookBatchSize || 25);
 
-    // 2. Durable BackgroundJobs
+    // 2. Durable BackgroundJobs (Unified primary asynchronous queue)
     const bgJobs = await this.processBackgroundJobs(
       options.backgroundJobBatchSize || 30,
       isTimeExhausted
     );
 
-    // 3. Transactional Emails (urgent)
+    // 3. Transactional Emails (Legacy direct EmailDelivery table sweep)
     const transactional = await this.processTransactionalEmails(
       options.transactionalBatchSize || 25,
       isTimeExhausted
@@ -552,13 +671,10 @@ export class ServerlessJobProcessor {
       isTimeExhausted
     );
 
-    // 9. Reconciliation (if requested or due every 5 minutes)
+    // 9. Reconciliation: only executed when explicitly requested (e.g. via separate 5-minute cron)
     let reconciliationResult = null;
-    const now = Date.now();
-    const isDue = now - lastReconciliationAt > RECONCILIATION_INTERVAL_MS;
-    if (options.runReconciliation || isDue) {
+    if (options.runReconciliation) {
       reconciliationResult = await this.reconcileJobs();
-      lastReconciliationAt = now;
     }
 
     const durationMs = Date.now() - startTime;

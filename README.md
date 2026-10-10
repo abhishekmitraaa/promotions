@@ -1,8 +1,8 @@
 # Communication Infrastructure Service (WhatsApp & Email)
 
-A production-minded, locally runnable self-hosted multi-channel messaging service built with **Next.js 16 (App Router)**, **TypeScript**, **Prisma ORM (Supabase PostgreSQL)**, **Redis + BullMQ**, **Zod**, **Meta's WhatsApp Cloud API**, and **Google Workspace / Gmail API**.
+A production-minded, locally runnable self-hosted multi-channel messaging service built with **Next.js 16 (App Router)**, **TypeScript**, **Prisma ORM (Supabase PostgreSQL)**, **Supabase Cron (`pg_cron`) & `pg_net` (Workerless Architecture)**, **Zod**, **Meta's WhatsApp Cloud API**, and **Google Workspace / Gmail API**.
 
-This service acts as a hardened, standardized abstraction layer between your external applications and communication providers—hiding access tokens, client secrets, and provider keys behind Bearer API keys while providing an administrative web dashboard, asynchronous queue processing, incoming webhook processing with cryptographic verification, OTP verification, contacts & segmentation management, campaign scheduling, and outbound delivery pipelines.
+This service acts as a hardened, standardized abstraction layer between your external applications and communication providers—hiding access tokens, client secrets, and provider keys behind Bearer API keys while providing an administrative web dashboard, durable asynchronous job processing, incoming webhook processing with cryptographic verification, OTP verification, contacts & segmentation management, campaign scheduling, and outbound delivery pipelines.
 
 ---
 
@@ -14,10 +14,10 @@ This service acts as a hardened, standardized abstraction layer between your ext
 - **Inbound Webhook Engine (`/api/webhooks/whatsapp`)**: Timing-safe HMAC-SHA256 (`X-Hub-Signature-256`) verification.
 - **Cryptographic OTP Service (`/api/v1/otp/*`)**: HMAC-SHA256 hashed with salt pepper; raw OTPs never stored in plaintext.
 
-### Email Platform
+### Email Platform & Multi-Channel Communications
 - **Secure Public REST API (`/api/v1/email/send`)**: Scoped by Bearer API key to tenant with explicit `type: "TRANSACTIONAL" | "PROMOTIONAL"`.
 - **Provider Abstraction Layer (`EmailProvider`)**: Normalized sender interface; first-class Google Workspace / Gmail OAuth2 provider with AES-256-GCM encrypted tokens.
-- **Dedicated BullMQ Queue Worker (`npm run worker:email`)**: Persistent Node.js worker handling asynchronous dispatches, exponential backoff retries, and bounded failures.
+- **Workerless Architecture & Supabase Cron**: Zero persistent 24/7 worker daemons in production; asynchronous work is durably recorded in PostgreSQL and dispatched via short-lived serverless invocations triggered by Supabase Cron (`pg_cron`) and `pg_net` using secrets stored in Supabase Vault.
 - **Safe Template Renderer**: Strict variable validation, HTML escaping, and immutable versioning for scheduled campaigns.
 - **Contacts, Lists & Dynamic Segments**: Normalized emails, decoupled marketing consent, and parameterized dynamic criteria (zero raw SQL).
 - **Campaign Wizard**: 7-step creation wizard with audience resolution, consent checks, and suppression gatekeeping.

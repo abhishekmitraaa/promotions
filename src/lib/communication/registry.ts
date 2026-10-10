@@ -66,14 +66,15 @@ export class CommunicationRegistry {
     for (const [channel, adapter] of this.adapters.entries()) {
       try {
         results[channel] = await adapter.checkHealth(clientId);
-      } catch (err: any) {
+      } catch (err: unknown) {
+        const error = err as Error;
         results[channel] = {
           providerType: channel,
           channel,
           status: "UNHEALTHY",
           latencyMs: -1,
           checkedAt: new Date(),
-          message: err.message || "Failed health check",
+          message: error.message || "Failed health check",
           capabilities: {
             supportsTemplates: false,
             supportsMedia: false,

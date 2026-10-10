@@ -136,7 +136,8 @@ export class UnifiedMessageRouter {
           };
         }
       }
-    } catch (err: any) {
+    } catch (err: unknown) {
+      const error = err as Error;
       // FAIL-CLOSED: Authoritative suppression check could not be verified
       return {
         success: false,
@@ -145,7 +146,7 @@ export class UnifiedMessageRouter {
         status: "FAILED",
         error: {
           code: "SUPPRESSION_CHECK_FAILED",
-          message: `Authoritative suppression check failed for recipient '${destination}': ${err.message}. Dispatch blocked (fail-closed).`,
+          message: `Authoritative suppression check failed for recipient '${destination}': ${error.message}. Dispatch blocked (fail-closed).`,
           retryable: true,
           failureCategory: "OPTED_OUT_OR_SUPPRESSED",
         },

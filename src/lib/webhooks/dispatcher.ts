@@ -3,7 +3,7 @@ import { prisma } from "../prisma";
 import { signWebhookPayload } from "./signature";
 import { logger } from "../logger";
 import { env } from "../env";
-import { DeliveryStatus } from "@prisma/client";
+import { DeliveryStatus, Prisma } from "@prisma/client";
 import { decryptWebhookSecret } from "../crypto";
 import { validateWebhookUrlSync, validateWebhookUrlForDelivery } from "./ssrf";
 
@@ -308,37 +308,39 @@ export async function processWebhookDeliveryQueue(
     logger.warn("Failed to reclaim stale locked webhook deliveries:", err);
   });
 
+  const safeBatchSize = Math.min(50, Math.max(1, batchSize));
+  const safeMaxRetries = Math.min(10, Math.max(1, maxRetries));
+
   // 2. Atomically claim eligible PENDING deliveries using FOR UPDATE SKIP LOCKED
-  const claimedJobs = ((await prisma.$queryRawUnsafe(`
+  const claimedJobs = await prisma.$queryRaw<
+    Array<{
+      id: string;
+      endpointId: string;
+      payload: string;
+      eventType: string;
+      attemptCount: number;
+      url: string;
+      encryptedSecret: string;
+    }>
+  >(Prisma.sql`
     WITH claimed AS (
-      SELECT d.id
+      SELECT d.id, d."endpointId"
       FROM "WebhookDelivery" d
       WHERE d."status" = 'PENDING'
         AND (d."nextAttemptAt" IS NULL OR d."nextAttemptAt" <= NOW())
-        AND d."attemptCount" < ${maxRetries}
+        AND d."attemptCount" < ${safeMaxRetries}
       ORDER BY d."createdAt" ASC
-      LIMIT ${batchSize}
+      LIMIT ${safeBatchSize}
       FOR UPDATE SKIP LOCKED
     )
     UPDATE "WebhookDelivery" d
     SET "status" = 'PROCESSING',
         "lockedAt" = NOW()
     FROM claimed c
-    JOIN "WebhookEndpoint" e ON e.id = (SELECT "endpointId" FROM "WebhookDelivery" WHERE id = c.id)
+    JOIN "WebhookEndpoint" e ON e.id = c."endpointId"
     WHERE d.id = c.id
     RETURNING d.id, d."endpointId", d.payload, d."eventType", d."attemptCount", e.url, e."encryptedSecret";
-  `).catch((err) => {
-    logger.error("Failed to atomically claim webhook deliveries:", err);
-    return [];
-  })) || []) as {
-    id: string;
-    endpointId: string;
-    payload: string;
-    eventType: string;
-    attemptCount: number;
-    url: string;
-    encryptedSecret: string;
-  }[];
+  `);
 
   let succeeded = 0;
   let failed = 0;

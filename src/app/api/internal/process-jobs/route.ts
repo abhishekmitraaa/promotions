@@ -1,25 +1,48 @@
 import { NextRequest, NextResponse } from "next/server";
 import { ServerlessJobProcessor } from "@/lib/services/serverless-job-processor";
 import { logger } from "@/lib/logger";
-import { requireUser } from "@/lib/auth";
 import { timingSafeEqualSecret } from "@/lib/timing-safe";
 
-async function handleProcessingRequest(req: NextRequest) {
-  const workerSecret = req.headers.get("x-worker-secret");
+/**
+ * Machine-to-Machine Internal Job Processing Endpoint
+ *
+ * Triggered exclusively by Supabase Cron via pg_net HTTP POST.
+ * Requires dedicated INTERNAL_PROCESSOR_SECRET provided via Bearer Authorization header
+ * or x-processor-secret header.
+ *
+ * Fails closed in production if secret is unconfigured or mismatch occurs.
+ * Never allows processing on GET requests (returns HTTP 405).
+ */
+export async function POST(req: NextRequest) {
+  const configuredSecret = process.env.INTERNAL_PROCESSOR_SECRET;
+
+  if (!configuredSecret || configuredSecret.trim().length === 0) {
+    logger.error("[API:ProcessJobs] INTERNAL_PROCESSOR_SECRET is not configured on server.");
+    return NextResponse.json(
+      { success: false, error: "Server authentication misconfigured" },
+      { status: 500 }
+    );
+  }
+
   const authHeader = req.headers.get("authorization");
-  const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.substring(7) : null;
+  const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.substring(7).trim() : null;
+  const headerSecret = req.headers.get("x-processor-secret")?.trim() || req.headers.get("x-worker-secret")?.trim();
+  const candidateSecret = bearerToken || headerSecret;
 
-  const configuredWorkerSecret = process.env.INTERNAL_WORKER_SECRET;
-  const configuredCronSecret = process.env.CRON_SECRET;
+  if (!candidateSecret) {
+    return NextResponse.json(
+      { success: false, error: "Missing authorization credential" },
+      { status: 401 }
+    );
+  }
 
-  const isWorkerAuthorized = await timingSafeEqualSecret(workerSecret, configuredWorkerSecret);
-  const isBearerAuthorized =
-    (Boolean(bearerToken && configuredWorkerSecret) && (await timingSafeEqualSecret(bearerToken, configuredWorkerSecret))) ||
-    (Boolean(bearerToken && configuredCronSecret) && (await timingSafeEqualSecret(bearerToken, configuredCronSecret)));
-
-  if (!isWorkerAuthorized && !isBearerAuthorized) {
-    const auth = await requireUser(req, "ADMIN");
-    if (auth.response) return auth.response;
+  const isAuthorized = await timingSafeEqualSecret(candidateSecret, configuredSecret);
+  if (!isAuthorized) {
+    logger.warn("[API:ProcessJobs] Unauthorized invocation attempt with invalid secret.");
+    return NextResponse.json(
+      { success: false, error: "Invalid authorization credential" },
+      { status: 403 }
+    );
   }
 
   try {
@@ -44,10 +67,15 @@ async function handleProcessingRequest(req: NextRequest) {
   }
 }
 
-export async function POST(req: NextRequest) {
-  return handleProcessingRequest(req);
-}
-
-export async function GET(req: NextRequest) {
-  return handleProcessingRequest(req);
+/**
+ * GET is strictly non-destructive and rejected with 405 Method Not Allowed.
+ */
+export async function GET() {
+  return NextResponse.json(
+    {
+      success: false,
+      error: "Method Not Allowed. Job processing cannot be triggered via GET.",
+    },
+    { status: 405 }
+  );
 }

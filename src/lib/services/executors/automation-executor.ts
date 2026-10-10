@@ -96,7 +96,7 @@ export class AutomationExecutor {
     const now = new Date();
     return prisma.emailAutomationEnrollment.findMany({
       where: {
-        status: "ACTIVE",
+        status: { in: ["ACTIVE", "WAITING"] },
         nextActionAt: { lte: now },
       },
       take: limit,

@@ -1,6 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { authenticateEmailApi } from "@/lib/email/api-auth-helper";
-import { EmailAutomationService } from "@/lib/services/email-automation-service";
+import {
+  EmailAutomationService,
+  AutomationTriggerConfig,
+  JourneyStep,
+} from "@/lib/services/email-automation-service";
 import { EmailAutomationStatus, EmailAutomationTriggerType, AudienceReEvaluationPolicy } from "@prisma/client";
 import { checkRateLimit, rateLimitResponse } from "@/lib/rate-limit";
 import { EmailAuditLogger } from "@/lib/email/audit-logger";
@@ -65,9 +69,9 @@ export async function POST(req: NextRequest) {
       name: body.name.trim(),
       description: typeof body.description === "string" ? body.description.trim() : null,
       triggerType: (body.triggerType as EmailAutomationTriggerType) || EmailAutomationTriggerType.MANUAL,
-      triggerConfig: body.triggerConfig as any,
+      triggerConfig: body.triggerConfig as AutomationTriggerConfig | undefined,
       reEvaluationPolicy: (body.reEvaluationPolicy as AudienceReEvaluationPolicy) || AudienceReEvaluationPolicy.ALWAYS_RE_EVALUATE,
-      steps: body.steps as any,
+      steps: body.steps as unknown as JourneyStep[],
     });
 
     EmailAuditLogger.log(

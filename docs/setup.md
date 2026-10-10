@@ -43,9 +43,9 @@ All configurations are defined in `.env.local` for local development, or configu
 | `DATABASE_URL` | String | Required | Supabase PostgreSQL pooled connection URL (port 6543, `?pgbouncer=true`). |
 | `DIRECT_URL` | String | Optional | Supabase PostgreSQL direct connection URL (port 5432) for migrations. |
 | `APP_URL` | String | `http://localhost:3000` | Base public URL of your service. |
-| `REDIS_URL` | String | `redis://localhost:6379` | Redis connection URL for BullMQ email queues. |
+| `REDIS_URL` | String | `redis://localhost:6379` | Optional Redis URL for distributed rate limiting (no BullMQ worker required). |
 | `AUTH_SESSION_SECRET` | String | Min 32 chars | Cryptographic secret for signing HttpOnly session cookies. Required in production. |
-| `INTERNAL_WORKER_SECRET` | String | Optional | Secret key for authorizing external scheduled workers (`x-worker-secret` header). |
+| `INTERNAL_PROCESSOR_SECRET` | String | Min 32 chars | Machine-to-machine authentication secret for Supabase Cron workerless processor (`/api/internal/process-jobs`). |
 | `API_KEY_PEPPER` | String | Auto-generated | Secret pepper used for HMAC-SHA256 hashing of API keys. Min 32 chars in production. |
 | `WEBHOOK_SECRET_ENCRYPTION_KEY` | String | Min 32 chars | Secret key for AES-256-GCM encryption of webhook signing secrets and provider OAuth credentials at rest. |
 | `GOOGLE_CLIENT_ID` | String | Optional | Google OAuth 2.0 Web Client ID for Gmail API provider integration. |

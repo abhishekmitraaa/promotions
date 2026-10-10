@@ -51,7 +51,9 @@ export class WhatsAppAdapter implements ChannelProviderAdapter {
           type: isTemplate ? "template" : "text",
           body: request.content.text,
           templateName: request.content.templateName,
-          templateParameters: request.content.templateParameters as any,
+          templateParameters: Array.isArray(request.content.templateParameters)
+            ? (request.content.templateParameters as string[])
+            : undefined,
           metadata: request.metadata,
         },
         {
@@ -79,16 +81,17 @@ export class WhatsAppAdapter implements ChannelProviderAdapter {
             }
           : undefined,
       };
-    } catch (err: any) {
+    } catch (err: unknown) {
+      const error = err as Error & { code?: string; status?: number };
       return {
         success: false,
         channel: "WHATSAPP",
         deliveryId: "",
         status: "FAILED",
         error: {
-          code: err.code || "WHATSAPP_DISPATCH_EXCEPTION",
-          message: err.message || "Failed to dispatch WhatsApp message",
-          retryable: err.status >= 500,
+          code: error.code || "WHATSAPP_DISPATCH_EXCEPTION",
+          message: error.message || "Failed to dispatch WhatsApp message",
+          retryable: typeof error.status === "number" && error.status >= 500,
           failureCategory: "PROVIDER_ERROR",
         },
       };
@@ -126,14 +129,15 @@ export class WhatsAppAdapter implements ChannelProviderAdapter {
           maxThroughputPerSecond: 80,
         },
       };
-    } catch (err: any) {
+    } catch (err: unknown) {
+      const error = err as Error;
       return {
         providerType: "META_CLOUD_API",
         channel: "WHATSAPP",
         status: "UNHEALTHY",
         latencyMs: Date.now() - startTime,
         checkedAt: new Date(),
-        message: err.message,
+        message: error.message,
         capabilities: {
           supportsTemplates: true,
           supportsMedia: true,
@@ -150,13 +154,13 @@ export class WhatsAppAdapter implements ChannelProviderAdapter {
    */
   normalizeWebhookEvent(rawPayload: Record<string, unknown>): UnifiedNormalizedEvent[] {
     const events: UnifiedNormalizedEvent[] = [];
-    const entry = (rawPayload.entry as any[]) || [];
+    const entry = Array.isArray(rawPayload.entry) ? (rawPayload.entry as Record<string, unknown>[]) : [];
 
     for (const item of entry) {
-      const changes = (item.changes as any[]) || [];
+      const changes = Array.isArray(item.changes) ? (item.changes as Record<string, unknown>[]) : [];
       for (const change of changes) {
-        const value = change.value || {};
-        const statuses = (value.statuses as any[]) || [];
+        const value = (change.value as Record<string, unknown>) || {};
+        const statuses = Array.isArray(value.statuses) ? (value.statuses as Record<string, unknown>[]) : [];
         for (const statusObj of statuses) {
           const providerStatus = String(statusObj.status || "").toLowerCase();
           let eventType: UnifiedNormalizedEvent["eventType"] = "FAILED";
@@ -166,14 +170,21 @@ export class WhatsAppAdapter implements ChannelProviderAdapter {
           else if (providerStatus === "read") eventType = "READ_OR_OPENED";
           else if (providerStatus === "failed") eventType = "FAILED";
 
+          const statusId = typeof statusObj.id === "string" ? statusObj.id : undefined;
+          const timestampNum =
+            typeof statusObj.timestamp === "number" || typeof statusObj.timestamp === "string"
+              ? Number(statusObj.timestamp)
+              : undefined;
+          const recipientId = typeof statusObj.recipient_id === "string" ? statusObj.recipient_id : "";
+
           events.push({
-            id: statusObj.id ? `wa_${statusObj.id}_${statusObj.timestamp}` : `wa_${Date.now()}`,
+            id: statusId ? `wa_${statusId}_${timestampNum || Date.now()}` : `wa_${Date.now()}`,
             channel: "WHATSAPP",
             eventType,
-            providerEventId: statusObj.id || `wa_event_${Date.now()}`,
-            providerMessageId: statusObj.id,
-            recipient: statusObj.recipient_id || "",
-            timestamp: statusObj.timestamp ? new Date(Number(statusObj.timestamp) * 1000) : new Date(),
+            providerEventId: statusId || `wa_event_${Date.now()}`,
+            providerMessageId: statusId,
+            recipient: recipientId,
+            timestamp: timestampNum ? new Date(timestampNum * 1000) : new Date(),
             payload: statusObj,
           });
         }
@@ -184,9 +195,23 @@ export class WhatsAppAdapter implements ChannelProviderAdapter {
   }
 
   /**
+   * Alias for send() for backward/forward compatibility.
+   */
+  async sendMessage(request: UnifiedMessageRequest): Promise<UnifiedSendResult> {
+    return this.send(request);
+  }
+
+  /**
    * Checks WhatsApp destination phone number reachability (E.164 validity).
    */
   async checkReachability(destination: string): Promise<ChannelReachabilityCheck> {
+    return this.validateDestination(destination);
+  }
+
+  /**
+   * Synchronous destination syntax validation.
+   */
+  validateDestination(destination: string): ChannelReachabilityCheck {
     try {
       const normalized = normalizePhoneNumber(destination);
       const digitsOnly = normalized.replace(/\D/g, "");

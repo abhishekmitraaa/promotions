@@ -32,26 +32,25 @@ export function computeRateMetrics(counts: RawMetricsCounts): UnifiedRateMetrics
   const complaints = Math.max(0, counts.complaints ?? 0);
   const optOuts = Math.max(0, counts.optOuts ?? 0);
 
-  // Delivery Rate: delivered / sent
-  const deliveryRate = sent > 0 ? Number((delivered / sent).toFixed(4)) : 0;
+  const safeRate = (numerator: number, denominator: number): number => {
+    if (!Number.isFinite(numerator) || !Number.isFinite(denominator) || denominator <= 0) {
+      return 0.0;
+    }
+    const ratio = numerator / denominator;
+    const clamped = Math.min(1.0, Math.max(0.0, ratio));
+    return Number(clamped.toFixed(4));
+  };
 
-  // Read or Open Rate: readOrOpened / delivered
-  const readOrOpenRate = delivered > 0 ? Number((readOrOpened / delivered).toFixed(4)) : 0;
+  const deliveryBasis = delivered > 0 ? delivered : sent;
 
-  // Click-Through Rate (CTR): clicked / delivered
-  const clickThroughRate = delivered > 0 ? Number((clicked / delivered).toFixed(4)) : 0;
+  const deliveryRate = safeRate(delivered, sent);
+  const readOrOpenRate = safeRate(readOrOpened, deliveryBasis);
+  const clickThroughRate = safeRate(clicked, deliveryBasis);
+  const clickToOpenRate = safeRate(clicked, readOrOpened);
+  const bounceRate = safeRate(bounced, sent);
+  const complaintRate = safeRate(complaints, deliveryBasis);
+  const optOutRate = safeRate(optOuts, deliveryBasis);
 
-  // Click-to-Open Rate (CTOR): clicked / readOrOpened
-  const clickToOpenRate = readOrOpened > 0 ? Number((clicked / readOrOpened).toFixed(4)) : 0;
-
-  // Bounce Rate: bounced / sent
-  const bounceRate = sent > 0 ? Number((bounced / sent).toFixed(4)) : 0;
-
-  // Complaint Rate: complaints / delivered
-  const complaintRate = delivered > 0 ? Number((complaints / delivered).toFixed(4)) : 0;
-
-  // Opt-out Rate: optOuts / delivered
-  const optOutRate = delivered > 0 ? Number((optOuts / delivered).toFixed(4)) : 0;
 
   return {
     sent,
@@ -71,6 +70,12 @@ export function computeRateMetrics(counts: RawMetricsCounts): UnifiedRateMetrics
     optOutRate,
   };
 }
+
+/**
+  * Alias for computeRateMetrics for backward compatibility.
+  */
+export const computeUnifiedRates = computeRateMetrics;
+
 
 /**
  * Aggregates channel-specific metrics into an omnichannel summary report.
@@ -117,3 +122,9 @@ export function aggregateOmnichannelAnalytics(
     timeframe,
   };
 }
+
+/**
+ * Alias for aggregateOmnichannelAnalytics for backward compatibility.
+ */
+export const buildUnifiedAnalyticsSummary = aggregateOmnichannelAnalytics;
+

@@ -234,7 +234,7 @@ export class EmailAnalyticsService {
       complaints = campaign.complaintCount;
     }
 
-    const unsubscribed = (campaign as any).unsubscribedCount || 0;
+    const unsubscribed = Number((campaign as unknown as Record<string, unknown>).unsubscribedCount) || 0;
 
     const rates = computeAuthoritativeRates({
       sent,

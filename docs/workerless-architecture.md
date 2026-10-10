@@ -122,37 +122,50 @@ Located at `src/lib/services/serverless-job-processor.ts`:
 - Enforces an execution deadline (default: 25 seconds) to comfortably fit within Vercel's Serverless Function execution limit.
 - Reuses domain service logic without duplicated code (`processTransactionalJob`, `processCampaignRecipientJob`, `processScheduledCampaignTriggerJob`, `EmailAutomationService`, `EmailEventService`, `reconcileAbandonedJobs`, `processWebhookDeliveryQueue`).
 
-### 3.4. Supabase Cron & pg_net Dispatcher
+### 3.4. Supabase Cron & pg_net Dispatcher with Supabase Vault
 Configured in PostgreSQL on Supabase project `peqynzeioiauynfpdsdv`:
-```sql
-SELECT cron.schedule(
-  'process-email-jobs',
-  '* * * * *',
-  $$
+- **Job 4 (`process-email-jobs`, `* * * * *`)**:
+  Retrieves the secret dynamically from Supabase Vault (`internal_processor_secret`) without hardcoding credentials in SQL:
+  ```sql
   SELECT net.http_post(
     url := 'https://promotions-lime.vercel.app/api/internal/process-jobs',
+    headers := jsonb_build_object(
+      'Content-Type', 'application/json',
+      'Authorization', 'Bearer ' || (SELECT decrypted_secret FROM vault.decrypted_secrets WHERE name = 'internal_processor_secret' LIMIT 1)
+    ),
     body := '{"source":"supabase_cron"}'::jsonb,
-    params := '{}'::jsonb,
-    headers := '{"Content-Type": "application/json", "x-worker-secret": "<INTERNAL_WORKER_SECRET>"}'::jsonb,
     timeout_milliseconds := 30000
   );
-  $$
-);
-```
+  ```
+- **Job 5 (`reconcile-email-jobs`, `*/5 * * * *`)**:
+  Executes stale lock recovery every 5 minutes:
+  ```sql
+  SELECT net.http_post(
+    url := 'https://promotions-lime.vercel.app/api/internal/process-jobs?reconcile=true',
+    headers := jsonb_build_object(
+      'Content-Type', 'application/json',
+      'Authorization', 'Bearer ' || (SELECT decrypted_secret FROM vault.decrypted_secrets WHERE name = 'internal_processor_secret' LIMIT 1)
+    ),
+    body := '{"source":"supabase_cron_reconcile"}'::jsonb,
+    timeout_milliseconds := 45000
+  );
+  ```
 
 ### 3.5. Internal Processing Endpoint (`/api/internal/process-jobs`)
 Located at `src/app/api/internal/process-jobs/route.ts`:
-- Accepts `POST` and `GET` requests.
-- Validates `x-worker-secret` or `Authorization: Bearer <CRON_SECRET>` using timing-safe comparison.
+- Rejects `GET` requests with `HTTP 405 Method Not Allowed` to prevent unintended trigger execution.
+- Strictly validates `Authorization: Bearer <INTERNAL_PROCESSOR_SECRET>` or `x-processor-secret` using constant-time string comparison (`timingSafeEqualSecret`).
+- Fails closed on missing or incorrect credentials (returns HTTP 401/403).
 - Returns comprehensive execution reports:
 ```json
 {
   "success": true,
   "data": {
     "success": true,
-    "timestamp": "2026-10-06T16:57:33.074Z",
-    "durationMs": 12530,
+    "timestamp": "2026-10-10T09:42:27.074Z",
+    "durationMs": 31,
     "results": {
+      "backgroundJobs": { "claimed": 0, "succeeded": 0, "failed": 0 },
       "webhooks": { "claimed": 0, "succeeded": 0, "failed": 0 },
       "transactional": { "processed": 0, "succeeded": 0, "failed": 0 },
       "scheduledCampaigns": { "processed": 0, "succeeded": 0, "failed": 0 },
@@ -160,7 +173,7 @@ Located at `src/app/api/internal/process-jobs/route.ts`:
       "recurringAutomations": { "processed": 0, "succeeded": 0, "failed": 0 },
       "automationEnrollments": { "processed": 0, "succeeded": 0, "failed": 0 },
       "events": { "processed": 0, "succeeded": 0, "failed": 0 },
-      "reconciliation": { "recoveredDeliveries": 0, "failedDeliveries": 0, "recoveredRecipients": 0, "completedCampaigns": 0 }
+      "reconciliation": null
     }
   }
 }
@@ -168,26 +181,37 @@ Located at `src/app/api/internal/process-jobs/route.ts`:
 
 ---
 
-## 4. Zero-Regression Dual Mode
+## 4. Authoritative Durable State: Zero Fake Adapters
 
-To maintain 100% backward compatibility with existing tests and environments:
-- **In Tests / Redis Environments**: `isWorkerlessMode()` evaluates to `false`. Real BullMQ queues operate normally.
-- **In Production / Vercel**: `isWorkerlessMode()` evaluates to `true` (`WORKERLESS_MODE=true` or running on Vercel without a remote Redis). `WorkerlessQueueAdapter` ensures `queue.add()` writes state durably to PostgreSQL without attempting network connections to Redis.
+The system completely eliminates mock queue adapters:
+- **Immediate Transactional Messages**: (e.g. OTPs, password reset) are executed immediately without delay.
+- **Background Jobs**: (e.g. transactional deliveries, campaign dispatches, journey steps) are persisted atomically as `BackgroundJob` and authoritative entity records (`EmailDelivery`, `EmailCampaignRecipient`) in a single PostgreSQL transaction before the API returns HTTP 202 Accepted.
+- **Fair Tenant Dispatch**: Uses PostgreSQL `FOR UPDATE SKIP LOCKED` with partitioned ranking to guarantee fair multi-tenant job processing without starvation.
+- **Deadlines**: Bounded batches with a 4-second safety buffer automatically roll back unstarted claims before reaching serverless function timeouts.
 
 ---
 
 ## 5. Verification & Testing
 
-Run the dedicated test suite:
+Run the dedicated test suites:
 ```bash
+# 1. Guard check preventing destructive actions against production Supabase
+npm run test:guard
+
+# 2. End-to-end workerless pipeline verification (runs against disposable PostgreSQL)
 npm run test:workerless
+
+# 3. Multi-channel communication engine verification
+npm run test:communication
 ```
-Tests pass across all 8 phases:
+Tests pass across all 10 verification areas:
 1. Workerless mode configuration check
-2. Transactional delivery processing
-3. Scheduled campaign triggers
+2. Transactional delivery processing & terminal transition
+3. Scheduled campaign triggers & audience resolution
 4. Campaign recipient batch dispatch
 5. Automation step & timeout advancement
 6. Email telemetry event processing
-7. Authorization & secret validation on `/api/internal/process-jobs`
+7. Authorization & secret validation on `/api/internal/process-jobs` (Bearer auth, missing 401, invalid 403, GET 405)
 8. Master `ServerlessJobProcessor.processAll()` execution
+9. Durable `BackgroundJob` persistence and fair-dispatch claim processing
+10. Concurrency safety under simultaneous parallel processors (zero duplicate processing or lock collisions)

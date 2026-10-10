@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { authenticateEmailApi } from "@/lib/email/api-auth-helper";
-import { EmailAutomationService } from "@/lib/services/email-automation-service";
+import { EmailAutomationService, UpdateAutomationInput } from "@/lib/services/email-automation-service";
 import { EmailAuditLogger } from "@/lib/email/audit-logger";
 
 interface RouteParams {
@@ -61,7 +61,11 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
   }
 
   try {
-    const updated = await EmailAutomationService.updateAutomation(auth.clientId, id, body as any);
+    const updated = await EmailAutomationService.updateAutomation(
+      auth.clientId,
+      id,
+      body as unknown as UpdateAutomationInput
+    );
 
     EmailAuditLogger.log(
       auth.clientId,

@@ -40,7 +40,7 @@ export class PushAdapter implements ChannelProviderAdapter {
       deliveryId: `push_stub_${Date.now()}`,
       status: "FAILED",
       error: {
-        code: "PUSH_PROVIDER_NOT_CONFIGURED",
+        code: "PROVIDER_UNAVAILABLE",
         message: "Push notification provider integration is ready for activation via ChannelProviderAdapter SPI",
         retryable: false,
         failureCategory: "PROVIDER_ERROR",
@@ -49,6 +49,7 @@ export class PushAdapter implements ChannelProviderAdapter {
   }
 
   async checkHealth(_clientId: string): Promise<UnifiedProviderHealthResult> {
+    void _clientId;
     return {
       providerType: "FCM_APNS_GATEWAY",
       channel: "PUSH",
@@ -89,8 +90,18 @@ export class PushAdapter implements ChannelProviderAdapter {
     ];
   }
 
+  /**
+   * Alias for send() for backward/forward compatibility.
+   */
+  async sendMessage(request: UnifiedMessageRequest): Promise<UnifiedSendResult> {
+    return this.send(request);
+  }
+
   async checkReachability(destination: string): Promise<ChannelReachabilityCheck> {
-    // FCM/APNs tokens are typically 32-256 base64/hex characters
+    return this.validateDestination(destination);
+  }
+
+  validateDestination(destination: string): ChannelReachabilityCheck {
     if (typeof destination !== "string" || destination.trim().length < 20) {
       return {
         valid: false,

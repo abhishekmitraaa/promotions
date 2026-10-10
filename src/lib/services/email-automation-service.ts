@@ -27,7 +27,6 @@ import {
   EmailAutomationTriggerType,
   AudienceReEvaluationPolicy,
   EmailEnrollmentStatus,
-  EmailCampaign,
   EmailCampaignStatus,
   EmailType,
   EmailContact,
@@ -327,7 +326,7 @@ export class EmailAutomationService {
         id: cleanId,
         name: s.name ? String(s.name).trim() : `Step ${cleanId}`,
         type: s.type,
-        config: (s.config || {}) as any,
+        config: (s.config || {}) as JourneyStep["config"],
         nextStepId: s.nextStepId ? String(s.nextStepId).trim() : null,
       });
     }
@@ -558,7 +557,7 @@ export class EmailAutomationService {
     input: CreateAutomationInput | UpdateAutomationInput
   ): Promise<void> {
     if (input.triggerConfig) {
-      const tc = input.triggerConfig as any;
+      const tc = input.triggerConfig as Record<string, unknown>;
       if (tc.segmentId) {
         const seg = await prisma.emailSegment.findFirst({ where: { id: tc.segmentId, clientId } });
         if (!seg) throw new Error(`Referenced segment '${tc.segmentId}' not found for tenant '${clientId}'.`);
@@ -919,7 +918,7 @@ export class EmailAutomationService {
       }
 
       // Re-entry Policy Guard: By default, do NOT re-enroll completed or abandoned contacts.
-      const triggerCfg: any = automation.triggerConfig ? JSON.parse(automation.triggerConfig) : {};
+      const triggerCfg = (automation.triggerConfig ? JSON.parse(automation.triggerConfig) : {}) as Record<string, unknown>;
       const allowReentry = Boolean(triggerCfg.allowReentry);
 
       if (!allowReentry) {

@@ -18,10 +18,13 @@ import {
 } from "./types";
 import { logger } from "../../logger";
 
+import { prisma } from "../../prisma";
+import { BackgroundJobStatus, Prisma } from "@prisma/client";
+
 export function isWorkerlessMode(): boolean {
   if (process.env.WORKERLESS_MODE === "true") return true;
-  // If running in Vercel and no external Redis URL is provided:
-  if (process.env.VERCEL === "1" && (!process.env.REDIS_URL || process.env.REDIS_URL.includes("127.0.0.1"))) {
+  // If running in Vercel or production without an external non-local Redis URL:
+  if (!process.env.REDIS_URL || process.env.REDIS_URL.includes("127.0.0.1") || process.env.REDIS_URL.includes("localhost")) {
     return true;
   }
   return false;
@@ -35,20 +38,98 @@ class WorkerlessQueueAdapter<T = unknown> {
   }
 
   async add(name: string, data: T, opts?: { jobId?: string; delay?: number }) {
-    const id = opts?.jobId || `job-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-    logger.info(`[WorkerlessQueue] Job '${name}' (${id}) safely recorded to durable DB state`);
-    return {
-      id,
-      name,
-      data,
-      getState: async () => "waiting",
-      remove: async () => {},
-    };
+    const payloadObj = (data && typeof data === "object") ? (data as Record<string, unknown>) : { data };
+    const clientId = (payloadObj.clientId as string) || "system";
+    const delayMs = opts?.delay || 0;
+    const availableAt = delayMs > 0 ? new Date(Date.now() + delayMs) : new Date();
+
+    let jobType = "BACKGROUND_JOB";
+    const lowerName = name.toLowerCase();
+    if (lowerName.includes("transactional")) jobType = "TRANSACTIONAL_EMAIL";
+    else if (lowerName.includes("promotional")) jobType = "PROMOTIONAL_EMAIL";
+    else if (lowerName.includes("recipient")) jobType = "CAMPAIGN_RECIPIENT";
+    else if (lowerName.includes("trigger")) jobType = "CAMPAIGN_TRIGGER";
+    else if (lowerName.includes("automation")) jobType = "AUTOMATION_STEP";
+    else if (lowerName.includes("event")) jobType = "EMAIL_EVENT";
+
+    try {
+      const bg = await prisma.backgroundJob.create({
+        data: {
+          clientId,
+          type: jobType,
+          status: BackgroundJobStatus.QUEUED,
+          payload: JSON.stringify(payloadObj),
+          scheduledAt: availableAt,
+          availableAt,
+          deduplicationKey: opts?.jobId || undefined,
+        },
+      });
+
+      logger.info(`[WorkerlessQueue] Job '${name}' persisted durably as BackgroundJob ${bg.id}`);
+      return {
+        id: bg.id,
+        name,
+        data,
+        getState: async () => "waiting",
+        remove: async () => {
+          await prisma.backgroundJob.deleteMany({ where: { id: bg.id } }).catch(() => {});
+        },
+      };
+    } catch (err: unknown) {
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+        if (opts?.jobId) {
+          const existing = await prisma.backgroundJob.findFirst({
+            where: { clientId, deduplicationKey: opts.jobId },
+          });
+          if (existing) {
+            logger.info(
+              `[WorkerlessQueue] Job '${name}' already exists with deduplicationKey '${opts.jobId}', returning existing job ${existing.id}`
+            );
+            return {
+              id: existing.id,
+              name,
+              data,
+              getState: async () => existing.status.toLowerCase(),
+              remove: async () => {
+                await prisma.backgroundJob.deleteMany({ where: { id: existing.id } }).catch(() => {});
+              },
+            };
+          }
+        }
+      }
+      logger.error(`[WorkerlessQueue] Failed to persist BackgroundJob for '${name}':`, err);
+      throw err;
+    }
   }
 
   async getJob(id: string) {
-    void id;
-    return null;
+    try {
+      const bg = await prisma.backgroundJob.findFirst({
+        where: {
+          OR: [
+            { id },
+            { deduplicationKey: id },
+          ],
+        },
+      });
+      if (!bg) return null;
+      return {
+        id: bg.id,
+        name: bg.type,
+        data: JSON.parse(bg.payload || "{}") as T,
+        getState: async () => {
+          if (bg.status === BackgroundJobStatus.COMPLETED) return "completed";
+          if (bg.status === BackgroundJobStatus.FAILED) return "failed";
+          if (bg.status === BackgroundJobStatus.PROCESSING) return "active";
+          return "waiting";
+        },
+        remove: async () => {
+          await prisma.backgroundJob.deleteMany({ where: { id: bg.id } }).catch(() => {});
+        },
+      };
+    } catch {
+      return null;
+    }
   }
 
   async close() {}

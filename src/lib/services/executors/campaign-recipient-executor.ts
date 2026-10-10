@@ -16,7 +16,6 @@ import {
   EmailCampaignStatus,
   EmailDeliveryStatus,
   EmailProviderType,
-  EmailProviderStatus,
 } from "@prisma/client";
 import { providerRegistry } from "../../email/registry";
 import { EmailProvider } from "../../email/types";

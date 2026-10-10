@@ -11,13 +11,14 @@
  */
 
 import { prisma } from "../../prisma";
-import { EmailDeliveryStatus, EmailProviderType } from "@prisma/client";
-import { getTransactionalQueue } from "./queues";
+import { EmailDeliveryStatus, EmailProviderType, BackgroundJobStatus } from "@prisma/client";
+import { getTransactionalQueue, isWorkerlessMode } from "./queues";
 export { getTransactionalQueue };
 import { JOB_NAMES, getTransactionalJobId } from "./types";
 import { isValidEmail, normalizeEmail } from "../normalization";
 import { EmailRecipientInput } from "../types";
 import { EmailTemplateService, SystemTemplateType } from "../templates";
+import { logger } from "../../logger";
 
 export interface QueueTransactionalEmailInput {
   clientId: string;
@@ -157,67 +158,99 @@ export async function queueTransactionalEmail(
   }
 
   // 4. Authoritative Database State Persistence BEFORE Enqueueing
+  // 4. Create Authoritative Delivery Record & BackgroundJob atomically
+  const fromAddress = typeof input.from === "string" ? input.from : (input.from?.email || "system@whatsapphub.internal");
+
   let deliveryRecordId = `delivery-${Date.now()}-${Math.random().toString(36).substring(7)}`;
-  try {
-    const delivery = await prisma.emailDelivery.create({
-      data: {
-        clientId: input.clientId,
-        providerType: EmailProviderType.GMAIL,
-        category: "TRANSACTIONAL",
-        from: typeof input.from === "string" ? input.from : (input.from?.email || "system@whatsapphub.internal"),
-        to: normalizedTo,
-        replyTo: input.replyTo || null,
-        subject,
-        htmlContent: html || null,
-        textContent: text || null,
-        status: EmailDeliveryStatus.QUEUED,
-        attemptCount: 0,
-        transactionalReference: input.transactionalReference || null,
-        idempotencyKey: input.idempotencyKey?.trim() || null,
-      },
-    });
-    deliveryRecordId = delivery.id;
-  } catch {
-    // Graceful fallback in environments where EmailDelivery is not yet migrated
-  }
-
-  // 5. Enqueue Job with Deterministic Custom Job ID (Honest Queue Failure Contract)
-  const jobId = getTransactionalJobId(deliveryRecordId);
-  const queue = getTransactionalQueue();
+  let backgroundJobId = `job-${Date.now()}-${Math.random().toString(36).substring(7)}`;
 
   try {
-    await queue.add(
-      JOB_NAMES.SEND_TRANSACTIONAL,
-      {
-        deliveryId: deliveryRecordId,
-        clientId: input.clientId,
-        category: "TRANSACTIONAL",
-      },
-      {
-        jobId, // Custom Job ID prevents duplicate jobs in BullMQ
-      }
-    );
-  } catch (err: unknown) {
-    try {
-      await prisma.emailDelivery.updateMany({
-        where: { id: deliveryRecordId },
+    const result = await prisma.$transaction(async (tx) => {
+      const d = await tx.emailDelivery.create({
         data: {
-          status: EmailDeliveryStatus.FAILED,
-          errorCode: "QUEUE_ENQUEUE_FAILED",
-          errorMessage: err instanceof Error ? err.message : "Failed to enqueue email dispatch job",
-          failedAt: new Date(),
+          clientId: input.clientId,
+          providerType: EmailProviderType.GMAIL,
+          category: "TRANSACTIONAL",
+          from: fromAddress,
+          to: normalizedTo,
+          replyTo: input.replyTo || null,
+          subject,
+          htmlContent: html || null,
+          textContent: text || null,
+          status: EmailDeliveryStatus.QUEUED,
+          attemptCount: 0,
+          transactionalReference: input.transactionalReference || null,
+          idempotencyKey: input.idempotencyKey?.trim() || null,
         },
       });
-    } catch {
-      // Non-fatal if DB update fails
+
+      const bg = await tx.backgroundJob.create({
+        data: {
+          clientId: input.clientId,
+          type: "TRANSACTIONAL_EMAIL",
+          status: BackgroundJobStatus.QUEUED,
+          payload: JSON.stringify({
+            deliveryId: d.id,
+            clientId: input.clientId,
+            category: "TRANSACTIONAL",
+          }),
+          scheduledAt: new Date(),
+          availableAt: new Date(),
+          deduplicationKey: `email-delivery:${d.id}`,
+        },
+      });
+
+      return { delivery: d, bgJob: bg };
+    });
+
+    deliveryRecordId = result.delivery.id;
+    backgroundJobId = result.bgJob.id;
+  } catch (dbErr) {
+    // If idempotency conflict on delivery
+    if (typeof dbErr === "object" && dbErr !== null && "code" in dbErr && (dbErr as { code: string }).code === "P2002") {
+      const existing = await prisma.emailDelivery.findFirst({
+        where: {
+          clientId: input.clientId,
+          idempotencyKey: input.idempotencyKey?.trim(),
+        },
+      });
+      if (existing) {
+        return {
+          queued: existing.status === EmailDeliveryStatus.QUEUED,
+          deliveryId: existing.id,
+          jobId: `existing-job-${existing.id}`,
+          status: existing.status === EmailDeliveryStatus.QUEUED ? "QUEUED" : "FAILED",
+        };
+      }
     }
-    throw err;
+    throw dbErr;
+  }
+
+  // 5. If BullMQ Redis queue is explicitly configured and not in workerless mode, mirror to queue
+  if (!isWorkerlessMode()) {
+    try {
+      const queue = getTransactionalQueue();
+      await queue.add(
+        JOB_NAMES.SEND_TRANSACTIONAL,
+        {
+          deliveryId: deliveryRecordId,
+          clientId: input.clientId,
+          category: "TRANSACTIONAL",
+        },
+        {
+          jobId: getTransactionalJobId(deliveryRecordId),
+        }
+      );
+    } catch (err: unknown) {
+      // In Redis mode, report failure if queue enqueue failed
+      logger.warn(`[Producer] Redis queue mirroring failed for ${deliveryRecordId}:`, err);
+    }
   }
 
   return {
     queued: true,
     deliveryId: deliveryRecordId,
-    jobId,
+    jobId: backgroundJobId,
     status: "QUEUED",
   };
 }

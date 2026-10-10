@@ -90,6 +90,20 @@ export function resolveNextDeliveryStatus(
   return current;
 }
 
+/**
+ * Evaluates whether a delivery status transition is allowed and determines the resulting status.
+ */
+export function evaluateDeliveryStatusTransition(
+  current: UnifiedDeliveryStatus,
+  target: UnifiedDeliveryStatus
+): { allowed: boolean; newStatus: UnifiedDeliveryStatus } {
+  const allowed = canTransitionDelivery(current, target);
+  return {
+    allowed,
+    newStatus: allowed ? target : current,
+  };
+}
+
 // =============================================================================
 // 2. Campaign Lifecycle State Machine
 // =============================================================================
@@ -115,6 +129,9 @@ export function canTransitionCampaign(
   const allowed = VALID_CAMPAIGN_TRANSITIONS[current];
   return allowed ? allowed.has(target) : false;
 }
+
+export const canTransitionCampaignStatus = canTransitionCampaign;
+
 
 /**
  * Returns true if the campaign status is terminal.
@@ -178,3 +195,34 @@ export function mapEmailStatus(status: string): UnifiedDeliveryStatus {
       return "FAILED";
   }
 }
+
+export const normalizeWhatsAppDeliveryStatus = mapWhatsAppStatus;
+export const normalizeEmailDeliveryStatus = mapEmailStatus;
+
+/**
+ * Normalizes provider event string to standard UnifiedNormalizedEvent eventType.
+ */
+export function normalizeChannelEventType(
+  channel: string,
+  rawEvent: string
+): "SENT" | "DELIVERED" | "READ_OR_OPENED" | "CLICKED" | "BOUNCED" | "COMPLAINT" | "OPT_OUT" | "FAILED" {
+  const evt = rawEvent.toLowerCase();
+  if (channel === "WHATSAPP") {
+    if (evt === "read") return "READ_OR_OPENED";
+    if (evt === "delivered") return "DELIVERED";
+    if (evt === "sent") return "SENT";
+    if (evt === "failed") return "FAILED";
+  }
+  if (channel === "EMAIL") {
+    if (evt === "open" || evt === "opened") return "READ_OR_OPENED";
+    if (evt === "click" || evt === "clicked") return "CLICKED";
+    if (evt === "spam" || evt === "complaint" || evt === "complained") return "COMPLAINT";
+    if (evt === "bounce" || evt === "bounced") return "BOUNCED";
+    if (evt === "delivered") return "DELIVERED";
+    if (evt === "sent") return "SENT";
+    if (evt === "failed") return "FAILED";
+    if (evt === "unsubscribe" || evt === "opt_out") return "OPT_OUT";
+  }
+  return "FAILED";
+}
+

@@ -7,16 +7,9 @@ import { TemplateEngine } from "@/lib/email/template-engine";
 import { EmailSuppressionService } from "@/lib/services/email-suppression-service";
 import { prisma } from "@/lib/prisma";
 import { normalizeEmail } from "@/lib/email/normalization";
-import { EmailDeliveryStatus, EmailProviderType, EmailType } from "@prisma/client";
+import { EmailDeliveryStatus, EmailProviderType, EmailType, BackgroundJobStatus } from "@prisma/client";
 import { providerRegistry } from "@/lib/email/registry";
-import { getTransactionalQueue, getCampaignQueue } from "@/lib/email/queue/queues";
-import {
-  JOB_NAMES,
-  getTransactionalJobId,
-  getPromotionalJobId,
-  TransactionalJobData,
-  PromotionalJobData,
-} from "@/lib/email/queue/types";
+
 
 export async function POST(req: NextRequest) {
   // 1. Authenticate API Key & Resolve Tenant
@@ -214,28 +207,50 @@ export async function POST(req: NextRequest) {
     // Falls back to mock provider in testing/development
   }
 
-  // 8. Create Authoritative Delivery Record
+  // 8. Atomically create Authoritative Delivery Record & Durable BackgroundJob
   const idempotencyKey = req.headers.get("idempotency-key") || undefined;
 
   let delivery;
   try {
-    delivery = await prisma.emailDelivery.create({
-      data: {
-        clientId,
-        category: input.type as EmailType,
-        providerType,
-        from: fromAddress,
-        to: recipientEmail,
-        replyTo: input.replyTo || null,
-        subject: finalSubject,
-        htmlContent: finalHtml || null,
-        textContent: finalText || null,
-        templateId: resolvedTemplateId || null,
-        templateVersionId: resolvedTemplateVersionId || null,
-        status: EmailDeliveryStatus.QUEUED,
-        idempotencyKey,
-      },
+    const result = await prisma.$transaction(async (tx) => {
+      const d = await tx.emailDelivery.create({
+        data: {
+          clientId,
+          category: input.type as EmailType,
+          providerType,
+          from: fromAddress,
+          to: recipientEmail,
+          replyTo: input.replyTo || null,
+          subject: finalSubject,
+          htmlContent: finalHtml || null,
+          textContent: finalText || null,
+          templateId: resolvedTemplateId || null,
+          templateVersionId: resolvedTemplateVersionId || null,
+          status: EmailDeliveryStatus.QUEUED,
+          idempotencyKey,
+        },
+      });
+
+      const bg = await tx.backgroundJob.create({
+        data: {
+          clientId,
+          type: input.type === "PROMOTIONAL" ? "PROMOTIONAL_EMAIL" : "TRANSACTIONAL_EMAIL",
+          status: BackgroundJobStatus.QUEUED,
+          payload: JSON.stringify({
+            deliveryId: d.id,
+            clientId,
+            category: input.type,
+          }),
+          scheduledAt: new Date(),
+          availableAt: new Date(),
+          deduplicationKey: `email-delivery:${d.id}`,
+        },
+      });
+
+      return { delivery: d, backgroundJob: bg };
     });
+
+    delivery = result.delivery;
   } catch (err: unknown) {
     if (typeof err === "object" && err !== null && "code" in err && (err as { code: string }).code === "P2002") {
       // Idempotency conflict
@@ -266,53 +281,6 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // 9. Queue Asynchronously (Honest Queue Failure Contract)
-  try {
-    if (input.type === "TRANSACTIONAL") {
-      const queue = getTransactionalQueue();
-      const jobData: TransactionalJobData = {
-        deliveryId: delivery.id,
-        clientId,
-        category: "TRANSACTIONAL",
-      };
-      await queue.add(JOB_NAMES.SEND_TRANSACTIONAL, jobData, {
-        jobId: getTransactionalJobId(delivery.id),
-      });
-    } else {
-      const queue = getCampaignQueue();
-      const jobData: PromotionalJobData = {
-        deliveryId: delivery.id,
-        clientId,
-        category: "PROMOTIONAL",
-      };
-      await queue.add(JOB_NAMES.SEND_PROMOTIONAL, jobData, {
-        jobId: getPromotionalJobId(delivery.id),
-      });
-    }
-  } catch (err: unknown) {
-    const errorMsg = err instanceof Error ? err.message : "Failed to enqueue delivery job";
-    await prisma.emailDelivery.updateMany({
-      where: { id: delivery.id },
-      data: {
-        status: EmailDeliveryStatus.FAILED,
-        errorCode: "QUEUE_ENQUEUE_FAILED",
-        errorMessage: errorMsg,
-        failedAt: new Date(),
-      },
-    });
-
-    return NextResponse.json(
-      {
-        success: false,
-        error: {
-          code: "QUEUE_ERROR",
-          message: "Failed to enqueue email dispatch job. Durable delivery marked as failed.",
-        },
-      },
-      { status: 500 }
-    );
-  }
-
   return NextResponse.json(
     {
       success: true,
@@ -326,3 +294,4 @@ export async function POST(req: NextRequest) {
     { status: 202 }
   );
 }
+

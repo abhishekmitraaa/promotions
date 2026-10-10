@@ -72,15 +72,16 @@ export class EmailAdapter implements ChannelProviderAdapter {
             }
           : undefined,
       };
-    } catch (err: any) {
+    } catch (err: unknown) {
+      const error = err as Error & { code?: string };
       return {
         success: false,
         channel: "EMAIL",
         deliveryId: "",
         status: "FAILED",
         error: {
-          code: err.code || "EMAIL_DISPATCH_EXCEPTION",
-          message: err.message || "Failed to dispatch email",
+          code: error.code || "EMAIL_DISPATCH_EXCEPTION",
+          message: error.message || "Failed to dispatch email",
           retryable: false,
           failureCategory: "PROVIDER_ERROR",
         },
@@ -123,14 +124,15 @@ export class EmailAdapter implements ChannelProviderAdapter {
           maxThroughputPerSecond: 50,
         },
       };
-    } catch (err: any) {
+    } catch (err: unknown) {
+      const error = err as Error;
       return {
         providerType: "GMAIL",
         channel: "EMAIL",
         status: "UNHEALTHY",
         latencyMs: Date.now() - startTime,
         checkedAt: new Date(),
-        message: err.message,
+        message: error.message,
         capabilities: {
           supportsTemplates: true,
           supportsMedia: true,
@@ -176,9 +178,23 @@ export class EmailAdapter implements ChannelProviderAdapter {
   }
 
   /**
+   * Alias for send() for backward/forward compatibility.
+   */
+  async sendMessage(request: UnifiedMessageRequest): Promise<UnifiedSendResult> {
+    return this.send(request);
+  }
+
+  /**
    * Checks email destination reachability (RFC 5322 syntax validation and normalization).
    */
   async checkReachability(destination: string): Promise<ChannelReachabilityCheck> {
+    return this.validateDestination(destination);
+  }
+
+  /**
+   * Synchronous destination syntax validation.
+   */
+  validateDestination(destination: string): ChannelReachabilityCheck {
     if (!isValidEmail(destination)) {
       return {
         valid: false,
@@ -191,3 +207,4 @@ export class EmailAdapter implements ChannelProviderAdapter {
     };
   }
 }
+
