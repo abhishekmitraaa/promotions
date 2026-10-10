@@ -99,6 +99,7 @@ interface InMemoryStore {
   campaigns: any[];
   deliveries: any[];
   campaignRecipients: any[];
+  jobs: any[];
 }
 
 const store: InMemoryStore = {
@@ -116,6 +117,7 @@ const store: InMemoryStore = {
   campaigns: [],
   deliveries: [],
   campaignRecipients: [],
+  jobs: [],
 };
 
 const enqueuedJobs: {
@@ -377,6 +379,41 @@ function setupHardeningMocks() {
   };
 
   (prisma.emailProviderConfig as any).findFirst = async () => null;
+
+  (prisma as any).$transaction = async (fnOrArray: any) => {
+    if (typeof fnOrArray === "function") {
+      return await fnOrArray(prisma);
+    }
+    return Promise.all(fnOrArray);
+  };
+
+  (prisma as any).backgroundJob = {
+    create: async ({ data }: any) => {
+      const record = { id: data.id || `bg-${Date.now()}-${Math.random().toString(36).substring(7)}`, status: "QUEUED", ...data };
+      store.jobs.push(record);
+      return record;
+    },
+    findUnique: async ({ where }: any) => {
+      return store.jobs.find((j: any) => j.id === where.id) || null;
+    },
+    findFirst: async ({ where }: any) => {
+      return store.jobs.find((j: any) => {
+        if (where?.id && j.id !== where.id) return false;
+        if (where?.clientId && j.clientId !== where.clientId) return false;
+        if (where?.deduplicationKey && j.deduplicationKey !== where.deduplicationKey) return false;
+        return true;
+      }) || null;
+    },
+    update: async ({ where, data }: any) => {
+      const idx = store.jobs.findIndex((j: any) => j.id === where.id);
+      if (idx !== -1) {
+        store.jobs[idx] = { ...store.jobs[idx], ...data };
+        return store.jobs[idx];
+      }
+      return null;
+    },
+    deleteMany: async () => ({ count: 0 }),
+  };
 }
 
 async function runHardeningSuite() {

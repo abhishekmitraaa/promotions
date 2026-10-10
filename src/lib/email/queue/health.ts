@@ -79,15 +79,16 @@ export async function getEmailQueueHealth(): Promise<EmailQueueHealthReport> {
   let postgresLatencyMs: number | undefined;
   let postgresError: string | undefined;
 
-  // 1. Check Redis Ping (if in Redis worker mode)
-  if (!isWorkerless) {
-    try {
-      const redis = getRedisConnection();
-      const start = Date.now();
-      const pong = await redis.ping();
-      redisLatencyMs = Date.now() - start;
-      redisConnected = pong === "PONG";
-    } catch (err) {
+  // 1. Check Redis Ping
+  try {
+    const redis = getRedisConnection();
+    const start = Date.now();
+    const pong = await redis.ping();
+    redisLatencyMs = Date.now() - start;
+    redisConnected = pong === "PONG";
+  } catch (err) {
+    redisConnected = false;
+    if (!isWorkerless) {
       redisError = err instanceof Error ? err.message : "Redis connection failed";
       workerLogger.error("[QueueHealth] Redis ping error", err);
     }
@@ -164,7 +165,7 @@ export async function getEmailQueueHealth(): Promise<EmailQueueHealthReport> {
 
   // 5. Query active worker heartbeats from Redis
   let activeClusterWorkers: WorkerTelemetrySnapshot[] = [];
-  if (redisConnected && !isWorkerless) {
+  if (redisConnected) {
     try {
       const redis = getRedisConnection();
       activeClusterWorkers = await getActiveWorkerHeartbeats(redis);

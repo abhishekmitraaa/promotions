@@ -10,6 +10,7 @@ import { Queue, QueueOptions } from "bullmq";
 import { getRedisConnection } from "./connection";
 import {
   QUEUE_NAMES,
+  JOB_NAMES,
   TransactionalJobData,
   PromotionalJobData,
   CampaignJobData,
@@ -52,6 +53,31 @@ class WorkerlessQueueAdapter<T = unknown> {
     else if (lowerName.includes("automation")) jobType = "AUTOMATION_STEP";
     else if (lowerName.includes("event")) jobType = "EMAIL_EVENT";
 
+    const deduplicationKey = opts?.jobId || undefined;
+    if (deduplicationKey) {
+      try {
+        const existing = await prisma.backgroundJob.findFirst({
+          where: { clientId, deduplicationKey },
+        });
+        if (existing) {
+          logger.info(
+            `[WorkerlessQueue] Job '${name}' already exists with deduplicationKey '${deduplicationKey}', returning existing job ${existing.id}`
+          );
+          return {
+            id: deduplicationKey || existing.id,
+            name,
+            data,
+            getState: async () => existing.status.toLowerCase(),
+            remove: async () => {
+              await prisma.backgroundJob.deleteMany({ where: { id: existing.id } }).catch(() => {});
+            },
+          };
+        }
+      } catch {
+        // Table or query check failed, fall through to creation
+      }
+    }
+
     try {
       const bg = await prisma.backgroundJob.create({
         data: {
@@ -61,13 +87,13 @@ class WorkerlessQueueAdapter<T = unknown> {
           payload: JSON.stringify(payloadObj),
           scheduledAt: availableAt,
           availableAt,
-          deduplicationKey: opts?.jobId || undefined,
+          deduplicationKey,
         },
       });
 
       logger.info(`[WorkerlessQueue] Job '${name}' persisted durably as BackgroundJob ${bg.id}`);
       return {
-        id: bg.id,
+        id: deduplicationKey || bg.id,
         name,
         data,
         getState: async () => "waiting",
@@ -77,16 +103,16 @@ class WorkerlessQueueAdapter<T = unknown> {
       };
     } catch (err: unknown) {
       if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
-        if (opts?.jobId) {
+        if (deduplicationKey) {
           const existing = await prisma.backgroundJob.findFirst({
-            where: { clientId, deduplicationKey: opts.jobId },
+            where: { clientId, deduplicationKey },
           });
           if (existing) {
             logger.info(
-              `[WorkerlessQueue] Job '${name}' already exists with deduplicationKey '${opts.jobId}', returning existing job ${existing.id}`
+              `[WorkerlessQueue] Job '${name}' already exists with deduplicationKey '${deduplicationKey}', returning existing job ${existing.id}`
             );
             return {
-              id: existing.id,
+              id: deduplicationKey || existing.id,
               name,
               data,
               getState: async () => existing.status.toLowerCase(),
@@ -113,9 +139,18 @@ class WorkerlessQueueAdapter<T = unknown> {
         },
       });
       if (!bg) return null;
+
+      let jobName: string = bg.type;
+      if (bg.type === "TRANSACTIONAL_EMAIL") jobName = JOB_NAMES.SEND_TRANSACTIONAL;
+      else if (bg.type === "PROMOTIONAL_EMAIL") jobName = JOB_NAMES.SEND_PROMOTIONAL;
+      else if (bg.type === "CAMPAIGN_RECIPIENT") jobName = JOB_NAMES.SEND_CAMPAIGN_RECIPIENT;
+      else if (bg.type === "CAMPAIGN_TRIGGER") jobName = JOB_NAMES.TRIGGER_SCHEDULED_CAMPAIGN;
+      else if (bg.type === "AUTOMATION_STEP") jobName = JOB_NAMES.PROCESS_AUTOMATION_STEP;
+      else if (bg.type === "EMAIL_EVENT") jobName = JOB_NAMES.PROCESS_EMAIL_EVENT;
+
       return {
-        id: bg.id,
-        name: bg.type,
+        id: bg.deduplicationKey || bg.id,
+        name: jobName,
         data: JSON.parse(bg.payload || "{}") as T,
         getState: async () => {
           if (bg.status === BackgroundJobStatus.COMPLETED) return "completed";
@@ -254,6 +289,10 @@ let transactionalQueue: Queue<TransactionalJobData | PromotionalJobData> | null 
 let campaignQueue: Queue<CampaignJobData | PromotionalJobData | AutomationJobData> | null = null;
 let eventsQueue: Queue<EmailEventJobData> | null = null;
 
+let workerlessTransactionalQueue: WorkerlessQueueAdapter<TransactionalJobData | PromotionalJobData> | null = null;
+let workerlessCampaignQueue: WorkerlessQueueAdapter<CampaignJobData | PromotionalJobData | AutomationJobData> | null = null;
+let workerlessEventsQueue: WorkerlessQueueAdapter<EmailEventJobData> | null = null;
+
 function getBaseQueueOptions(): QueueOptions {
   return {
     connection: getRedisConnection(),
@@ -280,9 +319,12 @@ function getBaseQueueOptions(): QueueOptions {
  */
 export function getTransactionalQueue(): Queue<TransactionalJobData | PromotionalJobData> {
   if (isWorkerlessMode()) {
-    return new WorkerlessQueueAdapter<TransactionalJobData | PromotionalJobData>(
-      QUEUE_NAMES.TRANSACTIONAL
-    ) as unknown as Queue<TransactionalJobData | PromotionalJobData>;
+    if (!workerlessTransactionalQueue) {
+      workerlessTransactionalQueue = new WorkerlessQueueAdapter<TransactionalJobData | PromotionalJobData>(
+        QUEUE_NAMES.TRANSACTIONAL
+      );
+    }
+    return workerlessTransactionalQueue as unknown as Queue<TransactionalJobData | PromotionalJobData>;
   }
 
   if (!transactionalQueue) {
@@ -299,9 +341,12 @@ export function getTransactionalQueue(): Queue<TransactionalJobData | Promotiona
  */
 export function getCampaignQueue(): Queue<CampaignJobData | PromotionalJobData | AutomationJobData> {
   if (isWorkerlessMode()) {
-    return new WorkerlessQueueAdapter<CampaignJobData | PromotionalJobData | AutomationJobData>(
-      QUEUE_NAMES.CAMPAIGN
-    ) as unknown as Queue<CampaignJobData | PromotionalJobData | AutomationJobData>;
+    if (!workerlessCampaignQueue) {
+      workerlessCampaignQueue = new WorkerlessQueueAdapter<CampaignJobData | PromotionalJobData | AutomationJobData>(
+        QUEUE_NAMES.CAMPAIGN
+      );
+    }
+    return workerlessCampaignQueue as unknown as Queue<CampaignJobData | PromotionalJobData | AutomationJobData>;
   }
 
   if (!campaignQueue) {
@@ -318,9 +363,12 @@ export function getCampaignQueue(): Queue<CampaignJobData | PromotionalJobData |
  */
 export function getEventsQueue(): Queue<EmailEventJobData> {
   if (isWorkerlessMode()) {
-    return new WorkerlessQueueAdapter<EmailEventJobData>(
-      QUEUE_NAMES.EVENTS
-    ) as unknown as Queue<EmailEventJobData>;
+    if (!workerlessEventsQueue) {
+      workerlessEventsQueue = new WorkerlessQueueAdapter<EmailEventJobData>(
+        QUEUE_NAMES.EVENTS
+      );
+    }
+    return workerlessEventsQueue as unknown as Queue<EmailEventJobData>;
   }
 
   if (!eventsQueue) {

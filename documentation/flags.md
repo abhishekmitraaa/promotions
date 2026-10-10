@@ -889,6 +889,35 @@
 - **Manual Operational Actions Required**:
   - The live endpoint `https://promotions-lime.vercel.app/api/internal/process-jobs` returns HTTP 500 (`Server authentication misconfigured`) because `INTERNAL_PROCESSOR_SECRET` has not yet been set in the Vercel Production Environment Variables for team `team_m86fYQNTuPr5kMKkb6qWi32B`. The user must add `INTERNAL_PROCESSOR_SECRET` with the value matching Supabase Vault (`internal_processor_secret`) in the Vercel Dashboard and trigger a production redeploy.
 
+### Entry: 2026-10-10 — Master Prompt: Fix Verified Production Blockers & Recertify WhatsApp Hub (Comprehensive Verification & Final Recertification)
+- **Prompt / Phase**: End-to-End Test Suite Repair, Workerless Queue Deduplication, CI Parity, and Final Production Audit
+- **Status**: ✅ Clean (All Test Suites Green, Build Validated, CI Regression Remediated)
+- **Resolved Issues**:
+  1. **Hardening Test Suite In-Memory Mock Isolation & Queue Failure Contract**:
+     - In `scripts/verify-email-hardening.ts`, updated test mock harness by providing in-memory `$transaction` and `backgroundJob` delegates so transactional send operations do not invoke real PostgreSQL transactions with unpersisted client fixtures.
+     - Restored honest queue error handling contract in `src/app/api/v1/email/send/route.ts` using `getTransactionalQueue().add` and `getCampaignQueue().add`, ensuring queue failures return HTTP 500 with `QUEUE_ERROR` and mark deliveries as `FAILED`.
+  2. **Workerless Queue Singleton Caching & Deduplication Key Preservation**:
+     - In `src/lib/email/queue/queues.ts`, cached singleton instances for `workerlessTransactionalQueue`, `workerlessCampaignQueue`, and `workerlessEventsQueue` to preserve mock hooks and avoid recreating queue adapters on every call.
+     - In `WorkerlessQueueAdapter.add`, returned `opts.jobId` as `job.id` when custom job IDs are specified, preserving BullMQ custom job ID compatibility and duplicate protection.
+     - In `WorkerlessQueueAdapter.getJob`, mapped internal job types (`TRANSACTIONAL_EMAIL`, `PROMOTIONAL_EMAIL`, `CAMPAIGN_TRIGGER`, etc.) to standard BullMQ job names (`send-transactional`, `send-promotional`, `trigger-scheduled-campaign`).
+  3. **Queue Health Check Redis Probing**:
+     - In `src/lib/email/queue/health.ts`, enabled Redis connectivity probing even when workerless mode is active so that running test harnesses and hybrid deployments accurately report Redis connectivity and latency.
+  4. **Full Test Pipeline Verification**:
+     - `npx prisma validate`: Valid.
+     - `npx prisma generate`: Generated Client v6.19.0.
+     - `npm run test:guard`: 16/16 PASSED.
+     - `npm run test:email:events`: 50/50 PASSED.
+     - `npm run test:workerless`: 22/22 PASSED.
+     - `npm run test:communication`: 8/8 PASSED.
+     - `npm test`: 24/24 scripts PASSED (100% sequential pass across all 24 verification suites).
+     - `npx tsc --noEmit`: 0 errors.
+     - `npm run lint`: 0 errors, 0 warnings.
+     - `npm run build`: 100% SUCCESS (all 74 Next.js routes compiled cleanly).
+- **Unresolved Concerns**:
+  - `None (all checks clean)`.
+- **Manual Operational Actions Required**:
+  - In Vercel Project Settings for team `team_m86fYQNTuPr5kMKkb6qWi32B`, configure `INTERNAL_PROCESSOR_SECRET` for the Production environment matching the secret stored in Supabase Vault (`internal_processor_secret`) and trigger a production deployment.
+
 ---
 
 ## Flag Template for Subsequent Prompts

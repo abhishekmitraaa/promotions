@@ -9,6 +9,14 @@ import { prisma } from "@/lib/prisma";
 import { normalizeEmail } from "@/lib/email/normalization";
 import { EmailDeliveryStatus, EmailProviderType, EmailType, BackgroundJobStatus } from "@prisma/client";
 import { providerRegistry } from "@/lib/email/registry";
+import { getTransactionalQueue, getCampaignQueue } from "@/lib/email/queue/queues";
+import {
+  JOB_NAMES,
+  getTransactionalJobId,
+  getPromotionalJobId,
+  TransactionalJobData,
+  PromotionalJobData,
+} from "@/lib/email/queue/types";
 
 
 export async function POST(req: NextRequest) {
@@ -231,6 +239,10 @@ export async function POST(req: NextRequest) {
         },
       });
 
+      const deduplicationKey = input.type === "PROMOTIONAL"
+        ? getPromotionalJobId(d.id)
+        : getTransactionalJobId(d.id);
+
       const bg = await tx.backgroundJob.create({
         data: {
           clientId,
@@ -243,7 +255,7 @@ export async function POST(req: NextRequest) {
           }),
           scheduledAt: new Date(),
           availableAt: new Date(),
-          deduplicationKey: `email-delivery:${d.id}`,
+          deduplicationKey,
         },
       });
 
@@ -275,6 +287,53 @@ export async function POST(req: NextRequest) {
         error: {
           code: "DATABASE_ERROR",
           message: `Database error while creating delivery record: ${msg}`,
+        },
+      },
+      { status: 500 }
+    );
+  }
+
+  // 9. Queue Asynchronously (Honest Queue Failure Contract)
+  try {
+    if (input.type === "TRANSACTIONAL") {
+      const queue = getTransactionalQueue();
+      const jobData: TransactionalJobData = {
+        deliveryId: delivery.id,
+        clientId,
+        category: "TRANSACTIONAL",
+      };
+      await queue.add(JOB_NAMES.SEND_TRANSACTIONAL, jobData, {
+        jobId: getTransactionalJobId(delivery.id),
+      });
+    } else {
+      const queue = getCampaignQueue();
+      const jobData: PromotionalJobData = {
+        deliveryId: delivery.id,
+        clientId,
+        category: "PROMOTIONAL",
+      };
+      await queue.add(JOB_NAMES.SEND_PROMOTIONAL, jobData, {
+        jobId: getPromotionalJobId(delivery.id),
+      });
+    }
+  } catch (err: unknown) {
+    const errorMsg = err instanceof Error ? err.message : "Failed to enqueue delivery job";
+    await prisma.emailDelivery.updateMany({
+      where: { id: delivery.id },
+      data: {
+        status: EmailDeliveryStatus.FAILED,
+        errorCode: "QUEUE_ENQUEUE_FAILED",
+        errorMessage: errorMsg,
+        failedAt: new Date(),
+      },
+    });
+
+    return NextResponse.json(
+      {
+        success: false,
+        error: {
+          code: "QUEUE_ERROR",
+          message: "Failed to enqueue email dispatch job. Durable delivery marked as failed.",
         },
       },
       { status: 500 }
