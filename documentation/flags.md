@@ -942,6 +942,34 @@
 
 ---
 
+### Entry: 2026-10-11 — Post-Redeployment Verification & Production Certification Audit
+- **Prompt / Phase**: Post-Redeployment Verification & Final Production Certification Audit
+- **Status**: 🟡 Open Risk (Serverless Runtime Margin Risk Under Default 15s Timeout)
+- **Resolved Verifications**:
+  1. **Authentication Cutover Verified**:
+     - `INTERNAL_PROCESSOR_SECRET` successfully loaded into Vercel production runtime.
+     - Live Supabase Cron invocations via `pg_net` return HTTP 200 with 100% success rate since `2026-10-10 20:08:00+00`.
+     - Zero HTTP 500 authentication errors post-redeploy.
+  2. **Security & RBAC Enforcement Confirmed**:
+     - Endpoint strictly enforces `Authorization: Bearer <secret>` and rejects missing credentials (401), invalid tokens (403), GET requests (405), and legacy headers (`x-processor-secret`).
+     - Admin route `/api/admin/jobs/process` protected by RBAC; non-admin/viewer requests rejected.
+  3. **Isolated Test Execution Clean**:
+     - All 24 verification suites pass locally with exit code 0; GitHub Actions CI workflow `38060577179` is 100% green on commit `025c156`.
+- **Unresolved Concerns & Potential Risks**:
+  1. **Serverless Function Execution Duration vs. Timeout Limit**:
+     - Idle execution duration of `ServerlessJobProcessor.processAll()` is 8.5s–9.7s on single cron sweeps and spikes to 12.2s during overlapping reconciliation cycles (`reconcile=true`).
+     - This high idle latency stems from trans-continental network round-trips between Vercel serverless compute in US East (`iad1`) and Supabase PostgreSQL in Mumbai (`ap-south-1`) across 9+ sequential queries.
+     - `src/app/api/internal/process-jobs/route.ts` lacks an explicit `export const maxDuration = 60` export. Without it, Vercel applies the default function timeout (15s).
+     - Running at 12.2s leaves only a 2.8s safety margin (81.3% consumed on an empty queue). Real production batch workloads risk encountering `504 Gateway Timeout` (`FUNCTION_INVOCATION_TIMEOUT`).
+  2. **Zero Live Production Traffic (Unpopulated Queue)**:
+     - All production job tables (`BackgroundJob`, `EmailDelivery`, `WebhookDelivery`) currently have 0 rows. Real production end-to-end processing is certified in disposable environments but cannot be marked full PASS in production without real volume.
+- **Mitigation / Recommended Next Steps**:
+  - Add `export const maxDuration = 60;` (or up to 300 for Pro) to `src/app/api/internal/process-jobs/route.ts` to extend the Vercel execution boundary beyond the 15s default.
+  - Optimize `ServerlessJobProcessor.processAll` to execute lightweight existence checks or co-locate compute in `bom1` (Mumbai) to eliminate cross-region round-trips.
+
+---
+
+
 
 ## Flag Template for Subsequent Prompts
 
