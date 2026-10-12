@@ -79,7 +79,7 @@ Key design choices:
 | Automation | `EmailAutomation`, `EmailAutomationEnrollment` |
 | Queue | `BackgroundJob` |
 
-Schema: `prisma/schema.prisma`. Migrations: `prisma/migrations/` (12 migrations; the two newest, `20261012000000_oauth_state_store` and `20261012010000_whatsapp_message_retry`, are **not yet applied to production**).
+Schema: `prisma/schema.prisma`. Migrations: `prisma/migrations/` (12 migrations, all applied to production as of 12 Oct 2026).
 
 ## Repository layout (`whatsapp-hub/`)
 

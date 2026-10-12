@@ -1155,6 +1155,23 @@
   - Owner to decide: merge to `main` and push. Before that, run `npx prisma migrate deploy` against production.
   - Then the external setup in [03-go-live-checklist.md](03-go-live-checklist.md): Vercel variables, Meta WhatsApp, Google OAuth, admin user and API key, end-to-end test.
 
+### Entry: 2026-10-12 — Production Deploy of the 12 Oct Work
+- **Prompt / Phase**: Owner approved "migrate, merge and push". Applied both migrations to production Supabase, fast-forwarded `main` to `47b905c`, pushed.
+- **Status**: 🟡 In Progress (deployed and healthy; external provider setup pending)
+- **Verified**:
+  - `prisma migrate status` on production before: only the two new migrations pending; after: schema up to date.
+  - GitHub Actions "Email Platform E2E & Hardening" on `47b905c`: success.
+  - Live `/api/health`: 200, database connected, rate limiter `HEALTHY` on `postgres` (new response shape, so the new build is serving).
+  - `net._http_response` 18:00–18:10 UTC across the deploy: 14/14 HTTP 200, `success: true`, no timeouts, 34–284 ms.
+- **Unresolved Concerns**:
+  - Vercel deployment record itself was not inspected (the connected Vercel account has no access to this project; GitHub API rate-limited). Liveness was inferred from the health response shape.
+  - The RBAC workflow did not report a check run on this commit; only the email workflow was observed.
+  - `/api/health` reported ~1 s database latency. Only the two processor routes are pinned to `bom1`; all other routes run in Vercel's default region, far from the Mumbai database. Consider setting `"regions": ["bom1"]` for the whole project.
+  - `metaCloudApi` is `unconfigured` in production; `REDIS_URL` / `WORKERLESS_MODE` may still exist in Vercel (unused).
+  - 8 rows exist in production `Message`; origin not investigated.
+- **Mitigation / Next Steps**:
+  - Owner: remove unused Vercel variables; proceed with external setup Steps 1–4 and the end-to-end test in Step 6.
+
 ---
 
 ## Flag Template for Subsequent Prompts

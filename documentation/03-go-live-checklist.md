@@ -103,11 +103,13 @@ Store the `whub_…` key in your project's secrets as e.g. `WHATSAPP_HUB_API_KEY
 
 ---
 
-## Step 5 — Code work 💻 ✅ Done (12 Oct 2026), not yet deployed
+## Step 5 — Code work 💻 ✅ Done and deployed (12 Oct 2026)
 
 All review findings are fixed, Redis and the old worker are removed, and WhatsApp retries and Gmail bounce detection are added. Details: [02-code-review-2026-10-12.md](02-code-review-2026-10-12.md). The work is on branch `fix/review-2026-10-12`.
 
-**To deploy it (order matters):**
+**Deployed 12 Oct 2026:** steps 1, 2 and 4 below are done (`main` at `47b905c`). Step 3 is still yours. The steps are kept as the procedure for future releases with migrations.
+
+**Deploy procedure (order matters):**
 
 1. Apply the two new migrations to production **first**. If the new code deploys before them, every query on `Message` fails.
    ```bash
