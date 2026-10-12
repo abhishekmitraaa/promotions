@@ -106,6 +106,9 @@ model Message {
   errorMessage       String?
   metadata           String?
   idempotencyKey     String?
+  attemptCount       Int              @default(0)
+  lockedAt           DateTime?
+  lockedBy           String?
   sentAt             DateTime?
   deliveredAt        DateTime?
   readAt             DateTime?
@@ -123,6 +126,7 @@ model Message {
   @@index([providerMessageId])
   @@index([direction])
   @@index([createdAt])
+  @@index([lockedAt])
 }
 
 model MessageEvent {

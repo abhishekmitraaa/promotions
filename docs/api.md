@@ -115,6 +115,26 @@ Full Meta template components for body, header, and dynamic buttons (URL/quick r
 }
 ```
 
+### Accepted With Automatic Retry (HTTP 202 Accepted)
+
+Returned when Meta is temporarily unavailable (timeout or 5xx). The message is stored as `QUEUED` and retried automatically, up to 5 attempts in total. Do not resend it; poll `GET /api/v1/messages/{id}` or wait for the `message.sent` / `message.failed` webhook.
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": "5d0c…",
+    "status": "QUEUED",
+    "retryScheduled": true,
+    "error": { "code": "503", "message": "Service temporarily unavailable" }
+  }
+}
+```
+
+### Failure Response (HTTP 502 Bad Gateway)
+
+Returned when Meta rejects the message permanently (for example an unapproved template or a recipient outside the 24-hour window). `status` is `FAILED` and `error` carries Meta's code and message. These are not retried.
+
 ---
 
 ## 2. Get Message Details

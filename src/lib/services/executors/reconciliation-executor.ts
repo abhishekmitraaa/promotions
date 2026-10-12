@@ -14,10 +14,11 @@ import {
   EmailDeliveryStatus,
   EmailCampaignStatus,
   BackgroundJobStatus,
+  MessageStatus,
 } from "@prisma/client";
 import { CampaignTriggerService } from "./campaign-trigger-service";
 import { logger } from "../../logger";
-import { SEND_OUTCOME_UNKNOWN, STALE_LOCK_MS, isSendInFlight } from "./claim-lock";
+import { SEND_IN_FLIGHT_SUFFIX, SEND_OUTCOME_UNKNOWN, STALE_LOCK_MS, isSendInFlight } from "./claim-lock";
 
 export interface ReconciliationOptions {
   staleMinutes?: number;
@@ -33,6 +34,8 @@ export interface ReconciliationReport {
   recoveredJobs: number;
   failedJobs: number;
   completedCampaigns: number;
+  /** WhatsApp messages flagged SEND_OUTCOME_UNKNOWN in this sweep. */
+  failedMessages?: number;
   durationMs?: number;
   error?: string;
 }
@@ -51,6 +54,7 @@ export class ReconciliationExecutor {
     let recoveredJobs = 0;
     let failedJobs = 0;
     let completedCampaigns = 0;
+    let failedMessages = 0;
 
     logger.info(`[ReconciliationExecutor] Starting reconciliation sweep (cutoff: ${staleCutoff.toISOString()})`);
 
@@ -179,6 +183,28 @@ export class ReconciliationExecutor {
       }
     }
 
+    // 2b. Outbound WhatsApp messages whose send was in flight when the invocation died.
+    //     Meta may have accepted them, so they are flagged for review and never re-sent.
+    //     (Stale locks without the in-flight marker are simply reclaimed by the retry executor.)
+    if (!checkTime()) {
+      const flagged = await prisma.message.updateMany({
+        where: {
+          status: MessageStatus.QUEUED,
+          lockedAt: { lt: staleCutoff },
+          lockedBy: { endsWith: SEND_IN_FLIGHT_SUFFIX },
+        },
+        data: {
+          status: MessageStatus.FAILED,
+          errorCode: SEND_OUTCOME_UNKNOWN,
+          errorMessage: "Worker stopped during the provider send. The message may or may not have been delivered; not retried automatically.",
+          failedAt: new Date(),
+          lockedAt: null,
+          lockedBy: null,
+        },
+      });
+      failedMessages = flagged.count;
+    }
+
     // 3. Stale BackgroundJob in 'PROCESSING'
     if (checkTime()) {
       logger.warn("[ReconciliationExecutor] Deadline reached before stale job check.");
@@ -253,6 +279,7 @@ export class ReconciliationExecutor {
       recoveredJobs,
       failedJobs,
       completedCampaigns,
+      failedMessages,
       durationMs: Date.now() - startTime,
     };
 

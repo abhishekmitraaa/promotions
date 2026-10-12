@@ -27,6 +27,9 @@ import { ReconciliationExecutor, ReconciliationReport } from "./executors/reconc
 import { PermanentError } from "../errors/job-errors";
 import { logger } from "../logger";
 import { STALE_LOCK_MS, newClaimToken, staleLockCutoff } from "./executors/claim-lock";
+import { WhatsAppMessageExecutor } from "./executors/whatsapp-message-executor";
+import { GmailBounceDetector, GmailBounceScanReport } from "./executors/gmail-bounce-detector";
+import { WHATSAPP_MESSAGE_JOB_TYPE } from "./message-service";
 
 export interface ServerlessProcessingOptions {
   transactionalBatchSize?: number;
@@ -77,6 +80,8 @@ export interface ServerlessProcessingResult {
       durationMs?: number;
       error?: string;
     } | null;
+    /** Mailbox bounce scan; only runs with reconciliation and when GMAIL_BOUNCE_DETECTION=true. */
+    gmailBounces?: GmailBounceScanReport;
   };
 }
 
@@ -261,6 +266,13 @@ export class ServerlessJobProcessor {
             if (!eventId) throw new PermanentError("Missing eventId in payload");
             const execResult = await EmailEventProcessor.process({ eventId });
             if (execResult && typeof execResult === "object" && "reason" in execResult && execResult.reason === "CONTENTION_LOCK_HELD") {
+              yieldContention = true;
+            }
+          } else if (job.type === WHATSAPP_MESSAGE_JOB_TYPE) {
+            const messageId = payload.messageId as string;
+            if (!messageId) throw new PermanentError("Missing messageId in payload");
+            const execResult = await WhatsAppMessageExecutor.execute({ messageId, maxAttempts: job.maxAttempts });
+            if (execResult.skipped && execResult.reason === "CONTENTION_LOCK_HELD") {
               yieldContention = true;
             }
           } else {
@@ -843,6 +855,18 @@ export class ServerlessJobProcessor {
       reconciliationResult = await this.reconcileJobs(STALE_LOCK_MS / 60000, isTimeExhausted);
     }
 
+    // Stage 6: Gmail mailbox bounce scan (same 5-minute cadence as reconciliation; no-op unless enabled)
+    let gmailBounces: GmailBounceScanReport | undefined;
+    if (options.runReconciliation && !isTimeExhausted()) {
+      try {
+        gmailBounces = await GmailBounceDetector.run({ isTimeExhausted });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        logger.error("[ServerlessProcessor] Gmail bounce scan error:", err);
+        gmailBounces = { enabled: true, providersChecked: 0, providersSkipped: 0, bouncesRecorded: 0, errors: [message], durationMs: 0 };
+      }
+    }
+
     const durationMs = Date.now() - startTime;
     logger.info(`[ServerlessProcessor] Execution cycle completed in ${durationMs}ms`);
 
@@ -856,6 +880,7 @@ export class ServerlessJobProcessor {
     if (automationEnrollments.error) errors.push(`automationEnrollments: ${automationEnrollments.error}`);
     if (events.error) errors.push(`events: ${events.error}`);
     if (reconciliationResult?.error) errors.push(`reconciliation: ${reconciliationResult.error}`);
+    if (gmailBounces?.errors.length) errors.push(`gmailBounces: ${gmailBounces.errors.join("; ")}`);
 
     const timingBreakdownMs = {
       webhooks: webhooks.durationMs || 0,
@@ -885,6 +910,7 @@ export class ServerlessJobProcessor {
         automationEnrollments,
         events,
         reconciliation: reconciliationResult,
+        ...(gmailBounces?.enabled ? { gmailBounces } : {}),
       },
     };
   }

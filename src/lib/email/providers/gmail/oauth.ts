@@ -12,6 +12,9 @@ import { EmailProviderStatus, EmailProviderType } from "@prisma/client";
 import { GMAIL_SEND_SCOPE, GOOGLE_TOKEN_ENDPOINT } from "./gmail-provider";
 import { logger } from "../../../logger";
 
+// Kept here (not imported from the bounce detector) to avoid a provider -> service import cycle
+const GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly";
+
 export const GOOGLE_AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth";
 export const GOOGLE_USERINFO_ENDPOINT = "https://www.googleapis.com/oauth2/v2/userinfo";
 
@@ -384,6 +387,8 @@ export async function verifyOAuthState(
  * Generates the Google OAuth 2.0 authorization URL.
  * Requests offline access with prompt=consent to ensure a refresh token is returned.
  * Requests minimum scopes: gmail.send (dispatch only) and userinfo.email (verified address lookup).
+ * When GMAIL_BOUNCE_DETECTION=true it also requests gmail.readonly, which the bounce detector
+ * needs to read mailer-daemon notifications from the sending mailbox.
  */
 export async function generateGoogleAuthUrl(options: GoogleAuthUrlOptions): Promise<string> {
   const state = await createOAuthState(options.tenantId, options.adminUserId, options.stateSecret);
@@ -392,7 +397,11 @@ export async function generateGoogleAuthUrl(options: GoogleAuthUrlOptions): Prom
     client_id: options.googleClientId,
     redirect_uri: options.redirectUri,
     response_type: "code",
-    scope: `${GMAIL_SEND_SCOPE} https://www.googleapis.com/auth/userinfo.email`,
+    scope: [
+      GMAIL_SEND_SCOPE,
+      "https://www.googleapis.com/auth/userinfo.email",
+      ...(process.env.GMAIL_BOUNCE_DETECTION === "true" ? [GMAIL_READONLY_SCOPE] : []),
+    ].join(" "),
     access_type: "offline",
     prompt: "consent",
     state,
@@ -474,6 +483,8 @@ export async function setupGmailProvider(options: {
   senderEmail: string;
   senderName?: string;
   isDefault?: boolean;
+  /** Space-separated scopes Google actually granted (from the token response). */
+  grantedScope?: string;
 }) {
   const credentialsPayload = JSON.stringify({
     clientId: options.googleClientId,
@@ -505,6 +516,9 @@ export async function setupGmailProvider(options: {
       senderName: options.senderName || options.senderEmail,
       encryptedCredentials,
       encryptedOAuthRefreshToken,
+      configMetadata: JSON.stringify({
+        grantedScopes: (options.grantedScope || "").split(/\s+/).filter(Boolean),
+      }),
       lastVerifiedAt: new Date(),
     },
   });

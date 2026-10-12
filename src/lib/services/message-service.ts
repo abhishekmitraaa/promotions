@@ -3,9 +3,19 @@ import { normalizePhoneNumber } from "../crypto";
 import { sendWhatsAppMessage } from "../whatsapp/client";
 import { MetaOutboundPayload, MetaTemplateComponent } from "../whatsapp/types";
 import { CreateMessageInput } from "../validation/messages";
-import { MessageDirection, MessageStatus, MessageType, Prisma } from "@prisma/client";
+import { BackgroundJobStatus, Message, MessageDirection, MessageStatus, MessageType, Prisma } from "@prisma/client";
 import { WhatsAppApiError } from "../whatsapp/errors";
 import { dispatchOutgoingWebhooks } from "../webhooks/dispatcher";
+import { logger } from "../logger";
+import { newClaimToken, sendInFlightToken } from "./executors/claim-lock";
+
+/** Total send attempts per outbound WhatsApp message (first attempt + automatic retries). */
+export const WHATSAPP_MAX_SEND_ATTEMPTS = 5;
+
+/** Delay before the first automatic retry; later retries back off in the job processor. */
+const WHATSAPP_FIRST_RETRY_DELAY_MS = 30 * 1000;
+
+export const WHATSAPP_MESSAGE_JOB_TYPE = "WHATSAPP_MESSAGE";
 
 export interface SendMessageOptions {
   idempotencyKey?: string;
@@ -25,6 +35,8 @@ export interface SendMessageResult {
   };
   errorCode?: string;
   errorMessage?: string;
+  /** True when a transient provider failure left the message QUEUED with an automatic retry scheduled. */
+  retryScheduled?: boolean;
 }
 
 export function formatTemplateComponents(
@@ -49,9 +61,49 @@ export function formatTemplateComponents(
   return rawParameters as MetaTemplateComponent[];
 }
 
+/**
+ * Builds the Meta Cloud API payload from a persisted outbound message (used by the first
+ * attempt and by retries, so both send exactly what was stored).
+ */
+export function buildMetaPayload(
+  message: Pick<Message, "type" | "to" | "body" | "templateName" | "templateLanguage" | "templateParameters">
+): MetaOutboundPayload {
+  if (message.type === MessageType.TEMPLATE) {
+    let rawParameters: unknown[] | null = null;
+    if (message.templateParameters) {
+      try {
+        rawParameters = JSON.parse(message.templateParameters) as unknown[];
+      } catch {
+        rawParameters = null;
+      }
+    }
+    const components = formatTemplateComponents(rawParameters);
+    return {
+      messaging_product: "whatsapp",
+      recipient_type: "individual",
+      to: message.to,
+      type: "template",
+      template: {
+        name: message.templateName!,
+        language: { code: message.templateLanguage || "en_US" },
+        ...(components ? { components } : {}),
+      },
+    };
+  }
+
+  return {
+    messaging_product: "whatsapp",
+    recipient_type: "individual",
+    to: message.to,
+    type: "text",
+    text: { preview_url: false, body: message.body! },
+  };
+}
+
 export class MessageService {
   /**
    * Dispatch an outbound WhatsApp message (Text or Template) scoped to an ApiClient.
+   * A transient provider failure leaves the message QUEUED and schedules an automatic retry.
    */
   static async send(
     input: CreateMessageInput,
@@ -84,11 +136,17 @@ export class MessageService {
       }
     }
 
-    // 2. Create QUEUED Record in DB (Handling concurrent idempotency race conditions)
+    // 2. Create QUEUED Record in DB (Handling concurrent idempotency race conditions).
+    //    The row carries an in-flight marker for the first attempt: if this invocation dies
+    //    mid-send, reconciliation flags the message instead of anything re-sending it.
+    const inFlightToken = sendInFlightToken(newClaimToken("wa-sync"));
     let messageRecord;
     try {
       messageRecord = await prisma.message.create({
         data: {
+          attemptCount: 1,
+          lockedBy: inFlightToken,
+          lockedAt: new Date(),
           clientId,
           direction: MessageDirection.OUTBOUND,
           type: typeEnum,
@@ -131,37 +189,8 @@ export class MessageService {
       throw createErr;
     }
 
-    // 3. Construct Meta API Payload
-    let metaPayload: MetaOutboundPayload;
-
-    if (typeEnum === MessageType.TEMPLATE) {
-      const components = formatTemplateComponents(input.templateParameters);
-
-      metaPayload = {
-        messaging_product: "whatsapp",
-        recipient_type: "individual",
-        to: normalizedTo,
-        type: "template",
-        template: {
-          name: input.templateName!,
-          language: {
-            code: input.templateLanguage || "en_US",
-          },
-          ...(components ? { components } : {}),
-        },
-      };
-    } else {
-      metaPayload = {
-        messaging_product: "whatsapp",
-        recipient_type: "individual",
-        to: normalizedTo,
-        type: "text",
-        text: {
-          preview_url: false,
-          body: input.body!,
-        },
-      };
-    }
+    // 3. Construct Meta API Payload from the persisted record
+    const metaPayload = buildMetaPayload(messageRecord);
 
     // 4. Dispatch to Meta WhatsApp Cloud API
     try {
@@ -174,6 +203,8 @@ export class MessageService {
           providerMessageId: providerId,
           status: MessageStatus.SENT,
           sentAt: new Date(),
+          lockedAt: null,
+          lockedBy: null,
         },
       });
 
@@ -208,6 +239,47 @@ export class MessageService {
           ? err.message
           : "Failed to send message via Meta WhatsApp API";
 
+      // Transient provider failure: keep the message QUEUED and hand it to the job processor
+      if (err instanceof WhatsAppApiError && err.isTransient) {
+        try {
+          await prisma.$transaction([
+            prisma.message.update({
+              where: { id: messageRecord.id },
+              data: { errorCode, errorMessage, lockedAt: null, lockedBy: null },
+            }),
+            prisma.backgroundJob.create({
+              data: {
+                clientId,
+                type: WHATSAPP_MESSAGE_JOB_TYPE,
+                status: BackgroundJobStatus.QUEUED,
+                payload: JSON.stringify({ messageId: messageRecord.id, clientId }),
+                availableAt: new Date(Date.now() + WHATSAPP_FIRST_RETRY_DELAY_MS),
+                scheduledAt: new Date(Date.now() + WHATSAPP_FIRST_RETRY_DELAY_MS),
+                maxAttempts: WHATSAPP_MAX_SEND_ATTEMPTS,
+                deduplicationKey: `whatsapp-message-${messageRecord.id}`,
+              },
+            }),
+          ]);
+          logger.warn(
+            `[MessageService] Transient WhatsApp failure for message ${messageRecord.id} (${errorCode}). Retry scheduled.`
+          );
+          return {
+            id: messageRecord.id,
+            providerMessageId: null,
+            status: MessageStatus.QUEUED,
+            to: messageRecord.to,
+            type: messageRecord.type,
+            retryScheduled: true,
+            error: { code: errorCode, message: errorMessage },
+            errorCode,
+            errorMessage,
+          };
+        } catch (scheduleErr) {
+          // Could not persist the retry: fall through and report an honest failure
+          logger.error(`[MessageService] Could not schedule retry for message ${messageRecord.id}:`, scheduleErr);
+        }
+      }
+
       const failedRecord = await prisma.message.update({
         where: { id: messageRecord.id },
         data: {
@@ -215,6 +287,8 @@ export class MessageService {
           errorCode,
           errorMessage,
           failedAt: new Date(),
+          lockedAt: null,
+          lockedBy: null,
         },
       });
 

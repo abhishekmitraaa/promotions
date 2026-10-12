@@ -145,6 +145,7 @@ export async function GET(req: NextRequest) {
       googleClientId,
       googleClientSecret,
       refreshToken: tokens.refreshToken,
+      grantedScope: tokens.scope,
       senderEmail: tokens.email,
       isDefault: true,
     });
@@ -221,6 +222,7 @@ export async function POST(req: NextRequest) {
       googleClientId: clientId,
       googleClientSecret: clientSecret,
       refreshToken: tokens.refreshToken,
+      grantedScope: tokens.scope,
       senderEmail: tokens.email,
       isDefault: isDefault ?? true,
     });

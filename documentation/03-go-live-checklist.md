@@ -13,7 +13,7 @@ Since this hub serves **one project only**, skip anything your project doesn't u
 | WhatsApp notifications only | Steps 1, 2, 4, 6, 7 | Gmail (3), campaign fixes |
 | OTP login over WhatsApp | Steps 1, 2 (including the `auth_otp_code` template), 4, 6, 7 | Gmail (3) |
 | Transactional email (receipts, alerts) | Steps 1, 3, 4, 5 (fixes 1–6, 11), 6, 7 | Meta (2) |
-| Marketing campaigns | Everything, including all code fixes and DNS | — |
+| Marketing campaigns | Everything, plus DNS and `GMAIL_BOUNCE_DETECTION=true` | — |
 
 For a single project, transactional WhatsApp + OTP + transactional email is the realistic scope. The campaigns/automations/segments engine is large and has the most bugs. Leave it unused unless you need it.
 
@@ -32,8 +32,7 @@ Vercel → project `whatsapp-hub` → Settings → Environment Variables (Produc
 | `INTERNAL_PROCESSOR_SECRET` | Must equal the Vault secret `internal_processor_secret` (it already works: cron gets 200) |
 | `EMAIL_CREDENTIALS_ENCRYPTION_KEY` | ≥ 32 random chars. **Set it once and never change it**, or stored Gmail tokens become undecryptable |
 | `EMAIL_TRACKING_SECRET` | ≥ 32 random chars |
-| `WORKERLESS_MODE` | Optional: workerless is now the default (review #12). Never set it to `false` in Vercel |
-| `REDIS_URL` | Optional. Without it, rate limiting uses PostgreSQL. If you do set it, that Redis must stay up: login/OTP fail closed when a configured Redis is down |
+| `GMAIL_BOUNCE_DETECTION` = `true` | Optional. Turns on bounce detection. Set it **before** connecting Google, because it adds the `gmail.readonly` permission to the consent screen |
 | `DEV_ALLOW_UNCONFIGURED_META` | Ignored in production (forced `false`), so no need to set it |
 
 Generate secrets with: `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`
@@ -77,7 +76,7 @@ Gmail is the **only** working email provider in the code.
 3. Create Credentials → OAuth client ID → **Web application**:
    - Authorized redirect URI: `https://promotions-lime.vercel.app/api/admin/email/providers/google/callback`
 4. In Vercel, set `GMAIL_CLIENT_ID` and `GMAIL_CLIENT_SECRET`. Note the names: **not** `GOOGLE_*` as `.env.example` says. Redeploy.
-5. In the dashboard, go to **Email → Providers → Connect Google** and complete consent with the sending account.
+5. In the dashboard, go to **Email → Providers → Connect Google** and complete consent with the sending account. If `GMAIL_BOUNCE_DETECTION=true`, the consent screen also asks for read access to the mailbox; that is what lets the hub see bounce notices. For a personal Gmail account this is a *restricted* permission: it works while the Google app is in Testing mode with you as a test user, but publishing the app would need Google's security review.
 6. Under **Email → Sender identities**, add the sending address and mark it verified.
 7. If you send from your own domain (Workspace), publish SPF, DKIM (Google Admin → Apps → Gmail → Authenticate email) and DMARC records, then run the domain check under **Email → Deliverability**.
 8. Know the limits: about **500 recipients/day** for personal Gmail and about **2,000/day** for Workspace. That's fine for transactional email from one project, but not for bulk marketing. For bulk you'd need an SES/Resend provider, which doesn't exist yet.
@@ -104,23 +103,26 @@ Store the `whub_…` key in your project's secrets as e.g. `WHATSAPP_HUB_API_KEY
 
 ---
 
-## Step 5 — Fix the code defects that block reliable delivery 💻 ✅ Done (12 Oct 2026)
+## Step 5 — Code work 💻 ✅ Done (12 Oct 2026), not yet deployed
 
-All 15 findings from [02-code-review-2026-10-12.md](02-code-review-2026-10-12.md) are fixed, plus the rate-limiter-without-Redis gap and the Prisma transient-error classification. Remaining to do: **commit and push to `main`**. Vercel auto-deploys, and no database migration is required.
+All review findings are fixed, Redis and the old worker are removed, and WhatsApp retries and Gmail bounce detection are added. Details: [02-code-review-2026-10-12.md](02-code-review-2026-10-12.md). The work is on branch `fix/review-2026-10-12`.
 
-### Code still open (found 12 Oct, after the review fixes)
+**To deploy it (order matters):**
 
-| Item | Why it matters | Needed for |
-|---|---|---|
-| **Gmail OAuth state is stored in Redis** (`RedisOAuthTransactionStore` in `src/lib/email/providers/gmail/oauth.ts`) | With no Redis, "Connect Google" fails. The in-memory fallback can't work on Vercel because the start and callback requests hit different instances. Move the store to PostgreSQL (small new table + migration) | **Blocker for email** |
-| **Legacy BullMQ worker code** (~3,900 lines in `src/lib/email/queue/` and `workers/`, plus `bullmq`/`ioredis` deps and the `worker:email` script) | No external worker is used. Remove it, rewrite queue health/metrics on PostgreSQL, and move `checkAndCompleteCampaign` out of `campaign-worker.ts`. 11 test suites (including the certification suite) exercise logic through these workers and must be ported to the executors | Cleanup, not a blocker |
-| Gmail bounces/complaints are not detected | Gmail has no delivery webhooks. A Pub/Sub verifier exists, but nothing reads mailbox history for bounce messages, so automatic suppression never fires | Campaigns only |
-| WhatsApp sends have no automatic retry | `/api/v1/messages` calls Meta synchronously. A transient failure is stored as `FAILED`, and resending with the same idempotency key returns that `FAILED` record | Optional |
-| SMS / push adapters | Honest stubs that return `PROVIDER_UNAVAILABLE`; not wired to any API route | Not needed |
+1. Apply the two new migrations to production **first**. If the new code deploys before them, every query on `Message` fails.
+   ```bash
+   DATABASE_URL="<prod pooled url>" DIRECT_URL="<prod direct url>" npx prisma migrate deploy
+   ```
+   They add the `OAuthState` table and three columns on `Message` (`attemptCount`, `lockedAt`, `lockedBy`). Both are additive and safe to apply while the old code is running.
+2. Merge the branch into `main` and push. Vercel deploys automatically.
+3. In Vercel, delete `REDIS_URL` and `WORKERLESS_MODE` if they exist (nothing reads them now).
+4. Check the cron responses in Supabase: status 200, and 500 only when a processing category fails.
 
-After deploy:
-- Delivery rows can now end as `FAILED / SEND_OUTCOME_UNKNOWN` (worker died mid-send). Check them by hand; see the runbook query.
-- The cron endpoint now returns HTTP 500 when a processing category fails, so `net._http_response` status codes become a real health signal.
+**Behavior to expect after deploy**
+- `POST /api/v1/messages` can return **202** with `status: "QUEUED"` and `retryScheduled: true` when Meta is temporarily unavailable. Treat 202 as accepted; your app does not need to retry.
+- Rows can end as `FAILED / SEND_OUTCOME_UNKNOWN` (email or WhatsApp) when an invocation died mid-send. Check those by hand; see the runbook query.
+
+**Still not built (by choice):** SMS, push, SES/SMTP providers; spam-complaint detection for Gmail (Google does not expose it).
 
 ---
 

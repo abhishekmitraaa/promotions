@@ -17,14 +17,14 @@ WhatsApp Hub is a self-hosted **communication gateway**. Your other application 
 
 | Area | What exists | Entry points |
 |---|---|---|
-| WhatsApp messaging | Text and template messages via Meta Cloud API; idempotency; 60 req/min rate limit | `POST /api/v1/messages`, `GET /api/v1/messages/[id]`, `GET /api/v1/conversations` |
+| WhatsApp messaging | Text and template messages via Meta Cloud API; idempotency; 60 req/min rate limit; automatic retry (up to 5 attempts) on temporary Meta failures | `POST /api/v1/messages`, `GET /api/v1/messages/[id]`, `GET /api/v1/conversations` |
 | Inbound WhatsApp | Webhook verification (GET) and HMAC-SHA256 signed event intake (POST) | `/api/webhooks/whatsapp` |
 | OTP | Hashed codes, expiry (300 s), max 5 attempts, sent as a WhatsApp **template** (`auth_otp_code`) | `POST /api/v1/otp/request`, `POST /api/v1/otp/verify` |
 | Email send | `TRANSACTIONAL` / `PROMOTIONAL`; durable `EmailDelivery` + `BackgroundJob` | `POST /api/v1/email/send` |
 | Email provider | **Gmail / Google Workspace only** (OAuth2, encrypted refresh token). SES verifier code exists but no SES sender | `/api/admin/email/providers/*` |
 | Audience | Contacts, CSV import, lists, dynamic segments, suppressions, unsubscribe | `/api/email/contacts`, `/lists`, `/segments`, `/suppressions`, `/unsubscribe/[token]` |
 | Campaigns & automations | Templates with versions, scheduled campaigns, pause/resume/cancel, journeys | `/api/email/campaigns/*`, `/api/email/automations/*`, `/api/email/templates/*` |
-| Tracking | Signed open/click tokens, provider event webhooks, analytics | `/api/email/track/*`, `/api/email/webhooks/[provider]`, `/api/email/analytics` |
+| Tracking | Signed open/click tokens, provider event webhooks, analytics; optional Gmail bounce detection by mailbox scan (`GMAIL_BOUNCE_DETECTION`) | `/api/email/track/*`, `/api/email/webhooks/[provider]`, `/api/email/analytics` |
 | Outbound webhooks | HMAC-signed delivery to your app, retries, SSRF checks | `/api/admin/webhooks/*` |
 | Dashboard | Login, password reset, email verification, Admin/Viewer RBAC, API keys, users, settings | `/login`, `/dashboard/*`, `/api/auth/*`, `/api/admin/*` |
 | Health | Liveness/config check | `GET /api/health` |
@@ -50,7 +50,7 @@ WhatsApp Hub is a self-hosted **communication gateway**. Your other application 
                                    ServerlessJobProcessor.processAll()
                                    ├─ webhooks (outbound deliveries)
                                    ├─ background jobs → executors (email, campaign recipient, automation, event)
-                                   ├─ legacy direct sweeps (transactional emails, campaign recipients, events)
+                                   ├─ direct sweeps (transactional emails, campaign recipients, events)
                                    └─ reconciliation (stale locks)
                                                 │
                                                 ▼
@@ -59,17 +59,17 @@ WhatsApp Hub is a self-hosted **communication gateway**. Your other application 
 
 Key design choices:
 
-- **No always-on worker in production.** State lives in Postgres; short Vercel invocations do the work. BullMQ/Redis code (`workers/`, `src/lib/email/queue/*-worker.ts`) is legacy and only used with an explicit `WORKERLESS_MODE=false` plus a `REDIS_URL`.
-- **Rate limiting** uses Redis only when `REDIS_URL` is set; otherwise the Postgres `RateLimit` table. Auth and OTP limits fail closed rather than falling back to per-instance memory.
+- **No worker and no Redis.** State lives in Postgres; short Vercel invocations do the work. The BullMQ/Redis worker code was removed on 12 Oct 2026.
+- **Rate limiting** is an atomic counter in the Postgres `RateLimit` table. Auth and OTP limits fail closed if the database limiter is unavailable; other limits fall back to per-instance memory.
 - **Duplicate-send protection** lives in `src/lib/services/executors/claim-lock.ts`: conditional claims, token-bound writes, and an in-flight marker that stops an automatic re-send after a crash mid-send.
 - **Secrets at rest:** API keys are stored as HMAC(pepper) hashes; OTPs as hashes; webhook secrets and Gmail credentials are AES-256-GCM encrypted.
 - **Middleware** (`src/middleware.ts`) guards `/dashboard/*` and `/api/admin/*` with a signed session cookie; non-GET admin API calls require the `ADMIN` role.
 
-## Data model (Prisma, 27 models)
+## Data model (Prisma, 28 models)
 
 | Domain | Models |
 |---|---|
-| Auth | `User`, `UserSession` |
+| Auth | `User`, `UserSession`, `OAuthState` (one-time Google sign-in state) |
 | Tenancy & keys | `ApiClient` (tenant), `ApiKey`, `RateLimit` |
 | WhatsApp | `Message`, `MessageEvent`, `OtpVerification` |
 | Outbound webhooks | `WebhookEndpoint`, `WebhookDelivery` |
@@ -79,7 +79,7 @@ Key design choices:
 | Automation | `EmailAutomation`, `EmailAutomationEnrollment` |
 | Queue | `BackgroundJob` |
 
-Schema: `prisma/schema.prisma`. Migrations: `prisma/migrations/` (10 migrations, latest `20261007000000_durable_background_jobs_and_indexes`).
+Schema: `prisma/schema.prisma`. Migrations: `prisma/migrations/` (12 migrations; the two newest, `20261012000000_oauth_state_store` and `20261012010000_whatsapp_message_retry`, are **not yet applied to production**).
 
 ## Repository layout (`whatsapp-hub/`)
 
@@ -91,12 +91,11 @@ Schema: `prisma/schema.prisma`. Migrations: `prisma/migrations/` (10 migrations,
 | `src/app/dashboard/` | Dashboard UI pages |
 | `src/lib/env.ts` | Zod-validated config (core vars only; many email vars are read directly from `process.env`) |
 | `src/lib/whatsapp/` | Meta Cloud API client |
-| `src/lib/email/` | Provider registry, Gmail provider, templates, tracking, webhook verifiers, legacy queue |
+| `src/lib/email/` | Provider registry, Gmail provider, templates, tracking, webhook verifiers, PostgreSQL job queue (`queue/`) |
 | `src/lib/services/` | Business logic; `serverless-job-processor.ts` and `executors/` are the async engine |
 | `src/lib/communication/` | Multi-channel adapter layer |
 | `prisma/` | Schema and migrations |
 | `scripts/` | Setup, key creation, admin seeding, ~40 `verify-*.ts` test suites |
-| `workers/` | Legacy BullMQ worker entry (not used in production) |
 | `.github/workflows/` | `email-tests.yml`, `rbac-tests.yml` |
 
 ## History (from git)
@@ -110,4 +109,6 @@ Schema: `prisma/schema.prisma`. Migrations: `prisma/migrations/` (10 migrations,
 | `598b612` | Performance: 60 s max duration, `bom1`, Prisma reuse, staged parallelism |
 | `c5ccaf9`, `1509601` | Atomic claim / cross-path race fix (**see code review — introduced new bugs**) |
 | `7ee228b`, `bb76d0c` | Docs and audit only |
-| 12 Oct 2026 (working tree) | Fixes for all 15 review findings, plus the rate-limiter-without-Redis and Prisma transient-error gaps; 29 new regression assertions |
+| `39e1e19` (12 Oct, branch `fix/review-2026-10-12`) | Fixes for all 15 review findings, rate-limiter and Prisma transient-error gaps, documentation set |
+| `7fe5e46` (same branch) | Redis and legacy BullMQ worker removed; OAuth state in Postgres; consent/unsubscribe/tracking restored in executors |
+| next commit (same branch) | WhatsApp automatic retries; Gmail bounce detection |

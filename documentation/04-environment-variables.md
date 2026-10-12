@@ -1,6 +1,6 @@
 # 04 — Environment Variables (what the code actually reads)
 
-Taken from `src/lib/env.ts` plus every direct `process.env.*` read in `src/` and `workers/` (12 Oct 2026). `.env.example` is **out of date**. Use this table instead.
+Taken from `src/lib/env.ts` plus every direct `process.env.*` read in `src/` (12 Oct 2026, after the Redis and worker removal). `.env.example` now matches this table.
 
 "Prod" column: **Required** = the app won't start or the feature fails without it. **Recommended** = works without it but behaves badly. **Optional** = has a sensible default.
 
@@ -57,6 +57,7 @@ Taken from `src/lib/env.ts` plus every direct `process.env.*` read in `src/` and
 |---|---|---|
 | `GMAIL_CLIENT_ID` | **Required for email** | `.env.example` wrongly says `GOOGLE_CLIENT_ID` |
 | `GMAIL_CLIENT_SECRET` | **Required for email** | `.env.example` wrongly says `GOOGLE_CLIENT_SECRET` |
+| `GMAIL_BOUNCE_DETECTION` | Optional | `true` enables the 5-minute mailbox scan for bounce notices and adds `gmail.readonly` to the Google consent screen. Set before connecting Google |
 | `GMAIL_WEBHOOK_VERIFICATION_TOKEN` | Optional | Only if receiving Gmail push events without a per-tenant secret |
 | `SES_WEBHOOK_SECRET` | Not used | SES verifier exists, but there is no SES sender |
 
@@ -64,9 +65,7 @@ Taken from `src/lib/env.ts` plus every direct `process.env.*` read in `src/` and
 
 | Variable | Prod | Notes |
 |---|---|---|
-| `WORKERLESS_MODE` | Optional | Workerless is the default. Only `false` (plus `REDIS_URL`) switches to legacy BullMQ, which needs a running worker. **Never set `false` on Vercel** |
-| `REDIS_URL` | Optional | If set, it is the rate-limit backend, and login/OTP fail closed whenever it is unreachable. If unset, rate limiting uses the PostgreSQL `RateLimit` table |
-| `EMAIL_WORKER_CONCURRENCY`, `EMAIL_EVENTS_CONCURRENCY`, `EMAIL_CAMPAIGN_CONCURRENCY`, `EMAIL_QUEUE_MAX_RATE`, `EMAIL_QUEUE_MAX_ATTEMPTS`, `EMAIL_QUEUE_BACKOFF_MS`, `EMAIL_CAMPAIGN_MAX_RATE` | Not used | Legacy BullMQ worker tuning only |
+| `WORKERLESS_MODE`, `REDIS_URL` | Not used | Removed 12 Oct 2026. Delete them from Vercel if present |
 | `OUTBOUND_WEBHOOK_TIMEOUT_MS` | Optional | Default 10000 |
 | `OUTBOUND_WEBHOOK_MAX_RETRIES` | Optional | Default 5 |
 

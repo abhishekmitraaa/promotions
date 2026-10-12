@@ -84,7 +84,8 @@ export async function POST(req: NextRequest) {
       idempotencyKey,
       clientId: auth.clientId,
     });
-    const statusCode = result.status === MessageStatus.FAILED ? 502 : 200;
+    // 202: a transient provider failure left the message queued with an automatic retry scheduled
+    const statusCode = result.status === MessageStatus.FAILED ? 502 : result.retryScheduled ? 202 : 200;
 
     const messageData = {
       id: result.id,
@@ -93,6 +94,7 @@ export async function POST(req: NextRequest) {
       to: result.to,
       type: result.type,
       sentAt: result.sentAt,
+      ...(result.retryScheduled ? { retryScheduled: true } : {}),
       ...(result.error ? { error: result.error } : {}),
     };
 

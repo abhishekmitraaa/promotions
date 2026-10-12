@@ -29,6 +29,13 @@
 > | D-12-09 | The Google OAuth GET callback takes client credentials from the environment only | Secrets must not appear in URLs or logs |
 > | D-12-10 | The hub serves **one owner project**. Multi-tenant features stay but only one `ApiClient` is expected; the campaign/automation engine is optional | Keeps the go-live scope to WhatsApp, OTP and transactional email (see [03-go-live-checklist.md](03-go-live-checklist.md)) |
 >
+> | D-12-11 | **No Redis and no worker process.** Job queue, rate limits and OAuth state are all PostgreSQL; `bullmq`/`ioredis` and the worker code are deleted | One project does not need a second datastore; Redis was a hidden dependency for login, OTP and Gmail connect. Supersedes Q-01, Q-13 and Q-16 |
+> | D-12-12 | Critical rate limits (login, OTP, verification) fail closed if the database limiter is unreachable; others degrade to per-instance memory | Never leave auth endpoints unprotected |
+> | D-12-13 | The provider's own `retryable` flag decides retry vs permanent failure | Message-keyword guessing misclassified Gmail timeouts and 500s |
+> | D-12-14 | Promotional email (single and campaign) always gets the consent check, RFC 8058 unsubscribe headers and open/click tracking; transactional email is never tracked | Restores behavior the old worker had; compliance |
+> | D-12-15 | WhatsApp sends retry automatically on temporary Meta failures (5 attempts); the API answers 202 with `retryScheduled` | The calling app should not need its own retry logic |
+> | D-12-16 | Gmail bounces are detected by scanning the sending mailbox, opt-in via `GMAIL_BOUNCE_DETECTION`, requiring `gmail.readonly` | Gmail has no delivery webhooks. Opt-in because the permission is broader than send-only. Complaints stay undetectable |
+>
 > **Still open:** §14.3 (no real production traffic yet), §14.4 (Gmail is the only real email adapter), §14.5 (admin DB role vs RLS), §14.6 (timeouts under load), §14.7 (all telemetry here predates 12 Oct and must be re-queried).
 
 ---
