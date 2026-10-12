@@ -53,6 +53,7 @@ function assert(condition: boolean, name: string) {
 interface MockMailboxMessage {
   id: string;
   threadId: string;
+  from?: string;
   subject: string;
   failedRecipients?: string;
   snippet: string;
@@ -114,7 +115,49 @@ async function main() {
     },
   });
 
+  const softDelivery = await prisma.emailDelivery.create({
+    data: {
+      clientId: tenantId,
+      providerType: EmailProviderType.GMAIL,
+      providerConfigId: readableConfig.id,
+      providerMessageId: `thread-soft-${run}`,
+      category: EmailType.TRANSACTIONAL,
+      from: "sender@example.com",
+      to: softEmail,
+      subject: "Welcome",
+      textContent: "Hello",
+      status: EmailDeliveryStatus.SENT,
+      sentAt: new Date(),
+    },
+  });
+  const victimEmail = `victim-${run}@example.com`;
+
   const mailbox: MockMailboxMessage[] = [
+    // Forged notice: not in the thread of anything we sent
+    {
+      id: `spoof-unthreaded-${run}`,
+      threadId: `thread-attacker-${run}`,
+      subject: "Delivery Status Notification (Failure)",
+      failedRecipients: victimEmail,
+      snippet: "Address not found 550 5.1.1",
+    },
+    // Forged notice: threaded with a real delivery but naming a different address
+    {
+      id: `spoof-wrong-recipient-${run}`,
+      threadId: `thread-soft-${run}`,
+      subject: "Delivery Status Notification (Failure)",
+      failedRecipients: victimEmail,
+      snippet: "Address not found 550 5.1.1",
+    },
+    // Forged notice: right thread and recipient, but not sent by a mailer-daemon/postmaster address
+    {
+      id: `spoof-sender-${run}`,
+      threadId: `thread-soft-${run}`,
+      from: '"mailer-daemon" <attacker@evil.example>',
+      subject: "Delivery Status Notification (Failure)",
+      failedRecipients: softEmail,
+      snippet: "Address not found 550 5.1.1",
+    },
     {
       id: `dsn-hard-${run}`,
       threadId: `thread-hard-${run}`,
@@ -164,7 +207,10 @@ async function main() {
     }
     const msg = mailbox.find((m) => m.id === idMatch[1]);
     if (!msg) return new Response("{}", { status: 404 });
-    const headers = [{ name: "Subject", value: msg.subject }];
+    const headers = [
+      { name: "Subject", value: msg.subject },
+      { name: "From", value: msg.from || "Mail Delivery Subsystem <mailer-daemon@googlemail.com>" },
+    ];
     if (msg.failedRecipients) headers.push({ name: "X-Failed-Recipients", value: msg.failedRecipients });
     return new Response(
       JSON.stringify({ id: msg.id, threadId: msg.threadId, snippet: msg.snippet, internalDate: String(Date.now()), payload: { headers } }),
@@ -211,6 +257,11 @@ async function main() {
     assert(hardSuppression !== null, "Hard-bounced address added to the suppression list");
     assert(softSuppression === null, "Soft bounce does not suppress the address");
     assert(delayEvent === null, "Delay notice produced no event");
+    const victimEvent = await prisma.emailEvent.findFirst({ where: { clientId: tenantId, recipient: victimEmail } });
+    const victimSuppression = await prisma.emailSuppression.findFirst({ where: { clientId: tenantId, email: victimEmail } });
+    assert(victimEvent === null && victimSuppression === null, "Forged notices cannot suppress an address we never emailed in that thread");
+    const softAfter = await prisma.emailDelivery.findUnique({ where: { id: softDelivery.id } });
+    assert(softAfter?.status === EmailDeliveryStatus.BOUNCED, `Genuine soft bounce still applied to its delivery (actual: ${softAfter?.status})`);
 
     // -------------------------------------------------------------------------
     console.log("\n▶ [Test 4] Re-scan is idempotent...");

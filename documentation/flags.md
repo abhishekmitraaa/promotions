@@ -1140,13 +1140,14 @@
   - Gaps found while porting the old worker's tests (production executors lacked them): promotional consent check, unsubscribe headers and tracking; campaign tracking; cross-tenant sender rejection; recurring-automation job type; provider `retryable` flag ignored; cancelled-campaign recipients reset to PENDING. All fixed. Full list in [02-code-review-2026-10-12.md](02-code-review-2026-10-12.md).
   - WhatsApp automatic retries (`WHATSAPP_MESSAGE` jobs, 5 attempts, in-flight marker, HTTP 202 with `retryScheduled`).
   - Gmail bounce detection by mailbox scan, opt-in via `GMAIL_BOUNCE_DETECTION` + `gmail.readonly`.
-- **Verification** (disposable Postgres on 127.0.0.1:5433, CI environment, no Redis): `npm test` (now 25 suites including `verify-whatsapp-retry` 16/16 and `verify-gmail-bounce-detection` 16/16), `test:email:certify` 130/130, `test:workerless` (66 + 61), `test:communication`, `test:guard`, `tsc --noEmit`, `eslint` and `next build` all pass.
+- **Verification** (disposable Postgres on 127.0.0.1:5433, CI environment, no Redis): `npm test` (now 25 suites including `verify-whatsapp-retry` 16/16 and `verify-gmail-bounce-detection` 18/18), `test:email:certify` 130/130, `test:workerless` (66 + 61), `test:communication`, `test:guard`, `tsc --noEmit`, `eslint` and `next build` all pass.
 - **Unresolved Concerns**:
   - **Deploy order:** migrations `20261012000000_oauth_state_store` and `20261012010000_whatsapp_message_retry` must be applied to production **before** this code deploys; otherwise every `Message` query fails. Neither has been applied to production.
   - The local disposable test database had drifted migration history (built with `db push`); `20261007000000_durable_background_jobs_and_indexes` was marked applied there with `prisma migrate resolve`. Production history was not touched or inspected.
   - API contract change: `POST /api/v1/messages` can now return 202 (`QUEUED`, `retryScheduled`). The owner's calling app must treat 202 as accepted.
   - `gmail.readonly` is a Google *restricted* scope. Fine for Workspace-internal apps and for personal Gmail in Testing mode; publishing an External app with it needs Google's security assessment.
   - Bounce classification (hard vs soft) is a heuristic on the notification text; spam complaints cannot be detected via Gmail.
+  - Security review (automated) flagged that forged mailer-daemon emails could suppress arbitrary addresses. Fixed: a notice is accepted only if it is in the Gmail thread of a delivery this tenant sent, names that delivery's recipient, and comes from a mailer-daemon/postmaster address (18 checks). Residual: SPF/DKIM of the notice is not verified, so the original recipient could forge a notice that suppresses only their own address.
   - Bounce detection and the 5-minute scan have only been exercised against a mocked Gmail API, never a real mailbox.
   - `scripts/verify-email-analytics.ts` (not in CI) fails on a non-existent `unsubscribedCount` field. Pre-existing, not fixed.
   - Still true: nothing has ever been delivered in production; Vercel environment variables and live Supabase state were not inspected this session.

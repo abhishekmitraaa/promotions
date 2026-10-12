@@ -8,8 +8,11 @@
  * - Opt-in: GMAIL_BOUNCE_DETECTION=true, and the provider must have granted gmail.readonly
  *   (recorded in EmailProviderConfig.configMetadata.grantedScopes at OAuth time).
  * - Idempotent: the event id is derived from the Gmail message id.
- * - A bounce is linked to its delivery through the Gmail thread (the notification is threaded
- *   with the original message); otherwise it is recorded for the tenant without a delivery.
+ * - Anyone can email the mailbox, so a notice is trusted only if ALL of these hold:
+ *     1. it is in the Gmail thread of a delivery this tenant actually sent,
+ *     2. the failed address equals that delivery's recipient,
+ *     3. its From address is a mailer-daemon / postmaster mailbox (exact local part, not a display name).
+ *   Anything else is ignored, so a forged notice cannot suppress an arbitrary address.
  * - Spam complaints are not available from the Gmail API and are not detected.
  */
 
@@ -64,6 +67,13 @@ function grantedScopes(configMetadata: string | null): string[] {
   } catch {
     return [];
   }
+}
+
+/** True when the From header's actual address (not its display name) is a bounce sender. */
+function isBounceSender(fromHeader: string | undefined): boolean {
+  if (!fromHeader) return false;
+  const address = (fromHeader.match(/<([^>]+)>/)?.[1] || fromHeader).trim().toLowerCase();
+  return /^(mailer-daemon|postmaster)@[a-z0-9.-]+$/.test(address);
 }
 
 function header(message: GmailMessageMetadata, name: string): string | undefined {
@@ -126,7 +136,7 @@ export class GmailBounceDetector {
           });
           if (seen) continue;
 
-          const detailUrl = `${GMAIL_MESSAGES_ENDPOINT}/${encodeURIComponent(id)}?format=metadata&metadataHeaders=X-Failed-Recipients&metadataHeaders=Subject`;
+          const detailUrl = `${GMAIL_MESSAGES_ENDPOINT}/${encodeURIComponent(id)}?format=metadata&metadataHeaders=X-Failed-Recipients&metadataHeaders=Subject&metadataHeaders=From`;
           const detailRes = await fetchFn(detailUrl, { headers: authHeaders });
           if (!detailRes.ok) {
             throw new Error(`Gmail message read failed (${detailRes.status})`);
@@ -138,6 +148,7 @@ export class GmailBounceDetector {
             .map((r) => r.trim())
             .filter(Boolean);
           if (failedRecipients.length === 0) continue; // not an attributable delivery failure
+          if (!isBounceSender(header(detail, "From"))) continue; // display-name spoof or unrelated sender
 
           const subject = header(detail, "Subject") || "";
           if (/\(delay\)|delayed/i.test(subject) && !/failure|undeliver/i.test(subject)) continue; // Gmail is still retrying
@@ -146,25 +157,30 @@ export class GmailBounceDetector {
           const bounceType: BounceClassification = HARD_BOUNCE_PATTERN.test(snippet) ? "HARD_BOUNCE" : "SOFT_BOUNCE";
           const occurredAt = detail.internalDate ? new Date(Number(detail.internalDate)) : new Date();
 
-          // The notification is threaded with the message that bounced
+          // A genuine notice is threaded with the message that bounced. Without a matching
+          // delivery of this tenant the notice is untrusted and ignored.
           const delivery = detail.threadId
             ? await prisma.emailDelivery.findFirst({
                 where: { clientId: config.clientId, providerMessageId: detail.threadId },
-                select: { id: true },
+                select: { id: true, to: true },
               })
             : null;
+          if (!delivery) continue;
+          const deliveredTo = normalizeEmail(delivery.to);
 
           for (let i = 0; i < failedRecipients.length; i++) {
+            // Only the address we actually sent to in this thread can be marked as bounced
+            if (normalizeEmail(failedRecipients[i]) !== deliveredTo) continue;
             const result = await EmailEventService.recordAndEnqueueEvent(
               {
                 providerType: EmailProviderType.GMAIL,
                 providerEventId: failedRecipients.length > 1 ? `${eventIdPrefix}-${i}` : eventIdPrefix,
                 eventType: EmailEventType.BOUNCED,
-                recipient: normalizeEmail(failedRecipients[i]),
+                recipient: deliveredTo,
                 occurredAt,
                 bounceType,
                 bounceReason: snippet || subject,
-                deliveryId: delivery?.id,
+                deliveryId: delivery.id,
                 rawPayload: { source: "gmail_mailbox_scan", gmailMessageId: id, gmailThreadId: detail.threadId, subject },
               },
               { id: config.id, clientId: config.clientId }
