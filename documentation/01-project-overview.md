@@ -111,4 +111,4 @@ Schema: `prisma/schema.prisma`. Migrations: `prisma/migrations/` (12 migrations;
 | `7ee228b`, `bb76d0c` | Docs and audit only |
 | `39e1e19` (12 Oct, branch `fix/review-2026-10-12`) | Fixes for all 15 review findings, rate-limiter and Prisma transient-error gaps, documentation set |
 | `7fe5e46` (same branch) | Redis and legacy BullMQ worker removed; OAuth state in Postgres; consent/unsubscribe/tracking restored in executors |
-| next commit (same branch) | WhatsApp automatic retries; Gmail bounce detection |
+| `f079a87` (same branch) | WhatsApp automatic retries; Gmail bounce detection |

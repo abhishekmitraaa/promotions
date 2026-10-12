@@ -1133,7 +1133,7 @@
 - **Resolved 2026-10-12** by the next entry (all four concerns).
 
 ### Entry: 2026-10-12 — Redis/Worker Removal, Restored Compliance Behavior, WhatsApp Retries, Gmail Bounce Detection
-- **Prompt / Phase**: Owner asked for every suggested fix and the optional items. Work is on branch `fix/review-2026-10-12` (commits `39e1e19`, `7fe5e46`, plus the WhatsApp/bounce commit). Not pushed.
+- **Prompt / Phase**: Owner asked for every suggested fix and the optional items. Work is on branch `fix/review-2026-10-12` (commits `39e1e19`, `7fe5e46`, `f079a87`). Not pushed.
 - **Status**: 🟡 In Progress (code complete and verified locally; deployment and external setup pending)
 - **Done**:
   - Gmail OAuth state moved to PostgreSQL (`OAuthState`); Redis, BullMQ, the worker code and `WORKERLESS_MODE`/`REDIS_URL` removed; queue, health/metrics and rate limiting are PostgreSQL-only.
