@@ -32,7 +32,8 @@ import { POST as createCampaignRoute, GET as listCampaignsRoute } from "../src/a
 import { PATCH as updateCampaignRoute } from "../src/app/api/email/campaigns/[id]/route";
 import { POST as sendCampaignRoute } from "../src/app/api/email/campaigns/[id]/send/route";
 import { EmailCampaignService } from "../src/lib/services/email-campaign-service";
-import { processPromotionalDeliveryJob } from "../src/lib/email/queue/promotional-delivery-worker";
+import { EmailDeliveryExecutor } from "../src/lib/services/executors/email-delivery-executor";
+import { PermanentError } from "../src/lib/errors/job-errors";
 import { getTransactionalQueue, getCampaignQueue } from "../src/lib/email/queue/queues";
 import {
   JOB_NAMES,
@@ -48,7 +49,6 @@ import {
   EmailType,
   EmailSuppressionReason,
 } from "@prisma/client";
-import { Job, UnrecoverableError } from "bullmq";
 
 let passed = 0;
 let failed = 0;
@@ -602,7 +602,7 @@ async function runHardeningSuite() {
 
   const campQueue = getCampaignQueue();
   const promoJob = await campQueue.getJob(getPromotionalJobId(promoData.deliveryId));
-  testAssert(promoJob !== null && promoJob !== undefined, "Promotional job enqueued in BullMQ campaign queue");
+  testAssert(promoJob !== null && promoJob !== undefined, "Promotional job enqueued in campaign queue");
   testAssert(promoJob?.name === JOB_NAMES.SEND_PROMOTIONAL, "Job name is send-promotional");
 
   // Worker Execution: Process Promotional Job
@@ -615,11 +615,9 @@ async function runHardeningSuite() {
       clientId: tenantAlpha.id,
       category: "PROMOTIONAL",
     },
-  } as unknown as Job<PromotionalJobData>;
+  };
 
-  const workerResult = await processPromotionalDeliveryJob(workerJob, {
-    providerOverride: mockProvider,
-  });
+  const workerResult = await EmailDeliveryExecutor.execute({ deliveryId: workerJob.data.deliveryId, providerOverride: mockProvider });
   testAssert(workerResult.success === true, "Worker processed promotional delivery successfully");
 
   const updatedDelivery = await prisma.emailDelivery.findUnique({
@@ -662,22 +660,11 @@ async function runHardeningSuite() {
 
   let workerThrewSuppression = false;
   try {
-    await processPromotionalDeliveryJob(
-      {
-        id: `job-supp-${suppressedDelivery.id}`,
-        name: JOB_NAMES.SEND_PROMOTIONAL,
-        data: {
-          deliveryId: suppressedDelivery.id,
-          clientId: tenantAlpha.id,
-          category: "PROMOTIONAL",
-        },
-      } as unknown as Job<PromotionalJobData>,
-      { providerOverride: mockProvider }
-    );
+    await EmailDeliveryExecutor.execute({ deliveryId: suppressedDelivery.id, providerOverride: mockProvider });
   } catch (err) {
-    workerThrewSuppression = err instanceof UnrecoverableError;
+    workerThrewSuppression = err instanceof PermanentError;
   }
-  testAssert(workerThrewSuppression, "Worker threw UnrecoverableError for suppressed recipient");
+  testAssert(workerThrewSuppression, "Executor threw PermanentError for suppressed recipient");
 
   const finalSuppDelivery = await prisma.emailDelivery.findUnique({
     where: { id: suppressedDelivery.id },
@@ -714,22 +701,11 @@ async function runHardeningSuite() {
 
   let workerThrewConsent = false;
   try {
-    await processPromotionalDeliveryJob(
-      {
-        id: `job-noconsent-${noConsentDelivery.id}`,
-        name: JOB_NAMES.SEND_PROMOTIONAL,
-        data: {
-          deliveryId: noConsentDelivery.id,
-          clientId: tenantAlpha.id,
-          category: "PROMOTIONAL",
-        },
-      } as unknown as Job<PromotionalJobData>,
-      { providerOverride: mockProvider }
-    );
+    await EmailDeliveryExecutor.execute({ deliveryId: noConsentDelivery.id, providerOverride: mockProvider });
   } catch (err) {
-    workerThrewConsent = err instanceof UnrecoverableError;
+    workerThrewConsent = err instanceof PermanentError;
   }
-  testAssert(workerThrewConsent, "Worker threw UnrecoverableError for contact without marketing consent");
+  testAssert(workerThrewConsent, "Executor threw PermanentError for contact without marketing consent");
 
   const finalConsentDelivery = await prisma.emailDelivery.findUnique({
     where: { id: noConsentDelivery.id },

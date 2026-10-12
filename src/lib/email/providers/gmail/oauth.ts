@@ -6,12 +6,10 @@
  */
 
 import crypto from "crypto";
-import { Redis } from "ioredis";
 import { prisma } from "../../../prisma";
 import { encryptProviderCredential, redactSecrets } from "../../../crypto";
 import { EmailProviderStatus, EmailProviderType } from "@prisma/client";
 import { GMAIL_SEND_SCOPE, GOOGLE_TOKEN_ENDPOINT } from "./gmail-provider";
-import { getRedisConnection } from "../../queue/connection";
 import { logger } from "../../../logger";
 
 export const GOOGLE_AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth";
@@ -65,100 +63,78 @@ export interface IOAuthTransactionStore {
   clear(): Promise<void>;
 }
 
-const LUA_CONSUME_OAUTH_STATE = `
-  local key = KEYS[1]
-  local now = tonumber(ARGV[1])
-  local raw = redis.call('GET', key)
+// Consumed/expired rows are kept briefly for replay detection, then pruned on later saves.
+const OAUTH_STATE_RETENTION_MS = 24 * 60 * 60 * 1000;
 
-  if not raw then
-    return cjson.encode({ status = 'NOT_FOUND' })
-  end
-
-  local data = cjson.decode(raw)
-
-  if data.used then
-    return cjson.encode({ status = 'ALREADY_USED', data = data })
-  end
-
-  if data.expiresAt and now > data.expiresAt then
-    return cjson.encode({ status = 'EXPIRED', data = data })
-  end
-
-  data.used = true
-  data.consumedAt = now
-
-  local ttl = redis.call('PTTL', key)
-  local encoded = cjson.encode(data)
-  if ttl > 0 then
-    redis.call('PSETEX', key, ttl, encoded)
-  else
-    redis.call('SET', key, encoded)
-  end
-
-  return cjson.encode({ status = 'OK', data = data })
-`;
+function toOAuthTransaction(row: {
+  nonce: string;
+  tenantId: string;
+  adminUserId: string | null;
+  createdAt: Date;
+  expiresAt: Date;
+  consumedAt: Date | null;
+}): OAuthTransaction {
+  return {
+    nonce: row.nonce,
+    tenantId: row.tenantId,
+    adminUserId: row.adminUserId || undefined,
+    createdAt: row.createdAt.getTime(),
+    expiresAt: row.expiresAt.getTime(),
+    used: row.consumedAt !== null,
+    consumedAt: row.consumedAt ? row.consumedAt.getTime() : undefined,
+  };
+}
 
 /**
- * Distributed Redis-backed store for OAuth transactions.
- * Supports multi-instance deployments, serverless functions, and process restarts.
- * Uses atomic Lua script for single-use consumption and race condition prevention.
+ * PostgreSQL-backed store for OAuth transactions (OAuthState table).
+ * Shared by every serverless instance and survives restarts. Single use is enforced by a
+ * conditional update, so concurrent callbacks with the same state cannot both succeed.
  */
-export class RedisOAuthTransactionStore implements IOAuthTransactionStore {
-  private client: Redis;
-  private keyPrefix: string;
-
-  constructor(client?: Redis, keyPrefix = "oauth:state:") {
-    this.client = client || getRedisConnection();
-    this.keyPrefix = keyPrefix;
-  }
-
-  private getKey(nonce: string): string {
-    return `${this.keyPrefix}${nonce}`;
-  }
-
+export class PostgresOAuthTransactionStore implements IOAuthTransactionStore {
   async save(nonce: string, tx: OAuthTransaction): Promise<void> {
-    const key = this.getKey(nonce);
-    const ttlMs = Math.max(1000, tx.expiresAt - Date.now());
-    await this.client.psetex(key, ttlMs, JSON.stringify(tx));
+    await prisma.oAuthState.create({
+      data: {
+        nonce,
+        tenantId: tx.tenantId,
+        adminUserId: tx.adminUserId || null,
+        createdAt: new Date(tx.createdAt),
+        expiresAt: new Date(tx.expiresAt),
+        consumedAt: tx.used ? new Date(tx.consumedAt || Date.now()) : null,
+      },
+    });
+    await prisma.oAuthState
+      .deleteMany({ where: { expiresAt: { lt: new Date(Date.now() - OAUTH_STATE_RETENTION_MS) } } })
+      .catch((err) => logger.warn("[OAuthTransactionStore] Pruning expired OAuth state failed:", redactSecrets(String(err))));
   }
 
   async get(nonce: string): Promise<OAuthTransaction | null> {
-    const key = this.getKey(nonce);
-    const raw = await this.client.get(key);
-    if (!raw) return null;
-    try {
-      return JSON.parse(raw) as OAuthTransaction;
-    } catch {
-      return null;
-    }
+    const row = await prisma.oAuthState.findUnique({ where: { nonce } });
+    if (!row || row.expiresAt.getTime() < Date.now()) return null;
+    return toOAuthTransaction(row);
   }
 
   async consume(nonce: string, now: number = Date.now()): Promise<OAuthConsumeResult> {
-    const key = this.getKey(nonce);
-    const resRaw = (await this.client.eval(
-      LUA_CONSUME_OAUTH_STATE,
-      1,
-      key,
-      now
-    )) as string;
-    try {
-      return JSON.parse(resRaw) as OAuthConsumeResult;
-    } catch (err) {
-      logger.error("[RedisOAuthTransactionStore] Failed to parse Lua consume result:", redactSecrets(String(err)));
-      return { status: "NOT_FOUND" };
-    }
+    const nowDate = new Date(now);
+    const claimed = await prisma.oAuthState.updateMany({
+      where: { nonce, consumedAt: null, expiresAt: { gte: nowDate } },
+      data: { consumedAt: nowDate },
+    });
+
+    const row = await prisma.oAuthState.findUnique({ where: { nonce } });
+    if (!row) return { status: "NOT_FOUND" };
+    const data = toOAuthTransaction(row);
+    if (claimed.count === 1) return { status: "OK", data };
+    if (row.consumedAt) return { status: "ALREADY_USED", data };
+    return { status: "EXPIRED", data };
   }
 
   async clear(): Promise<void> {
-    const keys = await this.client.keys(`${this.keyPrefix}*`);
-    if (keys.length > 0) {
-      await this.client.del(...keys);
-    }
+    await prisma.oAuthState.deleteMany({});
   }
 }
 
 /**
- * In-memory fallback store for standalone testing or development without Redis.
+ * In-memory store for unit tests only (not shared across serverless instances).
  */
 export class MemoryOAuthTransactionStore implements IOAuthTransactionStore {
   private store = new Map<string, OAuthTransaction>();
@@ -203,19 +179,14 @@ export class MemoryOAuthTransactionStore implements IOAuthTransactionStore {
 
 /**
  * Global shared registry for one-time OAuth transactions/nonces.
- * Delegates to Redis by default (or configured backend) for multi-instance production safety.
+ * Delegates to PostgreSQL by default (or a configured backend in tests).
  */
 export class OAuthTransactionStore {
   private static backend: IOAuthTransactionStore | null = null;
 
   static getBackend(): IOAuthTransactionStore {
     if (!this.backend) {
-      try {
-        this.backend = new RedisOAuthTransactionStore();
-      } catch (err) {
-        logger.warn("[OAuthTransactionStore] Redis connection unavailable, falling back to memory store:", redactSecrets(String(err)));
-        this.backend = new MemoryOAuthTransactionStore();
-      }
+      this.backend = new PostgresOAuthTransactionStore();
     }
     return this.backend;
   }

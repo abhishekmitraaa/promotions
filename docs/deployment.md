@@ -1,178 +1,45 @@
 # Deployment Architecture & Production Operations Guide
 
-This document describes the recommended production deployment topology for the WhatsApp & Email Infrastructure Platform.
+WhatsApp Hub runs entirely on two managed services. There is no Redis and no long-running worker process.
 
----
-
-## 1. System Topology Overview
-
-The platform uses a split architecture separating the serverless/stateless HTTP application from persistent background worker processes:
+| Layer | Service | Notes |
+|---|---|---|
+| Web app, public API, dashboard, job processor | **Vercel** (Next.js) | Processor routes pinned to `bom1` with `maxDuration: 60` (`vercel.json`) |
+| Database, durable job queue, rate limits, OAuth state | **Supabase PostgreSQL** (`ap-south-1`) | Pooled `DATABASE_URL` (6543) for runtime, `DIRECT_URL` (5432) for migrations |
+| Scheduler | **Supabase `pg_cron` + `pg_net`** | Calls the processor every minute; reconciliation every 5 minutes |
 
 ```
-                          ┌───────────────────────────┐
-                          │     External Clients      │
-                          │   (Web, Mobile, CRMs)     │
-                          └─────────────┬─────────────┘
-                                        │ HTTPS
-                                        ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                       HTTP APPLICATION LAYER (Netlify)                      │
-│                                                                             │
-│  - Next.js 16 App Router (Admin Dashboard UI & SSR)                         │
-│  - Inbound Webhook Handlers (/api/webhooks/whatsapp, /api/webhooks/email/*) │
-│  - Public REST APIs (/api/v1/messages, /api/v1/email/send, /api/v1/otp/*)   │
-│  - Admin REST APIs (/api/admin/*, /api/email/*)                             │
-│  - Producer: Enqueues jobs to Redis BullMQ                                  │
-└───────────────────────┬─────────────────────────────┬───────────────────────┘
-                        │                             │
-                        │ SQL (Port 6543)             │ Redis Protocol
-                        ▼                             ▼
-┌──────────────────────────────┐            ┌─────────────────────────────────┐
-│     DATABASE LAYER           │            │       MESSAGE QUEUE LAYER       │
-│  (Supabase PostgreSQL)       │            │  (Upstash / AWS ElastiCache)    │
-│                              │            │                                 │
-│ - Supavisor Connection Pool  │            │ - Redis 7+                      │
-│ - Row-Level Security (RLS)   │            │ - BullMQ Job Queues:            │
-│ - Multi-Tenant Isolation     │            │   * email-deliveries            │
-│ - Prisma Schema & Migrations │            │   * email-campaigns             │
-└──────────────▲───────────────┘            └────────────────┬────────────────┘
-               │                                             │
-               │ Direct SQL                                  │ Pop / Process Jobs
-               │                                             ▼
-┌──────────────┴──────────────────────────────────────────────────────────────┐
-│                    DEDICATED BACKGROUND WORKER LAYER                        │
-│                (Render, Fly.io, Railway, AWS ECS, or VM)                    │
-│                                                                             │
-│  - Node.js >= 22.12.0 long-running daemon (`npm run worker:email`)         │
-│  - BullMQ Queue Workers & Job Processors                                    │
-│  - Provider Abstraction Layer & Rate Limit Throttlers                       │
-│  - Dispatches to Email Providers (Google Workspace / Gmail API)             │
-│  - Updates EmailDelivery records & campaign metrics                         │
-└──────────────────────────────────────┬──────────────────────────────────────┘
-                                       │
-                                       ▼ HTTPS / OAuth2
-                        ┌─────────────────────────────┐
-                        │      EMAIL PROVIDERS        │
-                        │ (Google Workspace / Gmail)  │
-                        └─────────────────────────────┘
+Your app ──Bearer key──▶ Vercel /api/v1/*  ──writes──▶ PostgreSQL (EmailDelivery, BackgroundJob, ...)
+                                                              ▲
+Supabase pg_cron ──every 1 min──▶ POST /api/internal/process-jobs (Bearer secret from Vault)
+                                        └── claims due jobs (FOR UPDATE SKIP LOCKED) → executors → Gmail / Meta
 ```
 
----
+## Deploying a change
 
-## 2. Component Breakdown
+1. **Migrations first.** Builds do not apply schema changes. If the release adds a migration, run it against production before the code deploys:
+   ```bash
+   DATABASE_URL="<prod pooled url>" DIRECT_URL="<prod direct url>" npx prisma migrate deploy
+   ```
+2. **Push to `main`.** Vercel builds automatically (`prebuild` runs `prisma generate`).
+3. **Verify.** Check the new deployment's SHA in Vercel, the GitHub Actions run, and the cron responses (`net._http_response` should return 200; the processor returns 500 when a category fails).
 
-### A. HTTP Application (Netlify / Vercel / Cloud Run)
-- **Role**: Serves the Next.js frontend, public APIs, and incoming webhooks.
-- **Characteristics**: Stateless, auto-scaling, short-lived requests (maximum 10–30s execution timeout).
-- **CRITICAL NOTE**: **Never run BullMQ workers inside Netlify serverless functions.** Serverless functions freeze between requests and will abruptly terminate active email batches, drop Redis connections, and cause orphan delivery records.
+## Environment
 
-### B. PostgreSQL Database (Supabase)
-- **Role**: Primary system of record for all tenants, contacts, templates, campaigns, deliveries, audit logs, and WhatsApp messages.
-- **Connection Modes**:
-  - `DATABASE_URL`: Transaction pooled URL via Supavisor (port 6543) with `?pgbouncer=true` for application runtime.
-  - `DIRECT_URL`: Session direct connection (port 5432) for running migrations (`npx prisma migrate deploy`).
+See [`documentation/04-environment-variables.md`](../documentation/04-environment-variables.md) for every variable the code reads. Production refuses to start without strong `API_KEY_PEPPER`, `AUTH_SESSION_SECRET` and `WEBHOOK_SECRET_ENCRYPTION_KEY`.
 
-### C. Message Queue (Redis)
-- **Role**: High-throughput distributed queue for email dispatches, campaign recipient fan-outs, and delivery retries.
-- **Requirement**: Redis 6.2+ or 7+ (Upstash, AWS ElastiCache, Redis Enterprise, or managed DigitalOcean Redis).
-- **Environment Variable**: `REDIS_URL=rediss://default:password@your-redis-host:6379`.
+## Scheduler setup
 
-### D. Dedicated Background Worker
-- **Role**: Persistent daemon processing asynchronous email jobs.
-- **Command**:
-  ```bash
-  npm run worker:email
-  ```
-- **Deployment Targets**: Render Background Worker, Fly.io App, Railway Worker, AWS ECS Fargate, or Kubernetes StatefulSet/Deployment.
-- **Scaling**: Horizontally scalable across multiple worker nodes. Concurrency and rate limiting are handled deterministically through BullMQ.
+The cron job SQL (with the Vault-stored Bearer secret) is in [`docs/workerless-architecture.md`](workerless-architecture.md) §3.4. Monitoring queries, secret rotation and troubleshooting are in [`documentation/05-operations-runbook.md`](../documentation/05-operations-runbook.md).
 
-### E. Email Providers
-- **Role**: Outbound delivery endpoints.
-- **Production Scope**: Standardized exclusively on **Google Workspace / Gmail API via OAuth 2.0** (RFC 2822 base64url MIME transmission with automatic token refresh).
-- **Other Providers**: Amazon SES and generic SMTP adapters are currently out of scope and explicitly unavailable. The MOCK provider is strictly restricted to automated tests. Silent fallback across providers is prohibited.
+## Local disposable test infrastructure
 
----
-
-## 3. Environment Configuration for Production
-
-Ensure all mandatory environment variables are set in both the HTTP application and the Worker daemon:
+Destructive test suites need a throwaway PostgreSQL only:
 
 ```bash
-# Node Environment
-NODE_ENV=production
-APP_URL=https://hub.yourdomain.com
-
-# PostgreSQL Connection
-DATABASE_URL="postgresql://postgres:[PASSWORD]@[HOST]:6543/postgres?pgbouncer=true"
-DIRECT_URL="postgresql://postgres:[PASSWORD]@[HOST]:5432/postgres"
-
-# Redis Queue Connection
-REDIS_URL="rediss://default:[PASSWORD]@[HOST]:6379"
-REDIS_HOST="your-redis-host"
-REDIS_PORT=6379
-
-# Worker Concurrency Tuning
-EMAIL_WORKER_CONCURRENCY=5
-
-# Security & Encryption Secrets (All must be 32+ characters)
-AUTH_SESSION_SECRET="production-session-secret-at-least-32-chars-long"
-API_KEY_PEPPER="production-api-key-pepper-at-least-32-chars-long"
-WEBHOOK_SECRET_ENCRYPTION_KEY="production-webhook-encryption-key-32-chars"
-INTERNAL_WORKER_SECRET="production-internal-worker-secret-32-chars"
-
-# Google Workspace / Gmail OAuth (Provider Settings)
-GOOGLE_CLIENT_ID="your-client-id.apps.googleusercontent.com"
-GOOGLE_CLIENT_SECRET="GOCSPX-your-client-secret"
-GOOGLE_REDIRECT_URI="https://hub.yourdomain.com/api/email/providers/oauth/callback"
-
-# WhatsApp Meta Cloud API (Optional if only using Email)
-META_GRAPH_API_VERSION="v22.0"
-META_ACCESS_TOKEN="EAA..."
-META_PHONE_NUMBER_ID="100..."
-META_WABA_ID="100..."
-META_APP_SECRET="app-secret"
-META_WEBHOOK_VERIFY_TOKEN="custom-verify-token"
-DEV_ALLOW_UNCONFIGURED_META=false
+docker run -d --name disposable-email-postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=email_test -p 5433:5432 postgres:16
+DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5433/email_test \
+DIRECT_URL=postgresql://postgres:postgres@127.0.0.1:5433/email_test npx prisma migrate deploy
 ```
 
----
-
-## 4. Disposable Testing Infrastructure for Local & CI Certification
-
-For running full certification passes without touching production Supabase:
-
-```bash
-# 1. Start disposable PostgreSQL (e.g. port 5433)
-docker run -d --name disposable-email-postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=email_test -p 5433:5432 postgres:16-alpine
-
-# 2. Start disposable Redis (port 6379)
-docker run -d --name disposable-redis -p 6379:6379 redis:7-alpine
-
-# 3. Push schema to disposable database
-DATABASE_URL="postgresql://postgres:postgres@127.0.0.1:5433/email_test" npx prisma db push
-
-# 4. Run full certification suite (Flows A through P)
-npm run test:email:certify
-```
-
----
-
-## 5. Production Deployment Checklist
-
-1. [ ] **Database Migration**:
-   ```bash
-   npx prisma migrate deploy
-   ```
-2. [ ] **Seed Administrator**:
-   ```bash
-   DEMO_ADMIN_PASSWORD="YourStrongPassword" npm run auth:seed-admin
-   ```
-3. [ ] **Deploy Web App**:
-   Deploy Next.js application to Netlify or your preferred serverless hosting platform.
-4. [ ] **Deploy Worker**:
-   Deploy `npm run worker:email` as a continuous daemon process on your worker platform.
-5. [ ] **Configure Google OAuth**:
-   - Authorized redirect URI: `https://hub.yourdomain.com/api/email/providers/oauth/callback`
-   - Scope: `https://www.googleapis.com/auth/gmail.send`
-6. [ ] **Verify Worker Health**:
-   Check the Admin Dashboard under **Communication -> Email -> Dashboard** to ensure the queue and worker status report green.
+`scripts/test-db-guard.ts` blocks the production project unconditionally.

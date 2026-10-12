@@ -78,7 +78,7 @@ This document describes the production-grade email deliverability subsystem for 
   - **Immediate Action**: Auto-creates `EmailSuppression` record (`reason: HARD_BOUNCE`) and sets `EmailContact.status = BOUNCED`.
 - **Soft Bounce Handling**:
   - Ingestion of transient 4.x.x events (e.g. `452 4.2.2 Mailbox full`, rate limits).
-  - Triggers BullMQ worker retry with exponential backoff.
+  - Re-queues the delivery with exponential backoff (processed by the cron-driven job processor).
   - **Does NOT** permanently suppress on first occurrence.
 - **Complaint Handling (Spam Reports / FBL)**:
   - Ingestion of user spam reports or ISP feedback loops.

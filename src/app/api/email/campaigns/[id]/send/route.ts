@@ -20,7 +20,7 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
     `rl:tenant:${auth.clientId}:campaign_send`,
     10,
     60000,
-    { criticality: "HIGH", syncToDb: true }
+    { criticality: "HIGH" }
   );
   if (!tenantLimit.success) {
     return rateLimitResponse(

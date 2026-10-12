@@ -130,8 +130,8 @@ export default function EmailDashboardPage() {
           const json = await qRes.json();
           if (json.data) {
             setQueueHealth({
-              status: json.data.status || (json.data.redis?.connected ? "HEALTHY" : "DEGRADED"),
-              workerStatus: json.data.redis?.connected ? "READY" : "OFFLINE",
+              status: json.data.status || "DEGRADED",
+              workerStatus: json.data.processor?.status || "UNKNOWN",
               transactionalWaiting: json.data.queues?.transactional?.waiting || 0,
               campaignWaiting: json.data.queues?.campaign?.waiting || 0,
               failedJobs:
@@ -305,8 +305,8 @@ export default function EmailDashboardPage() {
         {/* Queue Health */}
         <div className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-5">
           <div className="flex items-center justify-between">
-            <h2 className="text-sm font-semibold text-white">BullMQ Asynchronous Queues</h2>
-            <span className="text-xs text-zinc-500">Standalone Workers</span>
+            <h2 className="text-sm font-semibold text-white">Background Job Queues</h2>
+            <span className="text-xs text-zinc-500">Supabase Cron Processor</span>
           </div>
           <div className="mt-4 space-y-3">
             <div className="flex items-center justify-between text-sm py-1 border-b border-zinc-800/60">
@@ -320,7 +320,7 @@ export default function EmailDashboardPage() {
               </span>
             </div>
             <div className="flex items-center justify-between text-sm py-1 border-b border-zinc-800/60">
-              <span className="text-zinc-400">Worker Status:</span>
+              <span className="text-zinc-400">Processor Status:</span>
               <span className={`font-mono text-xs font-medium ${queueHealth.workerStatus === "READY" ? "text-emerald-400" : "text-amber-400"}`}>
                 {queueHealth.workerStatus}
               </span>

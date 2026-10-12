@@ -18,6 +18,7 @@ import {
   EmailDelivery,
   EmailDeliveryStatus,
   EmailProviderType,
+  Prisma,
 } from "@prisma/client";
 import { providerRegistry } from "../../email/registry";
 import { EmailProvider, EmailSendResult } from "../../email/types";
@@ -28,9 +29,11 @@ import {
   RetryableError,
   PermanentError,
   classifyJobError,
+  providerFailureError,
 } from "../../errors/job-errors";
 import { logger } from "../../logger";
 import { getPublicAppUrl } from "../../env";
+import { EmailTrackingService } from "../../email/tracking/email-tracking-service";
 import { CampaignTriggerService } from "./campaign-trigger-service";
 import {
   newClaimToken,
@@ -54,6 +57,13 @@ export interface ExecuteCampaignRecipientResult {
   skipped?: boolean;
   reason?: string;
 }
+
+/** Delivery states that mean the provider never accepted this message. */
+const UNSENT_DELIVERY_STATUSES: EmailDeliveryStatus[] = [
+  EmailDeliveryStatus.QUEUED,
+  EmailDeliveryStatus.PROCESSING,
+  EmailDeliveryStatus.FAILED,
+];
 
 export class CampaignRecipientExecutor {
   /**
@@ -174,6 +184,7 @@ export class CampaignRecipientExecutor {
 
     let sent = false;
     let deliveryRecorded = false;
+    let pendingDeliveryId: string | null = null;
     let campaignId = recipient.campaignId;
 
     try {
@@ -261,6 +272,13 @@ export class CampaignRecipientExecutor {
 
       if (campaign.senderIdentityId && campaign.senderIdentity) {
         const senderIdentity = campaign.senderIdentity;
+        // Defense in depth: never send as another tenant's identity, even if the DB was tampered with
+        if (senderIdentity.clientId !== clientId) {
+          throw new PermanentError(
+            `Sender identity '${senderIdentity.id}' does not belong to tenant '${clientId}'.`,
+            "SENDER_IDENTITY_TENANT_MISMATCH"
+          );
+        }
         if (!senderIdentity.verified) {
           throw new PermanentError(`Sender identity '${senderIdentity.email}' is not verified.`);
         }
@@ -304,20 +322,23 @@ export class CampaignRecipientExecutor {
         );
       }
 
-      // 9. Idempotency: a delivery row for this recipient means an earlier attempt already sent it.
+      // 9. Idempotency: a delivery for this recipient that reached the provider means an earlier
+      //    attempt already sent it. (Rows still QUEUED/PROCESSING/FAILED never reached a send that
+      //    succeeded: the recipient's in-flight marker would otherwise have blocked this claim.)
       const idempotencyKey = `campaign-${campaign.id}-recipient-${recipient.id}`;
       let delivery: EmailDelivery | null = await prisma.emailDelivery.findUnique({
         where: { clientId_idempotencyKey: { clientId, idempotencyKey } },
       });
 
-      if (delivery) {
+      if (delivery && !UNSENT_DELIVERY_STATUSES.includes(delivery.status)) {
         sent = true;
         deliveryRecorded = true;
         logger.info(
           `[CampaignRecipientExecutor] Recipient ${recipient.id} already has delivery ${delivery.id}; finishing bookkeeping without re-sending.`
         );
       } else {
-        // 10. Mark send in flight, then dispatch
+        // 10. Mark send in flight on the recipient and its delivery (created first so tracking
+        //     tokens can reference the delivery id)
         const inFlightToken = sendInFlightToken(lockToken);
         const marked = await prisma.emailCampaignRecipient.updateMany({
           where: owned(),
@@ -329,46 +350,76 @@ export class CampaignRecipientExecutor {
         }
         ownerToken = inFlightToken;
 
+        const inFlightDelivery = {
+          status: EmailDeliveryStatus.PROCESSING,
+          lockedBy: inFlightToken,
+          lockedAt: new Date(),
+          lastAttemptAt: new Date(),
+        };
+        delivery = delivery
+          ? await prisma.emailDelivery.update({
+              where: { id: delivery.id },
+              data: { ...inFlightDelivery, attemptCount: { increment: 1 }, errorCode: null, errorMessage: null },
+            })
+          : await prisma.emailDelivery.create({
+              data: {
+                ...inFlightDelivery,
+                attemptCount: 1,
+                clientId,
+                providerType,
+                campaignId: campaign.id,
+                campaignRecipientId: recipient.id,
+                category: "PROMOTIONAL",
+                from: fromAddress,
+                to: recipient.email,
+                replyTo: replyToAddress,
+                subject: rendered.subject,
+                htmlContent: rendered.html,
+                textContent: rendered.text,
+                templateId: campaign.templateVersion.templateId,
+                templateVersionId: campaign.templateVersion.id,
+                senderIdentityId: campaign.senderIdentityId,
+                idempotencyKey,
+              },
+            });
+        pendingDeliveryId = delivery.id;
+
+        // Signed open pixel + wrapped links bound to this delivery
+        const trackedHtml = rendered.html
+          ? EmailTrackingService.prepareTrackedHtml(rendered.html, clientId, delivery.id, { baseUrl: getPublicAppUrl() })
+          : rendered.html;
+
         const sendResult: EmailSendResult = await provider.send({
           clientId,
           from: fromAddress,
           to: recipient.email,
           subject: rendered.subject,
-          html: rendered.html,
+          html: trackedHtml,
           text: rendered.text,
           replyTo: replyToAddress,
           type: "PROMOTIONAL",
           headers: unsubscribeHeaders,
           idempotencyKey,
+          campaignId: campaign.id,
+          campaignRecipientId: recipient.id,
         });
 
         if (!sendResult.success) {
-          throw new Error(sendResult.error?.message || "Provider returned failure");
+          throw providerFailureError(sendResult.error);
         }
         sent = true;
 
-        // 11. Persist Delivery
-        delivery = await prisma.emailDelivery.create({
+        // 11. Record the delivery as SENT
+        delivery = await prisma.emailDelivery.update({
+          where: { id: delivery.id },
           data: {
-            clientId,
-            providerType,
-            providerMessageId: sendResult.providerMessageId || null,
-            campaignId: campaign.id,
-            campaignRecipientId: recipient.id,
-            category: "PROMOTIONAL",
-            from: fromAddress,
-            to: recipient.email,
-            replyTo: replyToAddress,
-            subject: rendered.subject,
-            htmlContent: rendered.html,
-            textContent: rendered.text,
-            templateId: campaign.templateVersion.templateId,
-            templateVersionId: campaign.templateVersion.id,
-            senderIdentityId: campaign.senderIdentityId,
             status: EmailDeliveryStatus.SENT,
             sentAt: new Date(),
+            providerType,
+            providerMessageId: sendResult.providerMessageId || null,
             smtpCode: sendResult.error?.statusCode ? String(sendResult.error.statusCode) : null,
-            idempotencyKey,
+            lockedAt: null,
+            lockedBy: null,
           },
         });
         deliveryRecorded = true;
@@ -451,6 +502,12 @@ export class CampaignRecipientExecutor {
             lockedBy: null,
           },
         });
+        await releasePendingDelivery(pendingDeliveryId, ownerToken, {
+          status: EmailDeliveryStatus.QUEUED,
+          nextAttemptAt,
+          errorCode: classification.code,
+          errorMessage: classification.message,
+        });
 
         logger.warn(
           `[CampaignRecipientExecutor] Recipient ${recipient.id} failed transiently (attempt ${currentAttempt}/${maxAttempts}). Retrying at ${nextAttemptAt.toISOString()}`
@@ -474,6 +531,12 @@ export class CampaignRecipientExecutor {
           lockedBy: null,
         },
       });
+      await releasePendingDelivery(pendingDeliveryId, ownerToken, {
+        status: EmailDeliveryStatus.FAILED,
+        failedAt: new Date(),
+        errorCode: classification.code,
+        errorMessage: classification.message,
+      });
 
       try {
         await CampaignTriggerService.checkAndCompleteCampaign(campaignId);
@@ -491,4 +554,19 @@ export class CampaignRecipientExecutor {
       );
     }
   }
+}
+
+/** Clears the in-flight marker on a delivery whose send did not go out, recording the outcome. */
+async function releasePendingDelivery(
+  deliveryId: string | null,
+  inFlightToken: string,
+  data: Prisma.EmailDeliveryUpdateManyMutationInput
+): Promise<void> {
+  if (!deliveryId) return;
+  await prisma.emailDelivery
+    .updateMany({
+      where: { id: deliveryId, status: EmailDeliveryStatus.PROCESSING, lockedBy: inFlightToken },
+      data: { ...data, lockedAt: null, lockedBy: null },
+    })
+    .catch((err) => logger.error(`[CampaignRecipientExecutor] Could not release delivery ${deliveryId}:`, err));
 }

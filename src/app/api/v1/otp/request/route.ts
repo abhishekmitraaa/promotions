@@ -43,7 +43,6 @@ export async function POST(req: NextRequest) {
   const phoneRateLimit = await checkRateLimit(`otp_req_phone_${normalizedPhone}`, 5, 60000, {
     criticality: "CRITICAL",
     failClosed: true,
-    syncToDb: true,
   });
   if (!phoneRateLimit.success) {
     return NextResponse.json(
@@ -65,7 +64,6 @@ export async function POST(req: NextRequest) {
   const clientRateLimit = await checkRateLimit(`otp_req_client_${auth.clientId}`, 100, 60000, {
     criticality: "CRITICAL",
     failClosed: true,
-    syncToDb: true,
   });
   if (!clientRateLimit.success) {
     return NextResponse.json(
@@ -89,7 +87,6 @@ export async function POST(req: NextRequest) {
     const ipRateLimit = await checkRateLimit(`otp_req_ip_${clientIp}`, 20, 60000, {
       criticality: "CRITICAL",
       failClosed: true,
-      syncToDb: true,
     });
     if (!ipRateLimit.success) {
       return NextResponse.json(

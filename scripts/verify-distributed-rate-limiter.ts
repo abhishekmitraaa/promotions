@@ -6,7 +6,7 @@
  * 2. Strict tenant quota isolation (Tenant A cannot consume Tenant B's quota).
  * 3. Instance-hopping defense (IP-aware rate limits persist across instances).
  * 4. Per-recipient abuse protection (harassment & spam prevention).
- * 5. Redis failure modes (fail-closed for CRITICAL endpoints, safe degradation for standard).
+ * 5. Backend failure modes (fail-closed for CRITICAL endpoints, safe degradation for standard).
  * 6. Standardized HTTP 429/503 headers (Retry-After, X-RateLimit-*).
  * 7. End-to-end API integration tests.
  */
@@ -19,19 +19,16 @@ if (!process.env.DIRECT_URL || process.env.DIRECT_URL.includes("peqynzeioiauynfp
   process.env.DIRECT_URL = "postgresql://postgres:postgres@127.0.0.1:5433/email_test";
 }
 
-import { Redis } from "ioredis";
+import { PrismaClient } from "@prisma/client";
 import { prisma } from "../src/lib/prisma";
 import {
   checkRateLimit,
-  setRateLimiterRedisClient,
   setRateLimiterForceFailure,
   getClientIp,
   rateLimitResponse,
   getRateLimiterHealth,
 } from "../src/lib/rate-limit";
 import { NextRequest } from "next/server";
-
-const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
 
 async function main() {
   console.log("\n========================================================");
@@ -43,37 +40,24 @@ async function main() {
   // ---------------------------------------------------------------------------
   // [1] Health Check & Connectivity
   // ---------------------------------------------------------------------------
-  console.log("-> [Step 1] Verifying Rate Limiter Health & Redis Backend...");
+  console.log("-> [Step 1] Verifying Rate Limiter Health & PostgreSQL Backend...");
   const health = await getRateLimiterHealth();
   assert.equal(health.status, "HEALTHY", "Rate limiter health should be HEALTHY");
-  assert.equal(health.backend, "redis", "Rate limiter backend should be Redis");
-  assert.equal(health.redisConnected, true, "Redis should be connected");
+  assert.equal(health.backend, "postgres", "Rate limiter backend should be PostgreSQL");
   console.log(`  [PASS] Rate limiter is healthy (latency: ${health.latencyMs}ms).`);
 
   // ---------------------------------------------------------------------------
   // [2] Multi-Instance Concurrency Safety Simulation
   // ---------------------------------------------------------------------------
-  console.log("-> [Step 2] Testing Multi-Instance Concurrency (4 Simulated Serverless Nodes)...");
-  // Instantiate 4 distinct Redis client connections to simulate 4 serverless instances
-  const instance1 = new Redis(REDIS_URL);
-  const instance2 = new Redis(REDIS_URL);
-  const instance3 = new Redis(REDIS_URL);
-  const instance4 = new Redis(REDIS_URL);
-  const instances = [instance1, instance2, instance3, instance4];
-
+  console.log("-> [Step 2] Testing Concurrency (40 simultaneous requests over the connection pool)...");
   const concurrentKey = `concurrent_${runId}`;
   const CONCURRENT_LIMIT = 10;
   const TOTAL_REQUESTS = 40;
 
-  // Fire 40 simultaneous requests randomly distributed across all 4 instances
-  const promises = Array.from({ length: TOTAL_REQUESTS }, async (_, i) => {
-    const selectedInstance = instances[i % instances.length];
-    setRateLimiterRedisClient(selectedInstance);
-    return checkRateLimit(concurrentKey, CONCURRENT_LIMIT, 60000);
-  });
-
-  const results = await Promise.all(promises);
-  setRateLimiterRedisClient(undefined); // Reset to default
+  // Fire 40 simultaneous requests; each is a single atomic upsert on the shared RateLimit row
+  const results = await Promise.all(
+    Array.from({ length: TOTAL_REQUESTS }, () => checkRateLimit(concurrentKey, CONCURRENT_LIMIT, 60000))
+  );
 
   const successfulRequests = results.filter((r) => r.success);
   const rejectedRequests = results.filter((r) => !r.success);
@@ -95,7 +79,7 @@ async function main() {
     assert.equal(rejected.remaining, 0, "Rejected request must report 0 remaining");
   }
   console.log(
-    `  [PASS] Concurrency verified: exactly ${successfulRequests.length}/${TOTAL_REQUESTS} allowed across 4 instances.`
+    `  [PASS] Concurrency verified: exactly ${successfulRequests.length}/${TOTAL_REQUESTS} allowed.`
   );
 
   // ---------------------------------------------------------------------------
@@ -128,24 +112,22 @@ async function main() {
   const ipLimitKey = `rl:ip:${attackerIp}:${runId}`;
   const ipLimit = 3;
 
-  // Instance 1 consumes quota
-  setRateLimiterRedisClient(instance1);
+  // This instance consumes the quota
   for (let i = 0; i < ipLimit; i++) {
     const r = await checkRateLimit(ipLimitKey, ipLimit, 60000);
-    assert.equal(r.success, true, `Instance 1 request ${i + 1} should succeed`);
+    assert.equal(r.success, true, `Request ${i + 1} should succeed`);
   }
+  const blocked = await checkRateLimit(ipLimitKey, ipLimit, 60000);
+  assert.equal(blocked.success, false, "Further requests from the attacker must be blocked");
 
-  // Attacker hops to Instance 2
-  setRateLimiterRedisClient(instance2);
-  const hopInstance2 = await checkRateLimit(ipLimitKey, ipLimit, 60000);
-  assert.equal(hopInstance2.success, false, "Instance 2 must block attacker hopping from Instance 1");
-
-  // Attacker hops to Instance 3
-  setRateLimiterRedisClient(instance3);
-  const hopInstance3 = await checkRateLimit(ipLimitKey, ipLimit, 60000);
-  assert.equal(hopInstance3.success, false, "Instance 3 must block attacker hopping from Instance 2");
-
-  setRateLimiterRedisClient(undefined);
+  // A separate instance (its own database client, no shared memory) sees the same counter
+  const otherInstance = new PrismaClient();
+  try {
+    const shared = await otherInstance.rateLimit.findUnique({ where: { key: ipLimitKey } });
+    assert(shared !== null && shared.count > ipLimit, "Counter is stored in PostgreSQL and visible to every instance");
+  } finally {
+    await otherInstance.$disconnect();
+  }
   console.log("  [PASS] Instance-hopping defense verified: IP counter is durable across instances.");
 
   // ---------------------------------------------------------------------------
@@ -180,11 +162,11 @@ async function main() {
   console.log("  [PASS] Per-recipient abuse protection verified.");
 
   // ---------------------------------------------------------------------------
-  // [6] Redis Failure Modes & Criticality Tiers
+  // [6] Backend Failure Modes & Criticality Tiers
   // ---------------------------------------------------------------------------
-  console.log("-> [Step 6] Testing Redis Failure Modes (Critical vs Standard Tiers)...");
+  console.log("-> [Step 6] Testing Backend Failure Modes (Critical vs Standard Tiers)...");
 
-  // Force Redis failure simulation
+  // Force database limiter failure simulation
   setRateLimiterForceFailure(true);
 
   // 6a. CRITICAL endpoint (Auth/OTP/Verification) MUST FAIL CLOSED
@@ -192,7 +174,7 @@ async function main() {
     criticality: "CRITICAL",
     failClosed: true,
   });
-  assert.equal(criticalResult.success, false, "CRITICAL endpoint must FAIL CLOSED when Redis is down");
+  assert.equal(criticalResult.success, false, "CRITICAL endpoint must FAIL CLOSED when the limiter backend is down");
   assert.equal(criticalResult.failedClosed, true, "failedClosed flag must be set to true");
   assert.equal(criticalResult.error, "RATE_LIMITER_UNAVAILABLE", "Error code must indicate unavailability");
 
@@ -201,23 +183,20 @@ async function main() {
   assert.equal(criticalHttpRes.status, 503, "Fail-closed response must return HTTP 503 Service Unavailable");
   assert(criticalHttpRes.headers.get("Retry-After") !== null, "Retry-After header must be present on 503");
 
-  // 6b. STANDARD / LOW endpoint DEGRADES SAFELY to secondary backend (Postgres/Memory)
+  // 6b. STANDARD / LOW endpoint DEGRADES SAFELY to the per-instance memory limiter
   const standardResult = await checkRateLimit(`webhook_test_${runId}`, 100, 60000, {
     criticality: "LOW",
     failClosed: false,
   });
   assert.equal(standardResult.success, true, "LOW/STANDARD endpoint must degrade safely without failing");
-  assert(
-    standardResult.backend === "postgres" || standardResult.backend === "memory",
-    "Degraded backend must be postgres or memory"
-  );
+  assert.equal(standardResult.backend, "memory", "Degraded backend must be memory");
 
-  // Restore Redis
+  // Restore backend
   setRateLimiterForceFailure(false);
   const restoredResult = await checkRateLimit(`restored_test_${runId}`, 10, 60000);
-  assert.equal(restoredResult.success, true, "Rate limiter recovers when Redis is restored");
-  assert.equal(restoredResult.backend, "redis", "Backend recovers to Redis");
-  console.log("  [PASS] Redis failure behavior verified: Critical fail-closed, Standard safe degradation.");
+  assert.equal(restoredResult.success, true, "Rate limiter recovers when the backend is restored");
+  assert.equal(restoredResult.backend, "postgres", "Backend recovers to PostgreSQL");
+  console.log("  [PASS] Failure behavior verified: Critical fail-closed, Standard safe degradation.");
 
   // ---------------------------------------------------------------------------
   // [7] Standardized HTTP Headers & Retry-After
@@ -342,10 +321,6 @@ async function main() {
   await prisma.apiKey.deleteMany({ where: { clientId: testTenant.id } });
   await prisma.apiClient.delete({ where: { id: testTenant.id } });
 
-  // Close simulated instances
-  for (const inst of instances) {
-    await inst.quit().catch(() => inst.disconnect());
-  }
 
   console.log("\n========================================================");
   console.log("  ALL DISTRIBUTED RATE LIMITING TESTS PASSED (100%)!");

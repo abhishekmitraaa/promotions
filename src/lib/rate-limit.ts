@@ -1,21 +1,18 @@
 /**
- * Distributed, Shared Abuse Protection & Rate Limiting Engine
+ * Shared Abuse Protection & Rate Limiting Engine (PostgreSQL)
  *
- * Implements high-throughput, race-safe sliding-window rate limiting backed by Redis.
- * Ensures consistent, deterministic enforcement across multi-instance serverless deployments:
+ * Fixed-window counters in the PostgreSQL RateLimit table, updated with a single atomic upsert,
+ * so limits hold across every serverless instance:
  * - Prevents instance-hopping bypass attacks.
  * - Prevents cross-tenant quota depletion.
  * - Provides per-recipient abuse protection against harassment/denial-of-service.
- * - Enforces strict fail-closed security for critical endpoints (auth, OTP, verification).
- * - Gracefully degrades safely for lower-criticality endpoints during Redis connectivity issues.
- * - Synchronizes with PostgreSQL RateLimit model for auditability and backwards-compatibility.
+ * - Fails closed for critical endpoints (auth, OTP, verification) when the database is unavailable.
+ * - Degrades to a per-instance memory limiter for lower-criticality endpoints during outages.
  */
 
 import { NextRequest, NextResponse } from "next/server";
-import { Redis } from "ioredis";
 import { prisma } from "./prisma";
 import { logger } from "./logger";
-import { getRedisConnection } from "./email/queue/connection";
 
 export type RateLimitCriticality = "CRITICAL" | "HIGH" | "STANDARD" | "LOW";
 
@@ -26,7 +23,7 @@ export interface RateLimitResult {
   resetSeconds: number;
   failedClosed?: boolean;
   error?: string;
-  backend?: "redis" | "postgres" | "memory";
+  backend?: "postgres" | "memory";
 }
 
 export interface RateLimitOptions {
@@ -36,7 +33,6 @@ export interface RateLimitOptions {
   clientId?: string;
   recipient?: string;
   route?: string;
-  syncToDb?: boolean;
 }
 
 export interface RateLimitCheckItem {
@@ -57,96 +53,26 @@ export interface MultiRateLimitResult extends RateLimitResult {
   };
 }
 
-// In-memory emergency fallback in case Redis and DB are both unreachable
+// In-memory emergency fallback for non-critical limits when the database is unreachable
 interface MemoryRecord {
   timestamps: number[];
   resetAt: number;
 }
 const memoryStore = new Map<string, MemoryRecord>();
 
-// Test overrides
-let testRedisClientOverride: Redis | null | undefined = undefined;
-let testForceRedisFailure = false;
-
-export function setRateLimiterRedisClient(client: Redis | null | undefined) {
-  testRedisClientOverride = client;
-}
+// Test hook: simulate the database limiter being unavailable
+let testForceBackendFailure = false;
 
 export function setRateLimiterForceFailure(force: boolean) {
-  testForceRedisFailure = force;
+  testForceBackendFailure = force;
 }
 
 /**
- * Standard Redis Sliding Window Lua Script
- * Atomically removes expired entries, counts active entries, records new timestamp,
- * and computes exact seconds until the oldest active entry expires.
- */
-const SLIDING_WINDOW_LUA = `
-local key = KEYS[1]
-local now = tonumber(ARGV[1])
-local window = tonumber(ARGV[2])
-local limit = tonumber(ARGV[3])
-local member = ARGV[4]
-
-local clearBefore = now - window
-redis.call('ZREMRANGEBYSCORE', key, 0, clearBefore)
-local current = redis.call('ZCARD', key)
-
-if current < limit then
-    redis.call('ZADD', key, now, member)
-    redis.call('PEXPIRE', key, window)
-    local remaining = limit - current - 1
-    local resetSeconds = math.ceil(window / 1000)
-    return {1, remaining, resetSeconds, current + 1}
-else
-    local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
-    local resetSeconds = math.ceil(window / 1000)
-    if oldest and #oldest >= 2 then
-        local oldestScore = tonumber(oldest[2])
-        local resetMs = math.max(1000, oldestScore + window - now)
-        resetSeconds = math.ceil(resetMs / 1000)
-    end
-    redis.call('PEXPIRE', key, window)
-    return {0, 0, resetSeconds, current}
-end
-`;
-
-/**
- * Normalizes rate limit key with prefix
- */
-export function formatRateLimitKey(identifier: string): string {
-  if (identifier.startsWith("rl:")) return identifier;
-  return `rl:${identifier}`;
-}
-
-/**
- * Redis is only used when explicitly configured. Without REDIS_URL the PostgreSQL RateLimit
- * table is the shared (multi-instance) backend, instead of dialing a non-existent localhost Redis.
- */
-function isRedisConfigured(): boolean {
-  return testForceRedisFailure || testRedisClientOverride !== undefined || Boolean(process.env.REDIS_URL);
-}
-
-/**
- * Resolves active Redis connection for rate limiting.
- */
-function getRateLimiterRedis(): Redis | null {
-  if (testForceRedisFailure) return null;
-  if (testRedisClientOverride !== undefined) return testRedisClientOverride;
-  try {
-    return getRedisConnection();
-  } catch (err) {
-    logger.warn("[RateLimit] Failed to acquire Redis connection for rate limiting:", err);
-    return null;
-  }
-}
-
-/**
- * Distributed, race-safe atomic rate limiter.
- * Primary: Shared Redis sliding window (sub-millisecond, multi-instance synchronized).
- * Secondary / Failure modes:
- * - CRITICAL: Fails closed to protect security/auth tokens.
- * - HIGH / STANDARD: Falls back to PostgreSQL RateLimit table or emergency memory.
+ * Race-safe rate limiter.
+ * Primary: PostgreSQL atomic fixed-window counter (shared across instances).
+ * On database failure:
+ * - CRITICAL (or failClosed): request is refused (503) rather than unprotected.
+ * - Otherwise: per-instance memory limiter.
  */
 export async function checkRateLimit(
   identifier: string,
@@ -156,98 +82,19 @@ export async function checkRateLimit(
 ): Promise<RateLimitResult> {
   const criticality = options?.criticality || "STANDARD";
   const shouldFailClosed = options?.failClosed ?? (criticality === "CRITICAL");
-  const redisConfigured = isRedisConfigured();
-  const redis = redisConfigured ? getRateLimiterRedis() : null;
 
-  if (redis && !testForceRedisFailure) {
-    try {
-      const now = Date.now();
-      const member = `${now}:${Math.random().toString(36).substring(2, 9)}`;
-      const redisKey = formatRateLimitKey(identifier);
-
-      // Bounded execution timeout: 1500ms max to prevent blocking client HTTP connections
-      const evalPromise = redis.eval(
-        SLIDING_WINDOW_LUA,
-        1,
-        redisKey,
-        now,
-        windowMs,
-        limit,
-        member
-      ) as Promise<[number, number, number, number]>;
-
-      const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("Redis rate limiter timeout")), 1500)
-      );
-
-      const [allowedNum, remaining, resetSeconds, count] = await Promise.race([
-        evalPromise,
-        timeoutPromise,
-      ]);
-
-      const success = allowedNum === 1;
-
-      // Sync to PostgreSQL RateLimit table if requested or if DB is connected
-      // (ensures full compatibility with legacy audit queries and verify-phase2 tests)
-      if (options?.syncToDb !== false) {
-        syncPostgresRateLimit(identifier, count, windowMs).catch((err) => {
-          logger.debug?.("[RateLimit] Non-blocking PostgreSQL sync notice:", err?.message);
-        });
-      }
-
-      return {
-        success,
-        limit,
-        remaining: Math.max(0, remaining),
-        resetSeconds: Math.max(1, resetSeconds),
-        backend: "redis",
-      };
-    } catch (err) {
-      logger.warn(
-        `[RateLimit] Redis error for key '${identifier}' (criticality=${criticality}):`,
-        err instanceof Error ? err.message : err
-      );
-
-      if (shouldFailClosed) {
-        logger.error(
-          `[RateLimit:FailClosed] Critical rate limiter failing closed for '${identifier}' due to Redis unavailability.`
-        );
-        return {
-          success: false,
-          limit,
-          remaining: 0,
-          resetSeconds: Math.ceil(windowMs / 1000),
-          failedClosed: true,
-          error: "RATE_LIMITER_UNAVAILABLE",
-          backend: "redis",
-        };
-      }
-    }
-  } else if (redisConfigured && shouldFailClosed) {
-    logger.error(
-      `[RateLimit:FailClosed] Critical rate limiter failing closed for '${identifier}' because Redis is offline.`
-    );
-    return {
-      success: false,
-      limit,
-      remaining: 0,
-      resetSeconds: Math.ceil(windowMs / 1000),
-      failedClosed: true,
-      error: "RATE_LIMITER_UNAVAILABLE",
-      backend: "redis",
-    };
-  }
-
-  // Graceful secondary fallback: PostgreSQL atomic upsert
   try {
-    const pgResult = await checkRateLimitPostgres(identifier, limit, windowMs);
-    return pgResult;
+    if (testForceBackendFailure) {
+      throw new Error("Simulated rate limiter backend failure");
+    }
+    return await checkRateLimitPostgres(identifier, limit, windowMs);
   } catch (pgErr) {
     logger.warn(
-      `[RateLimit] PostgreSQL rate limiting unavailable for '${identifier}', falling back to memory:`,
+      `[RateLimit] PostgreSQL rate limiting unavailable for '${identifier}' (criticality=${criticality}):`,
       pgErr instanceof Error ? pgErr.message : pgErr
     );
     if (shouldFailClosed) {
+      logger.error(`[RateLimit:FailClosed] Critical rate limiter failing closed for '${identifier}'.`);
       // Per-instance memory is not a safe limiter for auth/OTP endpoints on serverless.
       return {
         success: false,
@@ -261,7 +108,6 @@ export async function checkRateLimit(
     }
   }
 
-  // Final fallback: Local in-process memory
   return checkRateLimitMemory(identifier, limit, windowMs);
 }
 
@@ -300,12 +146,12 @@ export async function checkRateLimits(
     limit: lastCheck?.limit || 60,
     remaining: 1,
     resetSeconds: Math.ceil((lastCheck?.windowMs || 60000) / 1000),
-    backend: "redis",
+    backend: "postgres",
   };
 }
 
 /**
- * Secondary PostgreSQL RateLimiter
+ * PostgreSQL fixed-window rate limiter (single atomic upsert)
  */
 async function checkRateLimitPostgres(
   identifier: string,
@@ -350,30 +196,6 @@ async function checkRateLimitPostgres(
   }
 
   throw new Error("Empty result from PostgreSQL rate limit query");
-}
-
-/**
- * Asynchronous sync to PostgreSQL RateLimit table to maintain compatibility with DB queries.
- */
-async function syncPostgresRateLimit(
-  identifier: string,
-  count: number,
-  windowMs: number
-): Promise<void> {
-  const resetTimestamp = new Date(Date.now() + windowMs);
-  await prisma.$queryRawUnsafe(
-    `
-    INSERT INTO "RateLimit" ("key", "count", "resetAt", "createdAt", "updatedAt")
-    VALUES ($1, $2, $3, NOW(), NOW())
-    ON CONFLICT ("key") DO UPDATE
-    SET "count" = GREATEST("RateLimit"."count", $2),
-        "resetAt" = GREATEST("RateLimit"."resetAt", $3),
-        "updatedAt" = NOW();
-    `,
-    identifier,
-    count,
-    resetTimestamp
-  );
 }
 
 /**
@@ -488,35 +310,18 @@ export function rateLimitResponse(
  * Inspects rate limiter health and backend status
  */
 export async function getRateLimiterHealth(): Promise<{
-  status: "HEALTHY" | "DEGRADED" | "DOWN";
-  backend: "redis" | "postgres" | "memory";
-  redisConnected: boolean;
+  status: "HEALTHY" | "DOWN";
+  backend: "postgres";
   latencyMs?: number;
 }> {
-  const redis = getRateLimiterRedis();
-  if (!redis || testForceRedisFailure) {
-    return {
-      status: "DEGRADED",
-      backend: "postgres",
-      redisConnected: false,
-    };
+  if (testForceBackendFailure) {
+    return { status: "DOWN", backend: "postgres" };
   }
-
   try {
     const start = performance.now();
-    await redis.ping();
-    const latencyMs = Math.round(performance.now() - start);
-    return {
-      status: "HEALTHY",
-      backend: "redis",
-      redisConnected: true,
-      latencyMs,
-    };
+    await prisma.$queryRawUnsafe("SELECT 1");
+    return { status: "HEALTHY", backend: "postgres", latencyMs: Math.round(performance.now() - start) };
   } catch {
-    return {
-      status: "DEGRADED",
-      backend: "postgres",
-      redisConnected: false,
-    };
+    return { status: "DOWN", backend: "postgres" };
   }
 }

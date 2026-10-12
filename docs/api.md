@@ -260,7 +260,7 @@ Requests without this exact confirmation string are rejected with HTTP 400 Bad R
 
 `POST /api/v1/email/send`
 
-Dispatches a transactional or promotional email. Requests are authenticated via Bearer API Key, tenant-scoped, and processed asynchronously via the BullMQ email queue.
+Dispatches a transactional or promotional email. Requests are authenticated via Bearer API Key, tenant-scoped, and processed asynchronously: the request persists an `EmailDelivery` and a `BackgroundJob`, which the cron-driven processor executes within about a minute.
 
 ### Request Headers
 - `Authorization: Bearer whub_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` (Required)
@@ -399,7 +399,7 @@ Transitions status back to `RUNNING` and requeues any unsent `PENDING` recipient
 
 ### Cancel Campaign
 `POST /api/email/campaigns/[id]/cancel`
-Transitions status to `CANCELLED`. Deletes any delayed BullMQ trigger jobs. Marks all unsent `PENDING` recipients as `CANCELLED`. Already transmitted `SENT` emails remain acknowledged and untouched.
+Transitions status to `CANCELLED`. Pending trigger jobs become no-ops. Marks all unsent `PENDING` recipients as `CANCELLED`. Already transmitted `SENT` emails remain acknowledged and untouched.
 
 ---
 

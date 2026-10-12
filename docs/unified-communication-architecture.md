@@ -6,7 +6,7 @@ This document defines the architectural specification, design patterns, lifecycl
 ### Core Architecture Principles
 1. **Zero Premature Schema Merging**: Channel-specific storage models (`Message` / `MessageEvent` for WhatsApp; `EmailContact` / `EmailDelivery` / `EmailEvent` / `EmailCampaign` for Email) remain isolated in PostgreSQL. We strictly reject polymorphic column dumping and table coalescing that would sacrifice referential integrity, indexes, or tenant isolation.
 2. **Anti-Corruption Layer (ACL)**: Unification occurs above the persistence layer via strongly-typed domain contracts, monotonic lifecycle adapters, and the `ChannelProviderAdapter` Service Provider Interface (SPI).
-3. **Strict Backward Compatibility**: Existing WhatsApp APIs, webhooks, and services (`MessageService`, `/api/webhooks/whatsapp`) and Email delivery pipelines (`EmailService`, BullMQ queues, worker processors) remain 100% backward compatible without interface drift or signature breaks.
+3. **Strict Backward Compatibility**: Existing WhatsApp APIs, webhooks, and services (`MessageService`, `/api/webhooks/whatsapp`) and Email delivery pipelines (`EmailService`, PostgreSQL job queue, executors) remain 100% backward compatible without interface drift or signature breaks.
 4. **Deterministic Fail-Closed Security**: Suppression verification, tenant boundary validation, and webhook signature verification strictly fail closed. Promotional dispatches are blocked if suppression state cannot be conclusively confirmed.
 5. **No Fake Upstream Successes**: Future adapters (SMS, Push) strictly return `PROVIDER_UNAVAILABLE` until production upstream gateways and credentials are bound.
 
@@ -65,11 +65,11 @@ stateDiagram-v2
 
 ## Campaign Automation & Journey Engine
 
-Built on top of the existing PostgreSQL and BullMQ foundations without introducing a second campaign engine:
+Built on top of the existing PostgreSQL job queue without introducing a second campaign engine:
 
 ### DAG Workflow Step Types
 1. `SEND_CAMPAIGN`: Dispatches campaigns or single-recipient child campaigns via `executeSendCampaignStep`, ensuring later enrollments are never skipped by campaign worker completion.
-2. `DELAY`: Pauses execution for a positive duration (`delayMinutes`, `delayHours`, `delayDays`), scheduling BullMQ delayed jobs with mandatory continuation paths.
+2. `DELAY`: Pauses execution for a positive duration (`delayMinutes`, `delayHours`, `delayDays`), scheduling delayed `BackgroundJob` rows with mandatory continuation paths.
 3. `CONDITIONAL_BRANCH`: Evaluates contact attributes, tags, custom fields, and previous step outcomes to route contacts to `trueNextStepId` or `falseNextStepId`.
 4. `WAIT_FOR_EVENT`: Listens for recipient interactions (`OPENED`, `CLICKED`, `REPLIED`, etc.). Enforces timeout semantics: if the event arrives before timeout, advances to `nextStepId`; if timeout expires, branches to `timeoutNextStepId` or transitions to `ABANDONED` (`TIMEOUT_EXPIRED`). Never enters infinite timeout loops.
 5. `END`: Formally concludes journey execution, transitioning enrollment to `COMPLETED`.
@@ -114,7 +114,7 @@ timeline
 - Deploy `UnifiedMessageRouter` with multi-tenant boundaries and fail-closed suppression verification.
 
 ### Phase 3: Authoritative Pipeline & Automation Hardening (Completed)
-- Eliminate duplicate email dispatch pathways by routing through authoritative `EmailDelivery` persistence and BullMQ queues.
+- Eliminate duplicate email dispatch pathways by routing through authoritative `EmailDelivery` persistence and the PostgreSQL job queue.
 - Implement child campaign isolation per enrollment execution in `EmailAutomationService`.
 - Implement timeout resolution and DAG cycle validation.
 - Protect webhooks with provider-level authentication and HMAC/PubSub signature verification.

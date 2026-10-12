@@ -33,27 +33,22 @@ if (!process.env.DATABASE_URL || process.env.DATABASE_URL.includes("peqynzeioiau
 if (!process.env.DIRECT_URL || process.env.DIRECT_URL.includes("peqynzeioiauynfpdsdv") || process.env.DIRECT_URL.includes("supabase.co")) {
   process.env.DIRECT_URL = "postgresql://postgres:postgres@127.0.0.1:5433/email_test";
 }
-process.env.REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
-process.env.REDIS_HOST = process.env.REDIS_HOST || "127.0.0.1";
-process.env.REDIS_PORT = process.env.REDIS_PORT || "6379";
 process.env.ALLOW_DESTRUCTIVE_TESTS = "true";
 process.env.NODE_ENV = "test";
 process.env.AUTH_SESSION_SECRET = "campaign-lifecycle-test-session-secret-32-chars";
 process.env.API_KEY_PEPPER = "campaign-lifecycle-test-pepper-32-chars-min";
 
 import { prisma } from "../src/lib/prisma";
-import { getCampaignQueue, closeAllQueues } from "../src/lib/email/queue/queues";
+import { getCampaignQueue } from "../src/lib/email/queue/queues";
 import {
   JOB_NAMES,
   getCampaignJobId,
   CampaignJobData,
 } from "../src/lib/email/queue/types";
 import { EmailCampaignService } from "../src/lib/services/email-campaign-service";
-import {
-  processCampaignRecipientJob,
-  checkAndCompleteCampaign,
-} from "../src/lib/email/queue/campaign-worker";
-import { processScheduledCampaignTriggerJob } from "../src/lib/email/queue/campaign-trigger-worker";
+import { CampaignRecipientExecutor } from "../src/lib/services/executors/campaign-recipient-executor";
+import { CampaignTriggerService } from "../src/lib/services/executors/campaign-trigger-service";
+import { PermanentError } from "../src/lib/errors/job-errors";
 import { EmailProvider, EmailSendRequest, EmailSendResult } from "../src/lib/email/types";
 import {
   EmailCampaignStatus,
@@ -71,7 +66,6 @@ import { POST as resumeRoute } from "../src/app/api/email/campaigns/[id]/resume/
 import { POST as pauseRoute } from "../src/app/api/email/campaigns/[id]/pause/route";
 import { POST as cancelRoute } from "../src/app/api/email/campaigns/[id]/cancel/route";
 import { NextRequest } from "next/server";
-import { Job, UnrecoverableError } from "bullmq";
 
 let passed = 0;
 let failed = 0;
@@ -342,9 +336,9 @@ async function runCampaignLifecycleSuite() {
   testAssert(scheduledCampaign.status === EmailCampaignStatus.SCHEDULED, "Campaign status transitioned to SCHEDULED");
   testAssert(scheduledCampaign.scheduledAt?.getTime() === scheduledTime.getTime(), "Campaign scheduledAt correctly persisted");
 
-  // Verify delayed trigger job was added to BullMQ
+  // Verify delayed trigger job was persisted
   const triggerJob1 = await queue.getJob(`trigger-campaign-${campaign1.id}`);
-  testAssert(!!triggerJob1, "Delayed trigger job added to BullMQ with stable business ID");
+  testAssert(!!triggerJob1, "Delayed trigger job persisted with stable business ID");
   testAssert(triggerJob1?.name === JOB_NAMES.TRIGGER_SCHEDULED_CAMPAIGN, "Trigger job name matches TRIGGER_SCHEDULED_CAMPAIGN");
 
   // ---------------------------------------------------------------------------
@@ -353,11 +347,11 @@ async function runCampaignLifecycleSuite() {
   console.log("\n🧪 Test 2: Trigger Processor Blocks Premature Execution");
   let prematureThrew = false;
   try {
-    await processScheduledCampaignTriggerJob(triggerJob1 as Job<CampaignJobData>);
+    await CampaignTriggerService.triggerScheduledCampaign({ campaignId: triggerJob1!.data.campaignId, clientId: triggerJob1!.data.clientId });
   } catch (err: any) {
     prematureThrew = err.isRetryable === true;
   }
-  testAssert(prematureThrew, "Trigger processor throws RetryableEmailError if scheduled time has not arrived");
+  testAssert(prematureThrew, "Trigger processor throws a retryable error if scheduled time has not arrived");
 
   const unmutatedCampaign = await prisma.emailCampaign.findUnique({ where: { id: campaign1.id } });
   testAssert(unmutatedCampaign?.status === EmailCampaignStatus.SCHEDULED, "Premature trigger leaves campaign in SCHEDULED state");
@@ -372,10 +366,9 @@ async function runCampaignLifecycleSuite() {
     data: { scheduledAt: new Date(Date.now() - 1000) },
   });
 
-  const triggerResult = await processScheduledCampaignTriggerJob(triggerJob1 as Job<CampaignJobData>);
+  const triggerResult = await CampaignTriggerService.triggerScheduledCampaign({ campaignId: triggerJob1!.data.campaignId, clientId: triggerJob1!.data.clientId });
   testAssert(triggerResult.success === true, "Trigger processor executed successfully");
-  testAssert(triggerResult.status === EmailCampaignStatus.RUNNING, "Trigger processor transitioned status to RUNNING");
-  testAssert(triggerResult.enqueuedCount === 3, "Enqueued 3 deterministic recipient jobs");
+  testAssert(triggerResult.recipientCount === 3, "Enqueued 3 deterministic recipient jobs");
 
   const campaign1PostTrigger = await prisma.emailCampaign.findUnique({ where: { id: campaign1.id } });
   testAssert(campaign1PostTrigger?.status === EmailCampaignStatus.RUNNING, "DB campaign status is RUNNING");
@@ -389,14 +382,14 @@ async function runCampaignLifecycleSuite() {
   // Verify recipient jobs exist in BullMQ with stable IDs
   for (const r of snapshotRecipients) {
     const rJob = await queue.getJob(getCampaignJobId(r.id));
-    testAssert(!!rJob, `Recipient job exists in BullMQ: ${getCampaignJobId(r.id)}`);
+    testAssert(!!rJob, `Recipient job exists in job queue: ${getCampaignJobId(r.id)}`);
   }
 
   // ---------------------------------------------------------------------------
   // TEST 4: Duplicate Trigger Idempotency (Never Duplicate Snapshot or Sends)
   // ---------------------------------------------------------------------------
   console.log("\n🧪 Test 4: Duplicate Trigger Idempotency");
-  const dupTriggerResult = await processScheduledCampaignTriggerJob(triggerJob1 as Job<CampaignJobData>);
+  const dupTriggerResult = await CampaignTriggerService.triggerScheduledCampaign({ campaignId: triggerJob1!.data.campaignId, clientId: triggerJob1!.data.clientId });
   testAssert(dupTriggerResult.skipped === true, "Duplicate trigger safely skipped");
 
   const recipientCountAfterDup = await prisma.emailCampaignRecipient.count({
@@ -517,9 +510,7 @@ async function runCampaignLifecycleSuite() {
 
   // Send first recipient successfully
   const rJob0 = await queue.getJob(getCampaignJobId(pauseRecipients[0].id));
-  const r0Result = await processCampaignRecipientJob(rJob0 as Job<CampaignJobData>, {
-    providerOverride: mockProvider,
-  });
+  const r0Result = await CampaignRecipientExecutor.executeRecipient({ recipientId: rJob0!.data.campaignRecipientId, providerOverride: mockProvider });
   testAssert(r0Result.success === true, "Recipient 0 sent successfully");
 
   // Now PAUSE the campaign while recipients 1 & 2 are still queued
@@ -527,9 +518,7 @@ async function runCampaignLifecycleSuite() {
 
   // Worker picks up recipient 1 while campaign is PAUSED -> must postpone without sending
   const rJob1 = await queue.getJob(getCampaignJobId(pauseRecipients[1].id));
-  const r1Result = await processCampaignRecipientJob(rJob1 as Job<CampaignJobData>, {
-    providerOverride: mockProvider,
-  });
+  const r1Result = await CampaignRecipientExecutor.executeRecipient({ recipientId: rJob1!.data.campaignRecipientId, providerOverride: mockProvider });
   testAssert(r1Result.skipped === true && r1Result.reason === "CAMPAIGN_PAUSED", "Worker postponed queued recipient while campaign is PAUSED");
 
   const r1Db = await prisma.emailCampaignRecipient.findUnique({ where: { id: pauseRecipients[1].id } });
@@ -545,15 +534,11 @@ async function runCampaignLifecycleSuite() {
 
   // Worker processes resumed recipients 1 and 2
   const rJob1Resumed = await queue.getJob(getCampaignJobId(pauseRecipients[1].id));
-  const r1SendResult = await processCampaignRecipientJob(rJob1Resumed as Job<CampaignJobData>, {
-    providerOverride: mockProvider,
-  });
+  const r1SendResult = await CampaignRecipientExecutor.executeRecipient({ recipientId: rJob1Resumed!.data.campaignRecipientId, providerOverride: mockProvider });
   testAssert(r1SendResult.success === true, "Resumed Recipient 1 successfully sent");
 
   const rJob2Resumed = await queue.getJob(getCampaignJobId(pauseRecipients[2].id));
-  const r2SendResult = await processCampaignRecipientJob(rJob2Resumed as Job<CampaignJobData>, {
-    providerOverride: mockProvider,
-  });
+  const r2SendResult = await CampaignRecipientExecutor.executeRecipient({ recipientId: rJob2Resumed!.data.campaignRecipientId, providerOverride: mockProvider });
   testAssert(r2SendResult.success === true, "Resumed Recipient 2 successfully sent");
 
   // Verify campaign auto-completed after all recipients reached terminal state (SENT)
@@ -588,9 +573,7 @@ async function runCampaignLifecycleSuite() {
   });
 
   const sJob = await queue.getJob(getCampaignJobId(senderRecipients[0].id));
-  await processCampaignRecipientJob(sJob as Job<CampaignJobData>, {
-    providerOverride: mockProvider,
-  });
+  await CampaignRecipientExecutor.executeRecipient({ recipientId: sJob!.data.campaignRecipientId, providerOverride: mockProvider });
 
   const sentRequest = mockProvider.sentRequests[0];
   testAssert(sentRequest.from === '"Alpha VIP Team" <vip@alpha.com>', "Worker honored senderIdentity name and email");
@@ -649,14 +632,14 @@ async function runCampaignLifecycleSuite() {
       clientId: tenantA.id,
       category: "PROMOTIONAL",
     },
-  } as unknown as Job<CampaignJobData>;
+  };
 
   try {
-    await processCampaignRecipientJob(hackedJob, { providerOverride: mockProvider });
+    await CampaignRecipientExecutor.executeRecipient({ recipientId: hackedJob.data.campaignRecipientId, providerOverride: mockProvider });
   } catch (err: any) {
-    workerCrossTenantThrew = err instanceof UnrecoverableError && err.message.includes("does not belong to tenant");
+    workerCrossTenantThrew = err instanceof PermanentError && err.message.includes("does not belong to tenant");
   }
-  testAssert(workerCrossTenantThrew, "Worker strictly throws UnrecoverableError on cross-tenant sender and never defaults");
+  testAssert(workerCrossTenantThrew, "Executor strictly rejects a cross-tenant sender identity and never defaults");
 
   // ---------------------------------------------------------------------------
   // TEST 12: Queue Failure Honesty & Observable Recoverable State
@@ -710,12 +693,10 @@ async function runCampaignLifecycleSuite() {
       clientId: tenantA.id,
       category: "PROMOTIONAL",
     },
-  } as unknown as Job<CampaignJobData>;
+  };
 
   mockProvider.sentRequests = [];
-  const dupWorkerResult = await processCampaignRecipientJob(duplicateJob, {
-    providerOverride: mockProvider,
-  });
+  const dupWorkerResult = await CampaignRecipientExecutor.executeRecipient({ recipientId: duplicateJob.data.campaignRecipientId, providerOverride: mockProvider });
   testAssert(dupWorkerResult.skipped === true && dupWorkerResult.reason === "ALREADY_SENT", "Worker detected already SENT recipient and skipped");
   testAssert(mockProvider.sentRequests.length === 0, "No duplicate email dispatched to provider");
 
@@ -759,17 +740,17 @@ async function runCampaignLifecycleSuite() {
     id: "job-sent",
     name: JOB_NAMES.SEND_CAMPAIGN_RECIPIENT,
     data: { campaignRecipientId: rSent.id, campaignId: terminalTestCampaign.id, clientId: tenantA.id, category: "PROMOTIONAL" },
-  } as unknown as Job<CampaignJobData>;
-  await processCampaignRecipientJob(jobSent, { providerOverride: mockProvider });
+  };
+  await CampaignRecipientExecutor.executeRecipient({ recipientId: jobSent.data.campaignRecipientId, providerOverride: mockProvider });
 
-  // 2. Process rSuppressed -> throws UnrecoverableError, updates DB to SUPPRESSED
+  // 2. Process rSuppressed -> throws PermanentError, updates DB to SUPPRESSED
   const jobSupp = {
     id: "job-supp",
     name: JOB_NAMES.SEND_CAMPAIGN_RECIPIENT,
     data: { campaignRecipientId: rSuppressed.id, campaignId: terminalTestCampaign.id, clientId: tenantA.id, category: "PROMOTIONAL" },
-  } as unknown as Job<CampaignJobData>;
+  };
   try {
-    await processCampaignRecipientJob(jobSupp, { providerOverride: mockProvider });
+    await CampaignRecipientExecutor.executeRecipient({ recipientId: jobSupp.data.campaignRecipientId, providerOverride: mockProvider });
   } catch {}
 
   const rSuppDb = await prisma.emailCampaignRecipient.findUnique({ where: { id: rSuppressed.id } });
@@ -786,9 +767,9 @@ async function runCampaignLifecycleSuite() {
     id: "job-fail",
     name: JOB_NAMES.SEND_CAMPAIGN_RECIPIENT,
     data: { campaignRecipientId: rFailed.id, campaignId: terminalTestCampaign.id, clientId: tenantA.id, category: "PROMOTIONAL" },
-  } as unknown as Job<CampaignJobData>;
+  };
   try {
-    await processCampaignRecipientJob(jobFail, { providerOverride: mockProvider });
+    await CampaignRecipientExecutor.executeRecipient({ recipientId: jobFail.data.campaignRecipientId, providerOverride: mockProvider });
   } catch {}
 
   const rFailDb = await prisma.emailCampaignRecipient.findUnique({ where: { id: rFailed.id } });
@@ -809,7 +790,6 @@ async function runCampaignLifecycleSuite() {
   console.log(`📊 CAMPAIGN LIFECYCLE SUITE COMPLETED: ${passed} PASSED, ${failed} FAILED`);
   console.log("==================================================================\n");
 
-  await closeAllQueues();
   await prisma.$disconnect();
 
   if (failed > 0) {

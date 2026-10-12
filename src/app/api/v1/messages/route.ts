@@ -14,7 +14,6 @@ export async function POST(req: NextRequest) {
   // Distributed rate limiting per API key (60 messages per minute)
   const rateLimit = await checkRateLimit(`msg_key_${auth.keyId || "anon"}`, 60, 60000, {
     criticality: "HIGH",
-    syncToDb: true,
   });
   if (!rateLimit.success) {
     return rateLimitResponse(

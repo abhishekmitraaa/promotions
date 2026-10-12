@@ -9,7 +9,6 @@ export async function POST(req: NextRequest) {
   const rl = await checkRateLimit(`reset_pw_ip_${ip}`, 10, 15 * 60 * 1000, {
     criticality: "CRITICAL",
     failClosed: true,
-    syncToDb: true,
   });
   if (!rl.success) {
     return rateLimitResponse(

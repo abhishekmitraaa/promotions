@@ -36,7 +36,7 @@ export async function POST(req: NextRequest) {
     `email_send_key_${auth.keyId || clientId}`,
     60,
     60000,
-    { criticality: "HIGH", syncToDb: true }
+    { criticality: "HIGH" }
   );
   if (!tenantLimit.success) {
     return rateLimitResponse(

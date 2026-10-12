@@ -35,7 +35,7 @@ import {
   PermanentEmailError,
   isRetryableError,
 } from "../email/queue/types";
-import { checkAndCompleteCampaign } from "../email/queue/campaign-worker";
+import { CampaignTriggerService } from "./executors/campaign-trigger-service";
 import { EmailAutomationService } from "./email-automation-service";
 import { logger } from "../logger";
 import { MAX_EVENT_ATTEMPTS, staleLockCutoff } from "./executors/claim-lock";
@@ -847,7 +847,7 @@ export class EmailEventService {
     }
 
     // Check if campaign reached terminal completion
-    await checkAndCompleteCampaign(campaignId);
+    await CampaignTriggerService.checkAndCompleteCampaign(campaignId);
   }
 
   /**
@@ -878,7 +878,7 @@ export class EmailEventService {
       },
     });
 
-    await checkAndCompleteCampaign(campaignId);
+    await CampaignTriggerService.checkAndCompleteCampaign(campaignId);
   }
 
   /**

@@ -30,7 +30,6 @@ if (!process.env.DATABASE_URL || process.env.DATABASE_URL.includes("peqynzeioiau
 if (!process.env.DIRECT_URL || process.env.DIRECT_URL.includes("peqynzeioiauynfpdsdv") || process.env.DIRECT_URL.includes("supabase.co")) {
   process.env.DIRECT_URL = "postgresql://postgres:postgres@127.0.0.1:5433/email_test";
 }
-process.env.WORKERLESS_MODE = "true";
 process.env.NODE_ENV = "test";
 process.env.ALLOW_DESTRUCTIVE_TESTS = "true";
 process.env.INTERNAL_PROCESSOR_SECRET = "test-internal-processor-secret-1234567890";
@@ -42,7 +41,8 @@ process.env.EMAIL_CREDENTIALS_ENCRYPTION_KEY = "test-email-encryption-key-32cha"
 
 import { prisma } from "../src/lib/prisma";
 import { ServerlessJobProcessor } from "../src/lib/services/serverless-job-processor";
-import { isWorkerlessMode } from "../src/lib/email/queue/queues";
+import { getTransactionalQueue } from "../src/lib/email/queue/queues";
+import { JOB_NAMES } from "../src/lib/email/queue/types";
 import {
   EmailDeliveryStatus,
   EmailCampaignStatus,
@@ -58,7 +58,7 @@ import {
   BackgroundJobStatus,
   DeliveryStatus,
 } from "@prisma/client";
-import { queueTransactionalEmail } from "../src/lib/email/queue/producer";
+import { EmailDispatchService } from "../src/lib/services/email-dispatch-service";
 import { ReconciliationExecutor } from "../src/lib/services/executors/reconciliation-executor";
 import { processWebhookDeliveryQueue } from "../src/lib/webhooks/dispatcher";
 import { encryptWebhookSecret } from "../src/lib/crypto";
@@ -109,8 +109,15 @@ async function main() {
   });
 
   // Test 1: Workerless Mode Detection
-  console.log("\n▶ [Test 1] Verifying Workerless Mode Configuration...");
-  assert(isWorkerlessMode() === true, "Workerless mode is correctly detected");
+  console.log("\n▶ [Test 1] Verifying producer jobs persist in PostgreSQL...");
+  const probeJob = await getTransactionalQueue().add(
+    JOB_NAMES.SEND_TRANSACTIONAL,
+    { deliveryId: "probe-delivery", clientId: testTenant, category: "TRANSACTIONAL" },
+    { jobId: `probe-${Date.now()}`, delay: 60 * 60 * 1000 }
+  );
+  const probeRow = await prisma.backgroundJob.findFirst({ where: { clientId: testTenant, deduplicationKey: probeJob.id } });
+  assert(probeRow?.type === "TRANSACTIONAL_EMAIL", "Producer jobs are persisted as PostgreSQL BackgroundJob rows");
+  if (probeRow) await prisma.backgroundJob.delete({ where: { id: probeRow.id } });
 
   // Test 2: Transactional Delivery Processing
   console.log("\n▶ [Test 2] Testing Serverless Transactional Delivery Processing...");
@@ -365,7 +372,7 @@ async function main() {
 
   // Test 10: Transactional Email Enqueue Atomicity
   console.log("\n▶ [Test 10] Testing Transactional Email Enqueue Atomicity...");
-  const atomicEnqueue = await queueTransactionalEmail({
+  const atomicEnqueue = await EmailDispatchService.enqueueBackground({
     clientId: testTenant,
     to: "atomic-recipient@example.com",
     subject: "Atomic Enqueue Test",

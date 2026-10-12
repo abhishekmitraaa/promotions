@@ -926,3 +926,16 @@ model BackgroundJob {
   @@index([scheduledAt])
 }
 
+
+// One-time Google OAuth transaction state (CSRF + replay protection).
+// Shared across serverless instances; consumedAt is set atomically on first use.
+model OAuthState {
+  nonce       String    @id
+  tenantId    String
+  adminUserId String?
+  createdAt   DateTime  @default(now())
+  expiresAt   DateTime
+  consumedAt  DateTime?
+
+  @@index([expiresAt])
+}

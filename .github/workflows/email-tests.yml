@@ -30,23 +30,11 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
 
     env:
       NODE_ENV: test
       DATABASE_URL: postgresql://postgres:postgres@localhost:5432/email_test
       DIRECT_URL: postgresql://postgres:postgres@localhost:5432/email_test
-      REDIS_URL: redis://localhost:6379
-      REDIS_HOST: localhost
-      REDIS_PORT: "6379"
       ALLOW_DESTRUCTIVE_TESTS: "true"
       AUTH_SESSION_SECRET: email-ci-session-secret-32-characters-minimum
       API_KEY_PEPPER: email-ci-api-key-pepper-32-characters-min

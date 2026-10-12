@@ -44,7 +44,6 @@ import {
 } from "../src/lib/crypto";
 import { EmailService } from "../src/lib/services/email-service";
 import { prisma } from "../src/lib/prisma";
-import { closeRedisConnections } from "../src/lib/email/queue/connection";
 import { createSessionToken, hashPasswordForStorage, hashSessionToken, SESSION_COOKIE } from "../src/lib/auth";
 
 async function runPhase2Tests() {
@@ -473,7 +472,7 @@ async function runPhase2Tests() {
     (prisma.userSession as any).findUnique = origFindUnique;
     (prisma.emailProviderConfig as any).findMany = origProviderFindMany;
     (prisma.emailSenderIdentity as any).findMany = origIdentityFindMany;
-    await closeRedisConnections();
+
   }
 
   // -------------------------------------------------------------------------

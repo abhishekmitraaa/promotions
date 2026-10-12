@@ -50,6 +50,9 @@ function maskValue(key: string, value: unknown): unknown {
     // Inline Bearer token redaction
     let masked = value.replace(/(Bearer\s+)[a-zA-Z0-9_\-\.]{15,}/gi, "$1[REDACTED]");
 
+    // Credentials embedded in connection strings (postgresql://user:pass@host, redis://:pass@host)
+    masked = masked.replace(/:\/\/([^:@\s/]*):([^@\s]+)@/g, "://$1:[REDACTED]@");
+
     // Inline phone pattern redaction in strings (e.g. "recipient '+1234567890'")
     masked = masked.replace(/(\+?\d{1,3})(\d{4,8})(\d{3,4})/g, (match, p1, p2, p3) => {
       return `${p1}****${p3}`;
@@ -70,6 +73,13 @@ function maskValue(key: string, value: unknown): unknown {
   }
 
   return value;
+}
+
+/**
+ * Returns a log-safe copy of any value (secrets, tokens, credentials and phone numbers masked).
+ */
+export function sanitizeForLog(value: unknown): unknown {
+  return maskValue("arg", value);
 }
 
 export const logger = {

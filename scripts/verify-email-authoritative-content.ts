@@ -23,9 +23,6 @@ if (!process.env.DATABASE_URL || process.env.DATABASE_URL.includes("peqynzeioiau
 if (!process.env.DIRECT_URL || process.env.DIRECT_URL.includes("peqynzeioiauynfpdsdv") || process.env.DIRECT_URL.includes("supabase.co")) {
   process.env.DIRECT_URL = "postgresql://postgres:postgres@127.0.0.1:5433/email_test";
 }
-process.env.REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
-process.env.REDIS_HOST = process.env.REDIS_HOST || "127.0.0.1";
-process.env.REDIS_PORT = process.env.REDIS_PORT || "6379";
 process.env.NODE_ENV = "test";
 process.env.ALLOW_DESTRUCTIVE_TESTS = "true";
 process.env.AUTH_SESSION_SECRET = "authoritative-test-session-secret-32-chars";
@@ -36,8 +33,8 @@ import { NextRequest } from "next/server";
 import { prisma } from "../src/lib/prisma";
 import { generateApiKey } from "../src/lib/crypto";
 import { POST as sendEmailRoute } from "../src/app/api/v1/email/send/route";
-import { processTransactionalJob } from "../src/lib/email/queue/worker";
-import { processPromotionalDeliveryJob } from "../src/lib/email/queue/promotional-delivery-worker";
+import { EmailDeliveryExecutor } from "../src/lib/services/executors/email-delivery-executor";
+import { RetryableError } from "../src/lib/errors/job-errors";
 import {
   JOB_NAMES,
   getTransactionalJobId,
@@ -46,7 +43,6 @@ import {
   PromotionalJobData,
   RetryableEmailError,
 } from "../src/lib/email/queue/types";
-import { closeAllQueues } from "../src/lib/email/queue/queues";
 import { EmailProvider, EmailSendRequest, EmailSendResult } from "../src/lib/email/types";
 import {
   EmailDeliveryStatus,
@@ -54,7 +50,6 @@ import {
   EmailType,
   EmailTemplateType,
 } from "@prisma/client";
-import { Job } from "bullmq";
 
 let passed = 0;
 let failed = 0;
@@ -84,6 +79,7 @@ class RecordingMockProvider implements EmailProvider {
       this.failNextWithRetryable = false;
       return {
         accepted: false,
+        success: false,
         providerName: this.providerName,
         error: {
           code: "TEMPORARY_NETWORK_FAILURE",
@@ -94,6 +90,7 @@ class RecordingMockProvider implements EmailProvider {
     }
     return {
       accepted: true,
+      success: true,
       providerMessageId: `msg-${Date.now()}-${Math.random().toString(36).substring(7)}`,
       providerName: this.providerName,
       providerStatus: "SENT",
@@ -111,13 +108,8 @@ class RecordingMockProvider implements EmailProvider {
   }
 }
 
-function createMockJob<T>(name: string, data: T, id: string): Job<T> {
-  return {
-    id,
-    name,
-    data,
-    opts: {},
-  } as unknown as Job<T>;
+function createMockJob<T>(name: string, data: T, id: string): { id: string; name: string; data: T } {
+  return { id, name, data };
 }
 
 async function main() {
@@ -199,7 +191,7 @@ async function main() {
     { deliveryId: delivery1!.id, clientId: tenantA.id, category: "TRANSACTIONAL" },
     getTransactionalJobId(delivery1!.id)
   );
-  await processTransactionalJob(job1, { providerOverride: mockProvider });
+  await EmailDeliveryExecutor.execute({ deliveryId: job1.data.deliveryId, providerOverride: mockProvider });
 
   testAssert(mockProvider.calls.length === 1, "Provider send was called exactly once");
   const call1 = mockProvider.calls[0];
@@ -250,7 +242,7 @@ async function main() {
     { deliveryId: delivery2!.id, clientId: tenantA.id, category: "TRANSACTIONAL" },
     getTransactionalJobId(delivery2!.id)
   );
-  await processTransactionalJob(job2, { providerOverride: mockProvider });
+  await EmailDeliveryExecutor.execute({ deliveryId: job2.data.deliveryId, providerOverride: mockProvider });
 
   testAssert(mockProvider.calls.length === 1, "Provider send called once");
   const call2 = mockProvider.calls[0];
@@ -328,7 +320,7 @@ async function main() {
     { deliveryId: delivery3!.id, clientId: tenantA.id, category: "TRANSACTIONAL" },
     getTransactionalJobId(delivery3!.id)
   );
-  await processTransactionalJob(job3, { providerOverride: mockProvider });
+  await EmailDeliveryExecutor.execute({ deliveryId: job3.data.deliveryId, providerOverride: mockProvider });
 
   testAssert(mockProvider.calls.length === 1, "Provider send executed");
   const call3 = mockProvider.calls[0];
@@ -419,23 +411,23 @@ async function main() {
 
   let caughtRetryable = false;
   try {
-    await processTransactionalJob(job5, { providerOverride: mockProvider });
+    await EmailDeliveryExecutor.execute({ deliveryId: job5.data.deliveryId, providerOverride: mockProvider });
   } catch (err) {
-    if (err instanceof RetryableEmailError) {
+    if (err instanceof RetryableError) {
       caughtRetryable = true;
     }
   }
-  testAssert(caughtRetryable, "Transient provider failure threw RetryableEmailError for BullMQ backoff");
+  testAssert(caughtRetryable, "Transient provider failure threw RetryableError (scheduled for retry)");
 
   // Verify delivery record still has exact authoritative content intact
   const delivery5AfterFail = await prisma.emailDelivery.findUnique({ where: { id: delivery5.id } });
-  testAssert(delivery5AfterFail?.status === EmailDeliveryStatus.PROCESSING, "Delivery remains in PROCESSING for retry");
+  testAssert(delivery5AfterFail?.status === EmailDeliveryStatus.QUEUED, "Delivery re-queued (QUEUED) for retry");
   testAssert(delivery5AfterFail?.htmlContent === retryHtml, "Authoritative htmlContent is unchanged after failure");
   testAssert(delivery5AfterFail?.attemptCount === 1, "Attempt count was incremented to 1");
 
   // Second Attempt: Provider succeeds
   mockProvider.reset();
-  const retryResult = await processTransactionalJob(job5, { providerOverride: mockProvider });
+  const retryResult = await EmailDeliveryExecutor.execute({ deliveryId: job5.data.deliveryId, providerOverride: mockProvider });
   testAssert(retryResult.success === true, "Retry succeeded on second attempt");
   testAssert(mockProvider.calls[0].html === retryHtml, "Retry sent identical authoritative HTML content");
 
@@ -447,7 +439,7 @@ async function main() {
   // -------------------------------------------------------------------------
   console.log("\n--- [6] Worker Replay Protection ---");
   mockProvider.reset();
-  const replayResult = await processTransactionalJob(job5, { providerOverride: mockProvider });
+  const replayResult = await EmailDeliveryExecutor.execute({ deliveryId: job5.data.deliveryId, providerOverride: mockProvider });
   testAssert(replayResult.skipped === true, "Worker detected already completed delivery and skipped");
   testAssert(mockProvider.calls.length === 0, "No duplicate send executed by provider on replay");
 
@@ -547,7 +539,7 @@ async function main() {
     { deliveryId: data8Promo.data.deliveryId, clientId: tenantA.id, category: "PROMOTIONAL" },
     getPromotionalJobId(data8Promo.data.deliveryId)
   );
-  await processPromotionalDeliveryJob(job8Promo, { providerOverride: mockProvider });
+  await EmailDeliveryExecutor.execute({ deliveryId: job8Promo.data.deliveryId, providerOverride: mockProvider });
 
   testAssert(mockProvider.calls.length === 1, "Promotional worker executed send");
   const promoCall = mockProvider.calls[0];
@@ -584,7 +576,7 @@ async function main() {
     { deliveryId: data8Tx.data.deliveryId, clientId: tenantA.id, category: "TRANSACTIONAL" },
     getTransactionalJobId(data8Tx.data.deliveryId)
   );
-  await processTransactionalJob(job8Tx, { providerOverride: mockProvider });
+  await EmailDeliveryExecutor.execute({ deliveryId: job8Tx.data.deliveryId, providerOverride: mockProvider });
 
   const txCall = mockProvider.calls[0];
   testAssert(
@@ -702,7 +694,7 @@ async function main() {
     { deliveryId: delivery11!.id, clientId: tenantA.id, category: "TRANSACTIONAL" },
     getTransactionalJobId(delivery11!.id)
   );
-  await processTransactionalJob(job11, { providerOverride: mockProvider });
+  await EmailDeliveryExecutor.execute({ deliveryId: job11.data.deliveryId, providerOverride: mockProvider });
 
   // 5. Worker MUST send the frozen V1 content, NOT the mutated DB content
   testAssert(mockProvider.calls.length === 1, "Worker executed send");
@@ -722,7 +714,6 @@ async function main() {
   console.log(`Summary: ${passed} PASSED, ${failed} FAILED`);
   console.log("------------------------------------------------------------------");
 
-  await closeAllQueues();
   await prisma.$disconnect();
 
   if (failed > 0) {
@@ -736,7 +727,6 @@ main()
   .catch(async (err) => {
     console.error("Fatal test error:", err);
     try {
-      await closeAllQueues();
       await prisma.$disconnect();
     } catch {}
     process.exit(1);

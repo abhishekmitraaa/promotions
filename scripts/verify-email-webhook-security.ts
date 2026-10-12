@@ -1,7 +1,7 @@
 /**
  * Comprehensive Email Webhook Security & Tenant Isolation Verification Suite
  *
- * Real disposable PostgreSQL + Redis integration test suite validating:
+ * Real disposable PostgreSQL integration test suite validating:
  * 1. Provider event uniqueness (provider-scoped event identity, no cross-provider collision).
  * 2. Strict tenant correlation (never correlate solely through recipient email).
  * 3. Mandatory provider configuration binding (webhooks must be bound to active EmailProviderConfig).
@@ -21,9 +21,6 @@ if (!process.env.DATABASE_URL || process.env.DATABASE_URL.includes("peqynzeioiau
 if (!process.env.DIRECT_URL || process.env.DIRECT_URL.includes("peqynzeioiauynfpdsdv") || process.env.DIRECT_URL.includes("supabase.co")) {
   process.env.DIRECT_URL = "postgresql://postgres:postgres@127.0.0.1:5433/email_test";
 }
-process.env.REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
-process.env.REDIS_HOST = process.env.REDIS_HOST || "127.0.0.1";
-process.env.REDIS_PORT = process.env.REDIS_PORT || "6379";
 process.env.ALLOW_DESTRUCTIVE_TESTS = "true";
 process.env.NODE_ENV = "test";
 process.env.AUTH_SESSION_SECRET = "webhook-security-session-secret-32-chars";
@@ -32,7 +29,7 @@ process.env.API_KEY_PEPPER = "webhook-security-pepper-32-chars-min";
 import crypto from "crypto";
 import { NextRequest } from "next/server";
 import { prisma } from "../src/lib/prisma";
-import { closeAllQueues, getEventsQueue } from "../src/lib/email/queue/queues";
+import { getEventsQueue } from "../src/lib/email/queue/queues";
 import { POST as webhookRoute } from "../src/app/api/email/webhooks/[provider]/route";
 import {
   EmailEventService,
@@ -1413,15 +1410,15 @@ async function main() {
   assert(dbEventPersisted !== null, "CRITICAL: EmailEvent record exists in DB immediately upon 202 response");
   assert(dbEventPersisted?.status === EmailEventProcessingStatus.RECEIVED, "Persisted EmailEvent is in RECEIVED state");
 
-  // 15b. Honest Queue Failure: Simulated Redis / Queue Error
+  // 15b. Honest Queue Failure: Simulated Queue Persistence Error
   // When BullMQ fails to enqueue, recordAndEnqueueEvent must NOT report success,
   // the DB event must be marked FAILED, and route must return HTTP 503!
   const queue = getEventsQueue();
   const originalAdd = queue.add.bind(queue);
 
-  // Mock queue.add to simulate Redis connection crash
+  // Mock queue.add to simulate a queue persistence failure
   (queue as any).add = async () => {
-    throw new Error("Simulated Redis Connection Refused: ECONNREFUSED 127.0.0.1:6379");
+    throw new Error("Simulated queue persistence failure: ECONNREFUSED");
   };
 
   const queueFailEventId = `evt-qfail-${testRunId}`;
@@ -1497,7 +1494,7 @@ async function main() {
     where: { id: { in: [tenantAlpha.id, tenantBeta.id] } },
   });
 
-  await closeAllQueues();
+
   await prisma.$disconnect();
 
   console.log("================================================================================");

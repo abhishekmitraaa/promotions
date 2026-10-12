@@ -32,7 +32,6 @@ export async function POST(req: NextRequest) {
 
   const rl = await checkRateLimit(`create_cmp_${auth.clientId}`, 20, 60000, {
     criticality: "HIGH",
-    syncToDb: true,
   });
   if (!rl.success) {
     return rateLimitResponse(

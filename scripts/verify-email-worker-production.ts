@@ -1,17 +1,15 @@
 /**
- * Production Email Worker Verification & Failure Simulation Test Suite
+ * Production Job Pipeline Verification & Failure Simulation Test Suite (workerless)
  *
- * Verifies all 10 requirements:
- * 1. Worker lifecycle: startup validation, graceful shutdown simulation, connection failure handling.
- * 2. Queue behavior: retryable vs permanent errors, delayed jobs, stalled jobs, dead-letter visibility, duplicate job protection.
- * 3. Worker health: uptime, Redis connectivity/latency, Postgres connectivity/latency, job states, processing latency, last success/error.
- * 4. Recovery: pending jobs continue, zero duplicate sends, safe processing job recovery, stale PROCESSING records purged.
- * 5. Abandoned state reconciliation: stale deliveries recovered, stale recipients reset/cancelled, orphaned campaigns completed.
- * 6. Campaign safety: paused campaigns remain paused, cancelled remain cancelled, completed campaigns never resurrected.
- * 7. Transaction safety: monotonic delivery state progression (never mark SENT before provider acceptance, never downgrade SENT/DELIVERED with old retry).
- * 8. Structured logs with secret redaction: all API keys, OAuth tokens, passwords, and sensitive headers sanitized.
- * 9. Metrics: Prometheus and JSON snapshots for production observability.
- * 10. Failure simulation: network blip, DB downtime simulation, provider 429 backoff, unrecoverable 401 fail-fast.
+ * Verifies:
+ * 1. Startup validation: PostgreSQL connectivity.
+ * 2. Error classification: retryable vs permanent errors.
+ * 3. Transaction safety: monotonic delivery state progression (never downgrade SENT/DELIVERED).
+ * 4. Campaign safety: paused campaigns remain paused, cancelled remain cancelled, completed never resurrected.
+ * 5. Abandoned state reconciliation: stale deliveries recovered, stale recipients reset/cancelled.
+ * 6. Health & metrics: PostgreSQL latency, processor liveness, queue depth, Prometheus exposition.
+ * 7. Structured logs with secret redaction.
+ * 8. Duplicate job protection via stable business job IDs.
  */
 
 import assert from "node:assert/strict";
@@ -22,12 +20,10 @@ if (!process.env.DIRECT_URL || process.env.DIRECT_URL.includes("peqynzeioiauynfp
   process.env.DIRECT_URL = "postgresql://postgres:postgres@127.0.0.1:5433/email_test";
 }
 
-import { Redis } from "ioredis";
 import { prisma } from "../src/lib/prisma";
 import {
   EmailDeliveryStatus,
   EmailCampaignStatus,
-  EmailRecipientStatus,
   EmailType,
   EmailProviderType,
 } from "@prisma/client";
@@ -37,21 +33,13 @@ import {
   isRetryableError,
   QUEUE_NAMES,
 } from "../src/lib/email/queue/types";
-import {
-  createWorkerRedisConnection,
-  closeRedisConnections,
-  sanitizeRedisUrl,
-} from "../src/lib/email/queue/connection";
-import { workerTelemetry, getActiveWorkerHeartbeats } from "../src/lib/email/queue/telemetry";
-import { reconcileAbandonedJobs } from "../src/lib/email/queue/reconciliation";
+import { ReconciliationExecutor } from "../src/lib/services/executors/reconciliation-executor";
 import { getEmailQueueHealth } from "../src/lib/email/queue/health";
 import { getProductionMetricsSnapshot, getPrometheusMetrics } from "../src/lib/email/queue/metrics";
-import { redactSecrets } from "../src/lib/email/queue/worker-logger";
+import { sanitizeForLog } from "../src/lib/logger";
 import { getTransactionalQueue } from "../src/lib/email/queue/queues";
-import { processPromotionalDeliveryJob } from "../src/lib/email/queue/promotional-delivery-worker";
-import { processCampaignRecipientJob, processCampaignJob } from "../src/lib/email/queue/campaign-worker";
-
-const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
+import { CampaignRecipientExecutor } from "../src/lib/services/executors/campaign-recipient-executor";
+import { JOB_NAMES } from "../src/lib/email/queue/types";
 
 let passedCount = 0;
 let failedCount = 0;
@@ -68,7 +56,7 @@ function fail(testName: string, err: any) {
 
 async function main() {
   console.log("\n=================================================================");
-  console.log("  PRODUCTION EMAIL WORKER HARNESS & FAILURE SIMULATION SUITE");
+  console.log("  PRODUCTION JOB PIPELINE HARNESS & FAILURE SIMULATION SUITE");
   console.log("=================================================================\n");
 
   const runId = `wkr_test_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
@@ -83,40 +71,15 @@ async function main() {
   const testClientId = testClient.id;
 
   // ---------------------------------------------------------------------------
-  // [1] Worker Lifecycle: Startup Validation & Secret Sanitization
+  // [1] Startup Validation: PostgreSQL connectivity
   // ---------------------------------------------------------------------------
-  console.log("-> [Step 1] Worker Lifecycle: Startup Validation & URL Sanitization...");
+  console.log("-> [Step 1] Startup Validation: PostgreSQL connectivity...");
   try {
-    const rawUrlWithCreds = "redis://admin:super_secret_password_123@cache.internal:6379/2";
-    const sanitized = sanitizeRedisUrl(rawUrlWithCreds);
-    assert.ok(!sanitized.includes("super_secret_password_123"), "Password must be stripped");
-    assert.ok(sanitized.includes("***"), "Password should be replaced with ***");
-    pass("Redis URL sanitization removes credentials cleanly");
-
-    // Invalid Redis connection test
-    const badRedis = new Redis("redis://127.0.0.1:9998", {
-      connectTimeout: 500,
-      maxRetriesPerRequest: 0,
-      lazyConnect: true,
-      retryStrategy: () => null,
-    });
-    let badConnectionThrew = false;
-    try {
-      await badRedis.connect();
-    } catch {
-      badConnectionThrew = true;
-    } finally {
-      badRedis.disconnect();
-    }
-    assert.ok(badConnectionThrew, "Invalid Redis connection must fail fast");
-    pass("Worker startup validation fails fast when Redis is unreachable");
-
-    // Database connectivity validation
     const dbPing = await prisma.$queryRawUnsafe("SELECT 1 as alive");
     assert.ok(Array.isArray(dbPing) && dbPing.length > 0, "PostgreSQL SELECT 1 should succeed");
-    pass("Worker startup validation verifies PostgreSQL connection and alive status");
+    pass("Startup validation verifies PostgreSQL connection and alive status");
   } catch (err: any) {
-    fail("Worker Lifecycle Startup Validation", err);
+    fail("Startup Validation", err);
   }
 
   // ---------------------------------------------------------------------------
@@ -264,7 +227,7 @@ async function main() {
       attemptsMade: 0,
     };
 
-    const pausedResult = await processCampaignRecipientJob(mockPausedJob);
+    const pausedResult = await CampaignRecipientExecutor.executeRecipient({ recipientId: mockPausedJob.data.campaignRecipientId });
     assert.equal(pausedResult.skipped, true, "Paused campaign job must be skipped");
     assert.equal(pausedResult.reason, "CAMPAIGN_PAUSED", "Skip reason must be CAMPAIGN_PAUSED");
 
@@ -305,7 +268,7 @@ async function main() {
       attemptsMade: 0,
     };
 
-    const cancelledResult = await processCampaignRecipientJob(mockCancelledJob);
+    const cancelledResult = await CampaignRecipientExecutor.executeRecipient({ recipientId: mockCancelledJob.data.campaignRecipientId });
     assert.equal(cancelledResult.skipped, true, "Cancelled campaign job must be skipped");
     assert.equal(cancelledResult.reason, "CAMPAIGN_CANCELLED", "Skip reason must be CAMPAIGN_CANCELLED");
 
@@ -329,17 +292,26 @@ async function main() {
       },
     });
 
+    // A late job for a recipient whose campaign has already completed
+    const lateRecipient = await prisma.emailCampaignRecipient.create({
+      data: {
+        campaignId: completedCampaign.id,
+        email: `late-rcpt-${runId}@example.com`,
+        status: "PENDING",
+      },
+    });
+
     const mockResurrectJob: any = {
       id: `job_resurrect_${runId}`,
       data: {
         campaignId: completedCampaign.id,
-        campaignRecipientId: pausedRecipient.id,
+        campaignRecipientId: lateRecipient.id,
         clientId: testClientId,
       },
       attemptsMade: 0,
     };
 
-    const resurrectResult = await processCampaignRecipientJob(mockResurrectJob);
+    const resurrectResult = await CampaignRecipientExecutor.executeRecipient({ recipientId: mockResurrectJob.data.campaignRecipientId });
     assert.equal(
       resurrectResult.skipped,
       true,
@@ -377,7 +349,7 @@ async function main() {
       },
     });
 
-    // 5.2 Stale PROCESSING Delivery with attemptCount >= maxAttempts -> Marked FAILED
+    // 5.2 Stale PROCESSING Delivery with attemptCount >= maxAttempts (5) -> Marked FAILED
     const expiredDelivery = await prisma.emailDelivery.create({
       data: {
         clientId: testClientId,
@@ -387,7 +359,7 @@ async function main() {
         category: EmailType.TRANSACTIONAL,
         providerType: EmailProviderType.SMTP,
         status: EmailDeliveryStatus.PROCESSING,
-        attemptCount: 3,
+        attemptCount: 5, // pipeline maxAttempts
         updatedAt: fifteenMinutesAgo,
       },
     });
@@ -429,10 +401,7 @@ async function main() {
     });
 
     // Run reconciliation
-    const reconResults = await reconcileAbandonedJobs({
-      batchSize: 50,
-      staleThresholdMinutes: 10,
-    });
+    const reconResults = await ReconciliationExecutor.reconcile({ staleMinutes: 10 });
 
     assert.ok(
       reconResults.recoveredDeliveries >= 1,
@@ -497,48 +466,6 @@ async function main() {
   }
 
   // ---------------------------------------------------------------------------
-  // [6] Worker Telemetry, Heartbeats & Distributed Cluster Visibility
-  // ---------------------------------------------------------------------------
-  console.log("\n-> [Step 6] Worker Telemetry, Heartbeats & Distributed Cluster Visibility...");
-  try {
-    const testRedis = createWorkerRedisConnection();
-
-    // 6.1 Telemetry Job Timing & Recording
-    const startTime = workerTelemetry.recordJobStart();
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    workerTelemetry.recordJobSuccess(startTime);
-
-    const snapshot = workerTelemetry.getSnapshot();
-    assert.ok(snapshot.uptimeSeconds >= 0, "Uptime must be non-negative");
-    assert.ok(snapshot.jobsProcessed >= 1, "Processed count should be recorded");
-    assert.ok(snapshot.jobsSucceeded >= 1, "Succeeded count should be recorded");
-    assert.ok(snapshot.averageProcessingDurationMs !== undefined, "Avg latency should be defined");
-    pass("In-memory worker telemetry accurately records job execution and rolling latencies");
-
-    // 6.2 Redis Distributed Heartbeat
-    workerTelemetry.startHeartbeat(testRedis, 500);
-    // Wait for first heartbeat to write
-    await new Promise((resolve) => setTimeout(resolve, 200));
-
-    const activeHeartbeats = await getActiveWorkerHeartbeats(testRedis);
-    const myHeartbeat = activeHeartbeats.find((h) => h.workerId === workerTelemetry.getWorkerId());
-    assert.ok(myHeartbeat, "Distributed heartbeat should be discoverable in Redis");
-    assert.equal(myHeartbeat?.workerId, workerTelemetry.getWorkerId());
-    pass("Worker heartbeat is published to Redis and cluster-wide worker discovery succeeds");
-
-    // Stop heartbeat and verify cleanup
-    await workerTelemetry.stopHeartbeat(testRedis);
-    const remainingHeartbeats = await getActiveWorkerHeartbeats(testRedis);
-    const cleanedHeartbeat = remainingHeartbeats.find(
-      (h) => h.workerId === workerTelemetry.getWorkerId()
-    );
-    assert.ok(!cleanedHeartbeat, "Worker heartbeat must be removed from Redis on shutdown");
-    pass("Worker heartbeat is cleanly deleted upon shutdown");
-  } catch (err: any) {
-    fail("Worker Telemetry & Heartbeats", err);
-  }
-
-  // ---------------------------------------------------------------------------
   // [7] Comprehensive Health & Production Metrics Snapshots
   // ---------------------------------------------------------------------------
   console.log("\n-> [Step 7] Comprehensive Health & Production Metrics Snapshots...");
@@ -551,36 +478,30 @@ async function main() {
     );
     assert.equal(health.postgres.connected, true, "PostgreSQL health must report connected");
     assert.ok(health.postgres.latencyMs !== undefined && health.postgres.latencyMs >= 0, "PostgreSQL latency must be >= 0");
-    assert.equal(health.redis.connected, true, "Redis health must report connected");
-    assert.ok(health.redis.latencyMs !== undefined && health.redis.latencyMs >= 0, "Redis latency must be >= 0");
+    assert.ok(["READY", "STALLED", "UNKNOWN"].includes(health.processor.status), "Processor liveness must be reported");
     assert.ok(health.queues.transactional, "Transactional queue metrics must exist");
     assert.ok(health.queues.campaign, "Campaign queue metrics must exist");
     assert.ok(health.queues.events, "Events queue metrics must exist");
     assert.ok(Array.isArray(health.deadLetter.recentFailedTransactional), "Dead letters array must exist");
-    pass("getEmailQueueHealth() reports complete system status, DB/Redis latencies, and queue counts");
+    pass("getEmailQueueHealth() reports system status, DB latency, processor liveness and queue counts");
 
     // 7.2 Production Metrics JSON Snapshot
     const metricsSnapshot = await getProductionMetricsSnapshot();
     assert.ok(metricsSnapshot.timestamp, "Metrics snapshot must have ISO timestamp");
-    assert.ok(metricsSnapshot.uptimeSeconds >= 0, "Uptime must be non-negative");
+    assert.ok(metricsSnapshot.processor, "Processor liveness must be present in metrics snapshot");
     assert.ok(metricsSnapshot.queues, "Queues breakdown must be present in metrics snapshot");
-    assert.ok(metricsSnapshot.redis.connected, "Redis status must be present");
     assert.ok(metricsSnapshot.postgres.connected, "PostgreSQL status must be present");
     pass("getProductionMetricsSnapshot() returns structured production telemetry");
 
     // 7.3 Prometheus Format
     const prometheusText = await getPrometheusMetrics();
     assert.ok(
-      prometheusText.includes("# HELP email_worker_active_jobs"),
-      "Prometheus text must include active_jobs gauge"
+      prometheusText.includes("# HELP email_processor_stalled"),
+      "Prometheus text must include processor stalled gauge"
     );
     assert.ok(
       prometheusText.includes("# HELP email_queue_depth_jobs"),
       "Prometheus text must include queue depth gauge"
-    );
-    assert.ok(
-      prometheusText.includes("# HELP email_jobs_total"),
-      "Prometheus text must include jobs_total counter"
     );
     assert.ok(
       prometheusText.includes("# HELP email_backend_connected"),
@@ -606,7 +527,7 @@ async function main() {
       recipientEmail: "confidential_ceo@enterprise-client.com",
     };
 
-    const redacted = redactSecrets(sensitivePayload);
+    const redacted = sanitizeForLog(sensitivePayload);
     const redactedStr = JSON.stringify(redacted);
 
     assert.ok(
@@ -621,7 +542,7 @@ async function main() {
       !redactedStr.includes("GOCSPX-SecretPasswordForOAuth1234"),
       "Client secret must be redacted"
     );
-    assert.ok(!redactedStr.includes("supersecret"), "Redis password must be redacted");
+    assert.ok(!redactedStr.includes("supersecret"), "Connection-string password must be redacted");
     assert.ok(
       !redactedStr.includes("$2b$10$abcdefghijklmnopqrstuvwxyz1234567890abcdefghijklm"),
       "Password hash must be redacted"
@@ -646,7 +567,7 @@ async function main() {
 
     // Add job with explicit custom jobId
     const job1 = await queue.add(
-      "send-email",
+      JOB_NAMES.SEND_TRANSACTIONAL,
       {
         deliveryId: `del_${runId}`,
         clientId: testClientId,
@@ -654,13 +575,12 @@ async function main() {
       } as any,
       {
         jobId: customJobId,
-        removeOnComplete: true,
       }
     );
 
     // Attempt to add duplicate job with identical custom jobId
     const job2 = await queue.add(
-      "send-email",
+      JOB_NAMES.SEND_TRANSACTIONAL,
       {
         deliveryId: `del_${runId}`,
         clientId: testClientId,
@@ -676,7 +596,7 @@ async function main() {
 
     // Clean up created job
     await job1.remove().catch(() => {});
-    pass("BullMQ custom job IDs provide strict duplicate job protection");
+    pass("Stable business job IDs provide strict duplicate job protection");
   } catch (err: any) {
     fail("Duplicate Job Protection", err);
   }
@@ -698,8 +618,7 @@ async function main() {
     await prisma.apiClient.deleteMany({
       where: { id: testClientId },
     });
-    await closeRedisConnections();
-    pass("Test database and Redis connections cleaned up successfully");
+    pass("Test database artifacts cleaned up successfully");
   } catch (err: any) {
     console.warn("Cleanup warning:", err.message);
   }

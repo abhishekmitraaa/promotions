@@ -222,7 +222,7 @@ npm test
 ```
 
 ### Email Platform Certification Commands
-All email tests run strictly against disposable local infrastructure (`PostgreSQL` and `Redis`) and are blocked unconditionally from production Supabase:
+All email tests run strictly against a disposable local PostgreSQL and are blocked unconditionally from production Supabase:
 
 ```bash
 # Master Certification Pass: Certifies Flows A through P end-to-end
@@ -232,7 +232,7 @@ npm run test:email:certify
 npm run test:email
 
 # Granular Test Suites
-npm run test:email:queue      # BullMQ queue workers, retries, and failure states
+npm run test:email:queue      # Delivery executor, retries, and failure states
 npm run test:email:campaign   # Campaign lifecycle, preview, and snapshots
 npm run test:email:audience   # Scalable audience engine, streaming cursors, advisory locks
 npm run test:email:security   # Public API schema, suppression, and multi-tenant isolation

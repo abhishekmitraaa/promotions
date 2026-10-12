@@ -13,17 +13,24 @@
 
 import { prisma } from "../../prisma";
 import {
+  EmailContactStatus,
   EmailDeliveryStatus,
   EmailProviderType,
   EmailFailureCategory,
   EmailDelivery,
+  EmailType,
 } from "@prisma/client";
 import { providerRegistry } from "../../email/registry";
 import { EmailProvider, EmailSendResult } from "../../email/types";
+import { normalizeEmail } from "../../email/normalization";
+import { EmailTrackingService } from "../../email/tracking/email-tracking-service";
+import { EmailUnsubscribeService } from "../email-unsubscribe-service";
+import { getPublicAppUrl } from "../../env";
 import {
   RetryableError,
   PermanentError,
   classifyJobError,
+  providerFailureError,
 } from "../../errors/job-errors";
 import { logger } from "../../logger";
 import {
@@ -217,6 +224,37 @@ export class EmailDeliveryExecutor {
       throw new PermanentError(`Recipient '${delivery.to}' is suppressed.`);
     }
 
+    // 4b. Promotional email: marketing consent + RFC 8058 one-click unsubscribe headers
+    let unsubscribeHeaders: Record<string, string> | undefined;
+    if (delivery.category === EmailType.PROMOTIONAL) {
+      const contact = await prisma.emailContact.findFirst({
+        where: { clientId: delivery.clientId, normalizedEmail: normalizeEmail(delivery.to) },
+      });
+      if (contact) {
+        if (!contact.hasMarketingConsent || contact.status !== EmailContactStatus.SUBSCRIBED) {
+          await prisma.emailDelivery.updateMany({
+            where: ownedByUs,
+            data: {
+              status: EmailDeliveryStatus.FAILED,
+              errorCode: "MARKETING_CONSENT_REQUIRED",
+              errorMessage: `Contact '${delivery.to}' has not provided marketing consent. Promotional dispatch rejected.`,
+              failedAt: new Date(),
+              lockedAt: null,
+              lockedBy: null,
+            },
+          });
+          throw new PermanentError(
+            `Contact '${delivery.to}' does not have marketing consent for promotional email.`,
+            "MARKETING_CONSENT_REQUIRED"
+          );
+        }
+        unsubscribeHeaders = EmailUnsubscribeService.getOneClickUnsubscribeHeaders(
+          getPublicAppUrl(),
+          EmailUnsubscribeService.generateUnsubscribeToken(delivery.clientId, contact.id)
+        );
+      }
+    }
+
     // 5. Resolve Provider
     let provider: EmailProvider;
     let providerType: EmailProviderType = EmailProviderType.GMAIL;
@@ -258,8 +296,14 @@ export class EmailDeliveryExecutor {
       }
     }
 
-    // 6. Validate content
-    const outgoingHtml = delivery.htmlContent || undefined;
+    // 6. Validate content (promotional HTML gets the signed open pixel and wrapped links)
+    const outgoingHtml = delivery.htmlContent
+      ? delivery.category === EmailType.PROMOTIONAL
+        ? EmailTrackingService.prepareTrackedHtml(delivery.htmlContent, delivery.clientId, delivery.id, {
+            baseUrl: getPublicAppUrl(),
+          })
+        : delivery.htmlContent
+      : undefined;
     const outgoingText = delivery.textContent || undefined;
 
     if (!outgoingHtml && !outgoingText) {
@@ -313,11 +357,12 @@ export class EmailDeliveryExecutor {
         text: outgoingText,
         replyTo: delivery.replyTo || undefined,
         type: delivery.category,
+        headers: unsubscribeHeaders,
         idempotencyKey: delivery.idempotencyKey || `delivery-${delivery.id}`,
       });
 
       if (!sendResult.success) {
-        throw new Error(sendResult.error?.message || "Provider returned failure");
+        throw providerFailureError(sendResult.error);
       }
     } catch (sendErr) {
       const classification = classifyJobError(sendErr);

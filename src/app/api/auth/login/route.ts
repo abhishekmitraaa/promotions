@@ -8,7 +8,6 @@ export async function POST(req: NextRequest) {
   const ipRl = await checkRateLimit(`login:${ip}`, 10, 15 * 60 * 1000, {
     criticality: "CRITICAL",
     failClosed: true,
-    syncToDb: true,
   });
   if (!ipRl.success) {
     return rateLimitResponse(

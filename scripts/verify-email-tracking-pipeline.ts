@@ -20,9 +20,6 @@ if (!process.env.DATABASE_URL || process.env.DATABASE_URL.includes("peqynzeioiau
 if (!process.env.DIRECT_URL || process.env.DIRECT_URL.includes("peqynzeioiauynfpdsdv") || process.env.DIRECT_URL.includes("supabase.co")) {
   process.env.DIRECT_URL = "postgresql://postgres:postgres@127.0.0.1:5433/email_test";
 }
-process.env.REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
-process.env.REDIS_HOST = process.env.REDIS_HOST || "127.0.0.1";
-process.env.REDIS_PORT = process.env.REDIS_PORT || "6379";
 process.env.ALLOW_DESTRUCTIVE_TESTS = "true";
 process.env.NODE_ENV = "test";
 process.env.EMAIL_TRACKING_SECRET = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -32,7 +29,7 @@ import { prisma } from "../src/lib/prisma";
 import { EmailTrackingService } from "../src/lib/email/tracking/email-tracking-service";
 import { EmailAnalyticsService } from "../src/lib/services/email-analytics-service";
 import { EmailCampaignService } from "../src/lib/services/email-campaign-service";
-import { processCampaignRecipientJob } from "../src/lib/email/queue/campaign-worker";
+import { CampaignRecipientExecutor } from "../src/lib/services/executors/campaign-recipient-executor";
 import { EmailProvider, EmailSendRequest, EmailSendResult } from "../src/lib/email/types";
 import {
   EmailCampaignStatus,
@@ -54,8 +51,12 @@ class TrackingCaptureEmailProvider implements EmailProvider {
     this.sentEmails.push(request);
     return {
       accepted: true,
+      success: true,
+      providerName: "Tracking Test Provider",
+      providerType: EmailProviderType.MOCK,
       providerMessageId: `msg-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
-      status: "SENT",
+      providerStatus: "SENT",
+      sentAt: new Date(),
     };
   }
 
@@ -187,7 +188,7 @@ async function runTests() {
       },
     } as any;
 
-    const result1 = await processCampaignRecipientJob(jobMock, { providerOverride: mockProvider });
+    const result1 = await CampaignRecipientExecutor.executeRecipient({ recipientId: jobMock.data.campaignRecipientId, providerOverride: mockProvider });
     if (!result1.success) {
       throw new Error(`Test 1 Failed: Recipient job did not succeed: ${JSON.stringify(result1)}`);
     }
@@ -692,7 +693,7 @@ async function runTests() {
         clientId: tenantId,
       },
     } as any;
-    const r2Result = await processCampaignRecipientJob(jobMock2, { providerOverride: mockProvider });
+    const r2Result = await CampaignRecipientExecutor.executeRecipient({ recipientId: jobMock2.data.campaignRecipientId, providerOverride: mockProvider });
     if (!r2Result.success || !r2Result.deliveryId) {
       throw new Error(`Test 10 Failed: Dispatching recipient 2 failed: ${JSON.stringify(r2Result)}`);
     }
@@ -710,7 +711,7 @@ async function runTests() {
         clientId: tenantId,
       },
     } as any;
-    const r3Result = await processCampaignRecipientJob(jobMock3, { providerOverride: mockProvider });
+    const r3Result = await CampaignRecipientExecutor.executeRecipient({ recipientId: jobMock3.data.campaignRecipientId, providerOverride: mockProvider });
     if (!r3Result.success || !r3Result.deliveryId) {
       throw new Error(`Test 10 Failed: Dispatching recipient 3 failed: ${JSON.stringify(r3Result)}`);
     }

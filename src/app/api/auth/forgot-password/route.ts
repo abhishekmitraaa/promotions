@@ -10,7 +10,6 @@ export async function POST(req: NextRequest) {
   const ipRateLimit = await checkRateLimit(`forgot_pw_ip_${ip}`, 5, 15 * 60 * 1000, {
     criticality: "CRITICAL",
     failClosed: true,
-    syncToDb: true,
   });
   if (!ipRateLimit.success) {
     return rateLimitResponse(
@@ -50,7 +49,7 @@ export async function POST(req: NextRequest) {
     `forgot_pw_email_${normalizedEmail}`,
     3,
     15 * 60 * 1000,
-    { criticality: "CRITICAL", failClosed: true, syncToDb: true }
+    { criticality: "CRITICAL", failClosed: true }
   );
   if (!emailRateLimit.success) {
     return rateLimitResponse(

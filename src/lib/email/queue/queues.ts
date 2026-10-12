@@ -1,17 +1,14 @@
 /**
- * BullMQ Queue Producers & Queue Lifecycle Management
+ * Durable Job Queues (PostgreSQL BackgroundJob table)
  *
- * Supports both:
- * 1. Workerless execution on Vercel + Supabase (default): jobs are persisted as BackgroundJob rows
- * 2. Distributed BullMQ execution with Redis (legacy): only with WORKERLESS_MODE=false and a REDIS_URL,
- *    and only when a dedicated BullMQ worker process is actually running
+ * Producers enqueue work here; ServerlessJobProcessor executes it when Supabase Cron calls
+ * /api/internal/process-jobs. There is no Redis and no long-running worker process.
  */
 
-import { Queue, QueueOptions } from "bullmq";
-import { getRedisConnection } from "./connection";
 import {
   QUEUE_NAMES,
   JOB_NAMES,
+  EmailJobName,
   TransactionalJobData,
   PromotionalJobData,
   CampaignJobData,
@@ -19,65 +16,126 @@ import {
   EmailEventJobData,
 } from "./types";
 import { logger } from "../../logger";
-
 import { prisma } from "../../prisma";
-import { BackgroundJobStatus, Prisma } from "@prisma/client";
+import { BackgroundJob, BackgroundJobStatus, Prisma } from "@prisma/client";
 
-export function isWorkerlessMode(): boolean {
-  // BullMQ is an explicit opt-in: a REDIS_URL alone (e.g. for rate limiting) must not divert
-  // jobs into Redis queues that no production process consumes.
-  return !(process.env.WORKERLESS_MODE === "false" && process.env.REDIS_URL);
+/** BackgroundJob.type for each producer job name (the processor dispatches on this). */
+const JOB_TYPE_BY_NAME: Record<EmailJobName, string> = {
+  [JOB_NAMES.SEND_TRANSACTIONAL]: "TRANSACTIONAL_EMAIL",
+  [JOB_NAMES.SEND_PROMOTIONAL]: "PROMOTIONAL_EMAIL",
+  [JOB_NAMES.SEND_CAMPAIGN_RECIPIENT]: "CAMPAIGN_RECIPIENT",
+  [JOB_NAMES.TRIGGER_SCHEDULED_CAMPAIGN]: "CAMPAIGN_TRIGGER",
+  [JOB_NAMES.PROCESS_EMAIL_EVENT]: "EMAIL_EVENT",
+  [JOB_NAMES.PROCESS_AUTOMATION_STEP]: "AUTOMATION_STEP",
+  [JOB_NAMES.TRIGGER_RECURRING_AUTOMATION]: "RECURRING_AUTOMATION",
+};
+
+const JOB_NAME_BY_TYPE: Record<string, EmailJobName> = Object.fromEntries(
+  Object.entries(JOB_TYPE_BY_NAME).map(([name, type]) => [type, name as EmailJobName])
+);
+
+/** BackgroundJob types belonging to each logical queue (all queues share one table). */
+export const QUEUE_JOB_TYPES: Record<string, string[]> = {
+  [QUEUE_NAMES.TRANSACTIONAL]: ["TRANSACTIONAL_EMAIL", "PROMOTIONAL_EMAIL", "EMAIL_DELIVERY"],
+  [QUEUE_NAMES.CAMPAIGN]: ["CAMPAIGN_RECIPIENT", "CAMPAIGN_TRIGGER", "AUTOMATION_STEP", "RECURRING_AUTOMATION"],
+  [QUEUE_NAMES.EVENTS]: ["EMAIL_EVENT"],
+};
+
+export interface EnqueueOptions {
+  /** Stable business key; enqueueing the same key twice returns the existing job. */
+  jobId?: string;
+  delay?: number;
+  attempts?: number;
+  /** Accepted for call-site compatibility; retry backoff is computed by the processor. */
+  backoff?: unknown;
 }
 
-class WorkerlessQueueAdapter<T = unknown> {
+export interface QueuedJob<T> {
+  id: string;
+  name: string;
+  data: T;
+  getState(): Promise<"waiting" | "active" | "completed" | "failed" | "cancelled">;
+  remove(): Promise<void>;
+}
+
+export interface FailedQueueJob<T> {
+  id: string;
+  name: string;
+  data: T;
+  failedReason: string;
+  attemptsMade: number;
+  finishedOn?: number;
+}
+
+function stateOf(status: BackgroundJobStatus): "waiting" | "active" | "completed" | "failed" | "cancelled" {
+  switch (status) {
+    case BackgroundJobStatus.COMPLETED:
+      return "completed";
+    case BackgroundJobStatus.FAILED:
+      return "failed";
+    case BackgroundJobStatus.PROCESSING:
+      return "active";
+    case BackgroundJobStatus.CANCELLED:
+      return "cancelled";
+    default:
+      return "waiting";
+  }
+}
+
+function parsePayload<T>(payload: string | null): T {
+  try {
+    return JSON.parse(payload || "{}") as T;
+  } catch {
+    return {} as T;
+  }
+}
+
+export class PostgresJobQueue<T = unknown> {
   readonly name: string;
+  private readonly jobTypes: string[];
 
   constructor(name: string) {
     this.name = name;
+    this.jobTypes = QUEUE_JOB_TYPES[name] || [];
   }
 
-  async add(name: string, data: T, opts?: { jobId?: string; delay?: number }) {
-    const payloadObj = (data && typeof data === "object") ? (data as Record<string, unknown>) : { data };
+  private toQueuedJob(job: BackgroundJob, name: string, data: T): QueuedJob<T> {
+    return {
+      id: job.deduplicationKey || job.id,
+      name,
+      data,
+      getState: async () => {
+        const fresh = await prisma.backgroundJob.findUnique({ where: { id: job.id }, select: { status: true } });
+        return stateOf(fresh?.status ?? job.status);
+      },
+      remove: async () => {
+        await prisma.backgroundJob.deleteMany({ where: { id: job.id } });
+      },
+    };
+  }
+
+  async add(name: EmailJobName, data: T, opts: EnqueueOptions = {}): Promise<QueuedJob<T>> {
+    const jobType = JOB_TYPE_BY_NAME[name];
+    if (!jobType) {
+      throw new Error(`Unknown job name '${name}' for queue '${this.name}'`);
+    }
+
+    const payloadObj = data && typeof data === "object" ? (data as Record<string, unknown>) : { data };
     const clientId = (payloadObj.clientId as string) || "system";
-    const delayMs = opts?.delay || 0;
-    const availableAt = delayMs > 0 ? new Date(Date.now() + delayMs) : new Date();
+    const delayMs = Math.max(0, opts.delay || 0);
+    const availableAt = new Date(Date.now() + delayMs);
+    const deduplicationKey = opts.jobId || undefined;
 
-    let jobType = "BACKGROUND_JOB";
-    const lowerName = name.toLowerCase();
-    if (lowerName.includes("transactional")) jobType = "TRANSACTIONAL_EMAIL";
-    else if (lowerName.includes("promotional")) jobType = "PROMOTIONAL_EMAIL";
-    else if (lowerName.includes("recipient")) jobType = "CAMPAIGN_RECIPIENT";
-    else if (lowerName.includes("trigger")) jobType = "CAMPAIGN_TRIGGER";
-    else if (lowerName.includes("automation")) jobType = "AUTOMATION_STEP";
-    else if (lowerName.includes("event")) jobType = "EMAIL_EVENT";
-
-    const deduplicationKey = opts?.jobId || undefined;
     if (deduplicationKey) {
-      try {
-        const existing = await prisma.backgroundJob.findFirst({
-          where: { clientId, deduplicationKey },
-        });
-        if (existing) {
-          logger.info(
-            `[WorkerlessQueue] Job '${name}' already exists with deduplicationKey '${deduplicationKey}', returning existing job ${existing.id}`
-          );
-          return {
-            id: deduplicationKey || existing.id,
-            name,
-            data,
-            getState: async () => existing.status.toLowerCase(),
-            remove: async () => {
-              await prisma.backgroundJob.deleteMany({ where: { id: existing.id } }).catch(() => {});
-            },
-          };
-        }
-      } catch {
-        // Table or query check failed, fall through to creation
+      const existing = await prisma.backgroundJob.findFirst({ where: { clientId, deduplicationKey } });
+      if (existing) {
+        logger.info(`[JobQueue] Job '${name}' already enqueued as ${existing.id} (key '${deduplicationKey}')`);
+        return this.toQueuedJob(existing, name, data);
       }
     }
 
     try {
-      const bg = await prisma.backgroundJob.create({
+      const job = await prisma.backgroundJob.create({
         data: {
           clientId,
           type: jobType,
@@ -86,314 +144,105 @@ class WorkerlessQueueAdapter<T = unknown> {
           scheduledAt: availableAt,
           availableAt,
           deduplicationKey,
+          ...(opts.attempts ? { maxAttempts: opts.attempts } : {}),
         },
       });
-
-      logger.info(`[WorkerlessQueue] Job '${name}' persisted durably as BackgroundJob ${bg.id}`);
-      return {
-        id: deduplicationKey || bg.id,
-        name,
-        data,
-        getState: async () => "waiting",
-        remove: async () => {
-          await prisma.backgroundJob.deleteMany({ where: { id: bg.id } }).catch(() => {});
-        },
-      };
+      logger.info(`[JobQueue] Job '${name}' persisted as BackgroundJob ${job.id}`);
+      return this.toQueuedJob(job, name, data);
     } catch (err: unknown) {
-      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
-        if (deduplicationKey) {
-          const existing = await prisma.backgroundJob.findFirst({
-            where: { clientId, deduplicationKey },
-          });
-          if (existing) {
-            logger.info(
-              `[WorkerlessQueue] Job '${name}' already exists with deduplicationKey '${deduplicationKey}', returning existing job ${existing.id}`
-            );
-            return {
-              id: deduplicationKey || existing.id,
-              name,
-              data,
-              getState: async () => existing.status.toLowerCase(),
-              remove: async () => {
-                await prisma.backgroundJob.deleteMany({ where: { id: existing.id } }).catch(() => {});
-              },
-            };
-          }
-        }
+      // Concurrent enqueue with the same key: return the winner
+      if (deduplicationKey && err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+        const existing = await prisma.backgroundJob.findFirst({ where: { clientId, deduplicationKey } });
+        if (existing) return this.toQueuedJob(existing, name, data);
       }
-      logger.error(`[WorkerlessQueue] Failed to persist BackgroundJob for '${name}':`, err);
+      logger.error(`[JobQueue] Failed to persist BackgroundJob for '${name}':`, err);
       throw err;
     }
   }
 
-  async getJob(id: string) {
-    try {
-      const bg = await prisma.backgroundJob.findFirst({
-        where: {
-          OR: [
-            { id },
-            { deduplicationKey: id },
-          ],
-        },
-      });
-      if (!bg) return null;
-
-      let jobName: string = bg.type;
-      if (bg.type === "TRANSACTIONAL_EMAIL") jobName = JOB_NAMES.SEND_TRANSACTIONAL;
-      else if (bg.type === "PROMOTIONAL_EMAIL") jobName = JOB_NAMES.SEND_PROMOTIONAL;
-      else if (bg.type === "CAMPAIGN_RECIPIENT") jobName = JOB_NAMES.SEND_CAMPAIGN_RECIPIENT;
-      else if (bg.type === "CAMPAIGN_TRIGGER") jobName = JOB_NAMES.TRIGGER_SCHEDULED_CAMPAIGN;
-      else if (bg.type === "AUTOMATION_STEP") jobName = JOB_NAMES.PROCESS_AUTOMATION_STEP;
-      else if (bg.type === "EMAIL_EVENT") jobName = JOB_NAMES.PROCESS_EMAIL_EVENT;
-
-      return {
-        id: bg.deduplicationKey || bg.id,
-        name: jobName,
-        data: JSON.parse(bg.payload || "{}") as T,
-        getState: async () => {
-          if (bg.status === BackgroundJobStatus.COMPLETED) return "completed";
-          if (bg.status === BackgroundJobStatus.FAILED) return "failed";
-          if (bg.status === BackgroundJobStatus.PROCESSING) return "active";
-          return "waiting";
-        },
-        remove: async () => {
-          await prisma.backgroundJob.deleteMany({ where: { id: bg.id } }).catch(() => {});
-        },
-      };
-    } catch {
-      return null;
-    }
+  async getJob(id: string): Promise<QueuedJob<T> | null> {
+    const job = await prisma.backgroundJob.findFirst({
+      where: { OR: [{ id }, { deduplicationKey: id }] },
+    });
+    if (!job) return null;
+    return this.toQueuedJob(job, JOB_NAME_BY_TYPE[job.type] || job.type, parsePayload<T>(job.payload));
   }
 
   async getJobCounts(...types: string[]): Promise<Record<string, number>> {
-    try {
-      const now = new Date();
-      const [waiting, active, completed, failed, delayed] = await Promise.all([
-        prisma.backgroundJob.count({
-          where: { status: BackgroundJobStatus.QUEUED, availableAt: { lte: now } },
-        }),
-        prisma.backgroundJob.count({
-          where: { status: BackgroundJobStatus.PROCESSING },
-        }),
-        prisma.backgroundJob.count({
-          where: { status: BackgroundJobStatus.COMPLETED },
-        }),
-        prisma.backgroundJob.count({
-          where: { status: BackgroundJobStatus.FAILED },
-        }),
-        prisma.backgroundJob.count({
-          where: { status: BackgroundJobStatus.QUEUED, availableAt: { gt: now } },
-        }),
-      ]);
-
-      const counts: Record<string, number> = {
-        waiting,
-        active,
-        completed,
-        failed,
-        delayed,
-      };
-
-      if (types.length === 0) return counts;
-      const filtered: Record<string, number> = {};
-      for (const t of types) {
-        filtered[t] = counts[t] || 0;
-      }
-      return filtered;
-    } catch (err) {
-      logger.error("[WorkerlessQueue] Failed to get job counts:", err);
-      return { waiting: 0, active: 0, completed: 0, failed: 0, delayed: 0 };
-    }
+    const now = new Date();
+    const type = { in: this.jobTypes };
+    const [waiting, active, completed, failed, delayed] = await Promise.all([
+      prisma.backgroundJob.count({ where: { type, status: BackgroundJobStatus.QUEUED, availableAt: { lte: now } } }),
+      prisma.backgroundJob.count({ where: { type, status: BackgroundJobStatus.PROCESSING } }),
+      prisma.backgroundJob.count({ where: { type, status: BackgroundJobStatus.COMPLETED } }),
+      prisma.backgroundJob.count({ where: { type, status: BackgroundJobStatus.FAILED } }),
+      prisma.backgroundJob.count({ where: { type, status: BackgroundJobStatus.QUEUED, availableAt: { gt: now } } }),
+    ]);
+    const counts: Record<string, number> = { waiting, active, completed, failed, delayed };
+    if (types.length === 0) return counts;
+    return Object.fromEntries(types.map((t) => [t, counts[t] || 0]));
   }
 
-  async getFailed(start = 0, end = 10) {
-    try {
-      const take = Math.max(1, end - start + 1);
-      const failedJobs = await prisma.backgroundJob.findMany({
-        where: { status: BackgroundJobStatus.FAILED },
-        orderBy: { failedAt: "desc" },
-        skip: start,
-        take,
-      });
-
-      return failedJobs.map((j) => ({
-        id: j.id,
-        name: j.type,
-        data: JSON.parse(j.payload || "{}") as T,
-        failedReason: j.lastErrorMessage || "Execution failed",
-        attemptsMade: j.attemptCount,
-        finishedOn: j.failedAt ? j.failedAt.getTime() : undefined,
-      }));
-    } catch {
-      return [];
-    }
+  /** Deletes this queue's jobs that are still waiting (QUEUED). */
+  async drain(): Promise<void> {
+    await prisma.backgroundJob.deleteMany({
+      where: { type: { in: this.jobTypes }, status: BackgroundJobStatus.QUEUED },
+    });
   }
 
-  async drain() {
-    try {
-      await prisma.backgroundJob.deleteMany({
-        where: { status: BackgroundJobStatus.QUEUED },
-      });
-    } catch (err) {
-      logger.warn("[WorkerlessQueue] Failed to drain queue:", err);
-    }
+  /** Deletes up to `limit` of this queue's jobs in the given state older than `graceMs`. Returns their ids. */
+  async clean(graceMs: number, limit = 1000, state: "completed" | "failed" | "wait" = "completed"): Promise<string[]> {
+    const status = {
+      completed: BackgroundJobStatus.COMPLETED,
+      failed: BackgroundJobStatus.FAILED,
+      wait: BackgroundJobStatus.QUEUED,
+    }[state];
+    const stale = await prisma.backgroundJob.findMany({
+      where: { type: { in: this.jobTypes }, status, updatedAt: { lte: new Date(Date.now() - graceMs) } },
+      select: { id: true },
+      take: limit,
+    });
+    const ids = stale.map((j) => j.id);
+    if (ids.length > 0) await prisma.backgroundJob.deleteMany({ where: { id: { in: ids } } });
+    return ids;
   }
 
-  async clean(grace: number, limit = 1000, type = "completed"): Promise<string[]> {
-    try {
-      const statusMap: Record<string, BackgroundJobStatus> = {
-        completed: BackgroundJobStatus.COMPLETED,
-        failed: BackgroundJobStatus.FAILED,
-        active: BackgroundJobStatus.PROCESSING,
-        wait: BackgroundJobStatus.QUEUED,
-      };
-      const targetStatus = statusMap[type.toLowerCase()] || BackgroundJobStatus.COMPLETED;
-      const graceDate = new Date(Date.now() - grace);
-
-      const toClean = await prisma.backgroundJob.findMany({
-        where: {
-          status: targetStatus,
-          updatedAt: { lte: graceDate },
-        },
-        select: { id: true },
-        take: limit,
-      });
-
-      if (toClean.length > 0) {
-        const ids = toClean.map((j) => j.id);
-        await prisma.backgroundJob.deleteMany({
-          where: { id: { in: ids } },
-        });
-        return ids;
-      }
-      return [];
-    } catch {
-      return [];
-    }
+  async getFailed(start = 0, end = 10): Promise<FailedQueueJob<T>[]> {
+    const failedJobs = await prisma.backgroundJob.findMany({
+      where: { type: { in: this.jobTypes }, status: BackgroundJobStatus.FAILED },
+      orderBy: { failedAt: "desc" },
+      skip: start,
+      take: Math.max(1, end - start + 1),
+    });
+    return failedJobs.map((j) => ({
+      id: j.id,
+      name: JOB_NAME_BY_TYPE[j.type] || j.type,
+      data: parsePayload<T>(j.payload),
+      failedReason: j.lastErrorMessage || "Execution failed",
+      attemptsMade: j.attemptCount,
+      finishedOn: j.failedAt ? j.failedAt.getTime() : undefined,
+    }));
   }
-
-  async isPaused(): Promise<boolean> {
-    return false;
-  }
-
-  async pause(): Promise<void> {}
-
-  async resume(): Promise<void> {}
-
-  async close() {}
 }
 
-let transactionalQueue: Queue<TransactionalJobData | PromotionalJobData> | null = null;
-let campaignQueue: Queue<CampaignJobData | PromotionalJobData | AutomationJobData> | null = null;
-let eventsQueue: Queue<EmailEventJobData> | null = null;
+let transactionalQueue: PostgresJobQueue<TransactionalJobData | PromotionalJobData> | null = null;
+let campaignQueue: PostgresJobQueue<CampaignJobData | PromotionalJobData | AutomationJobData> | null = null;
+let eventsQueue: PostgresJobQueue<EmailEventJobData> | null = null;
 
-let workerlessTransactionalQueue: WorkerlessQueueAdapter<TransactionalJobData | PromotionalJobData> | null = null;
-let workerlessCampaignQueue: WorkerlessQueueAdapter<CampaignJobData | PromotionalJobData | AutomationJobData> | null = null;
-let workerlessEventsQueue: WorkerlessQueueAdapter<EmailEventJobData> | null = null;
-
-function getBaseQueueOptions(): QueueOptions {
-  return {
-    connection: getRedisConnection(),
-    defaultJobOptions: {
-      attempts: parseInt(process.env.EMAIL_QUEUE_MAX_ATTEMPTS || "3", 10),
-      backoff: {
-        type: "exponential",
-        delay: parseInt(process.env.EMAIL_QUEUE_BACKOFF_MS || "2000", 10),
-      },
-      removeOnComplete: {
-        count: 1000,
-        age: 24 * 3600, // 24 hours
-      },
-      removeOnFail: {
-        count: 5000,
-        age: 7 * 24 * 3600, // 7 days
-      },
-    },
-  };
-}
-
-/**
- * Accessor for the transactional email queue.
- */
-export function getTransactionalQueue(): Queue<TransactionalJobData | PromotionalJobData> {
-  if (isWorkerlessMode()) {
-    if (!workerlessTransactionalQueue) {
-      workerlessTransactionalQueue = new WorkerlessQueueAdapter<TransactionalJobData | PromotionalJobData>(
-        QUEUE_NAMES.TRANSACTIONAL
-      );
-    }
-    return workerlessTransactionalQueue as unknown as Queue<TransactionalJobData | PromotionalJobData>;
-  }
-
-  if (!transactionalQueue) {
-    transactionalQueue = new Queue<TransactionalJobData | PromotionalJobData>(
-      QUEUE_NAMES.TRANSACTIONAL,
-      getBaseQueueOptions()
-    );
-  }
+/** Transactional and single promotional email deliveries. */
+export function getTransactionalQueue(): PostgresJobQueue<TransactionalJobData | PromotionalJobData> {
+  if (!transactionalQueue) transactionalQueue = new PostgresJobQueue(QUEUE_NAMES.TRANSACTIONAL);
   return transactionalQueue;
 }
 
-/**
- * Accessor for the promotional campaign queue.
- */
-export function getCampaignQueue(): Queue<CampaignJobData | PromotionalJobData | AutomationJobData> {
-  if (isWorkerlessMode()) {
-    if (!workerlessCampaignQueue) {
-      workerlessCampaignQueue = new WorkerlessQueueAdapter<CampaignJobData | PromotionalJobData | AutomationJobData>(
-        QUEUE_NAMES.CAMPAIGN
-      );
-    }
-    return workerlessCampaignQueue as unknown as Queue<CampaignJobData | PromotionalJobData | AutomationJobData>;
-  }
-
-  if (!campaignQueue) {
-    campaignQueue = new Queue<CampaignJobData | PromotionalJobData | AutomationJobData>(
-      QUEUE_NAMES.CAMPAIGN,
-      getBaseQueueOptions()
-    );
-  }
+/** Campaign recipients, scheduled campaign triggers and automation steps. */
+export function getCampaignQueue(): PostgresJobQueue<CampaignJobData | PromotionalJobData | AutomationJobData> {
+  if (!campaignQueue) campaignQueue = new PostgresJobQueue(QUEUE_NAMES.CAMPAIGN);
   return campaignQueue;
 }
 
-/**
- * Accessor for the email events/webhook queue.
- */
-export function getEventsQueue(): Queue<EmailEventJobData> {
-  if (isWorkerlessMode()) {
-    if (!workerlessEventsQueue) {
-      workerlessEventsQueue = new WorkerlessQueueAdapter<EmailEventJobData>(
-        QUEUE_NAMES.EVENTS
-      );
-    }
-    return workerlessEventsQueue as unknown as Queue<EmailEventJobData>;
-  }
-
-  if (!eventsQueue) {
-    eventsQueue = new Queue<EmailEventJobData>(
-      QUEUE_NAMES.EVENTS,
-      getBaseQueueOptions()
-    );
-  }
+/** Inbound provider email events. */
+export function getEventsQueue(): PostgresJobQueue<EmailEventJobData> {
+  if (!eventsQueue) eventsQueue = new PostgresJobQueue(QUEUE_NAMES.EVENTS);
   return eventsQueue;
-}
-
-/**
- * Closes all active BullMQ queue producer connections cleanly.
- */
-export async function closeAllQueues(): Promise<void> {
-  const closeTasks: Promise<unknown>[] = [];
-  if (transactionalQueue) {
-    closeTasks.push(transactionalQueue.close());
-    transactionalQueue = null;
-  }
-  if (campaignQueue) {
-    closeTasks.push(campaignQueue.close());
-    campaignQueue = null;
-  }
-  if (eventsQueue) {
-    closeTasks.push(eventsQueue.close());
-    eventsQueue = null;
-  }
-  await Promise.allSettled(closeTasks);
 }

@@ -20,6 +20,7 @@ import {
   PermanentError,
 } from "../../errors/job-errors";
 import { logger } from "../../logger";
+import { getCampaignJobId } from "../../email/queue/types";
 
 export interface TriggerCampaignOptions {
   campaignId: string;
@@ -245,7 +246,7 @@ export class CampaignTriggerService {
                 campaignRecipientId: r.id,
                 clientId,
               }),
-              deduplicationKey: `campaign-recip:${r.id}`,
+              deduplicationKey: getCampaignJobId(r.id),
             },
           })
         )

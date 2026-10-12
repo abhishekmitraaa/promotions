@@ -1,26 +1,21 @@
 /**
- * BullMQ Queue & Worker Health Monitoring
+ * Job Queue & Processor Health (PostgreSQL)
  *
- * Provides comprehensive operational observability:
- * - Redis connectivity and round-trip ping latency.
- * - PostgreSQL connectivity and round-trip query latency.
- * - Live worker heartbeats and process telemetry.
- * - Accurate job depth (waiting, active, completed, failed, delayed) per queue.
- * - Dead-letter visibility: inspection of recent failed jobs.
- * - Complete redaction of Redis passwords, DB credentials, and sensitive payload tokens.
+ * - PostgreSQL connectivity and round-trip latency
+ * - Job depth per logical queue (waiting, active, completed, failed, delayed)
+ * - Processor liveness: the cron-driven processor is considered stalled when runnable jobs
+ *   have been waiting longer than PROCESSOR_STALL_THRESHOLD_MS
+ * - Dead-letter visibility: most recent failed jobs, with secrets redacted
  */
 
-import { Queue } from "bullmq";
-import { getRedisConnection, getRedisUrl, sanitizeRedisUrl } from "./connection";
-import {
-  getTransactionalQueue,
-  getCampaignQueue,
-  getEventsQueue,
-  isWorkerlessMode,
-} from "./queues";
+import { BackgroundJobStatus } from "@prisma/client";
+import { getTransactionalQueue, getCampaignQueue, getEventsQueue, PostgresJobQueue } from "./queues";
 import { prisma } from "../../prisma";
-import { workerLogger, sanitizeLogValue } from "./worker-logger";
-import { getActiveWorkerHeartbeats, workerTelemetry, WorkerTelemetrySnapshot } from "./telemetry";
+import { logger } from "../../logger";
+import { redactSecrets } from "../../crypto";
+
+/** Cron runs every minute; a runnable job older than this means the processor is not running. */
+export const PROCESSOR_STALL_THRESHOLD_MS = 5 * 60 * 1000;
 
 export interface QueueJobCounts {
   waiting: number;
@@ -40,21 +35,15 @@ export interface FailedJobSummary {
 
 export interface EmailQueueHealthReport {
   status: "HEALTHY" | "DEGRADED" | "DOWN";
-  redis: {
-    connected: boolean;
-    latencyMs?: number;
-    target: string;
-    error?: string;
-  };
   postgres: {
     connected: boolean;
     latencyMs?: number;
     error?: string;
   };
-  workers: {
-    activeWorkerCount: number;
-    cluster: WorkerTelemetrySnapshot[];
-    localTelemetry: WorkerTelemetrySnapshot;
+  processor: {
+    status: "READY" | "STALLED" | "UNKNOWN";
+    oldestRunnableJobAgeMs?: number;
+    lastActivityAt?: string;
   };
   queues: {
     transactional: QueueJobCounts;
@@ -68,145 +57,116 @@ export interface EmailQueueHealthReport {
   timestamp: string;
 }
 
-export async function getEmailQueueHealth(): Promise<EmailQueueHealthReport> {
-  const isWorkerless = isWorkerlessMode();
-  const safeTarget = isWorkerless ? "workerless (PostgreSQL backed)" : sanitizeRedisUrl(getRedisUrl());
-  let redisConnected = false;
-  let redisLatencyMs: number | undefined;
-  let redisError: string | undefined;
+const EMPTY_COUNTS: QueueJobCounts = { waiting: 0, active: 0, completed: 0, failed: 0, delayed: 0 };
 
+async function safeJobCounts(queue: PostgresJobQueue<unknown>): Promise<QueueJobCounts> {
+  try {
+    const counts = await queue.getJobCounts("waiting", "active", "completed", "failed", "delayed");
+    return {
+      waiting: counts.waiting || 0,
+      active: counts.active || 0,
+      completed: counts.completed || 0,
+      failed: counts.failed || 0,
+      delayed: counts.delayed || 0,
+    };
+  } catch (err) {
+    logger.warn("[QueueHealth] Failed to get queue counts:", err instanceof Error ? err.message : String(err));
+    return { ...EMPTY_COUNTS };
+  }
+}
+
+async function recentFailedJobs(queue: PostgresJobQueue<unknown>): Promise<FailedJobSummary[]> {
+  try {
+    const failed = await queue.getFailed(0, 4);
+    return failed.map((job) => ({
+      id: job.id,
+      name: job.name,
+      failedReason: redactSecrets(job.failedReason) || "Unknown failure",
+      attemptsMade: job.attemptsMade,
+      failedTimestamp: job.finishedOn,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+export async function getEmailQueueHealth(): Promise<EmailQueueHealthReport> {
   let postgresConnected = false;
   let postgresLatencyMs: number | undefined;
   let postgresError: string | undefined;
 
-  // 1. Check Redis Ping
-  try {
-    const redis = getRedisConnection();
-    const start = Date.now();
-    const pong = await redis.ping();
-    redisLatencyMs = Date.now() - start;
-    redisConnected = pong === "PONG";
-  } catch (err) {
-    redisConnected = false;
-    if (!isWorkerless) {
-      redisError = err instanceof Error ? err.message : "Redis connection failed";
-      workerLogger.error("[QueueHealth] Redis ping error", err);
-    }
-  }
-
-  // 2. Check PostgreSQL Ping
   try {
     const start = Date.now();
     await prisma.$queryRawUnsafe("SELECT 1");
     postgresLatencyMs = Date.now() - start;
     postgresConnected = true;
   } catch (err) {
-    postgresError = err instanceof Error ? err.message : "PostgreSQL connection failed";
-    workerLogger.error("[QueueHealth] PostgreSQL ping error", err);
+    postgresError = err instanceof Error ? redactSecrets(err.message) : "PostgreSQL connection failed";
+    logger.error("[QueueHealth] PostgreSQL ping error", err);
   }
 
-  // 3. Helper to safely get counts
-  async function safeJobCounts(queueGetter: () => Queue): Promise<QueueJobCounts> {
+  const transactionalQueue = getTransactionalQueue() as PostgresJobQueue<unknown>;
+  const campaignQueue = getCampaignQueue() as PostgresJobQueue<unknown>;
+  const eventsQueue = getEventsQueue() as PostgresJobQueue<unknown>;
+
+  const [transactionalCounts, campaignCounts, eventsCounts, failedTransactional, failedCampaign] = postgresConnected
+    ? await Promise.all([
+        safeJobCounts(transactionalQueue),
+        safeJobCounts(campaignQueue),
+        safeJobCounts(eventsQueue),
+        recentFailedJobs(transactionalQueue),
+        recentFailedJobs(campaignQueue),
+      ])
+    : [{ ...EMPTY_COUNTS }, { ...EMPTY_COUNTS }, { ...EMPTY_COUNTS }, [], []];
+
+  // Processor liveness from job timestamps
+  let processor: EmailQueueHealthReport["processor"] = { status: "UNKNOWN" };
+  if (postgresConnected) {
     try {
-      if (!isWorkerless && !redisConnected) {
-        return { waiting: 0, active: 0, completed: 0, failed: 0, delayed: 0 };
-      }
-      const queue = queueGetter();
-      const counts = await queue.getJobCounts(
-        "waiting",
-        "active",
-        "completed",
-        "failed",
-        "delayed"
-      );
-      return {
-        waiting: counts.waiting || 0,
-        active: counts.active || 0,
-        completed: counts.completed || 0,
-        failed: counts.failed || 0,
-        delayed: counts.delayed || 0,
+      const now = Date.now();
+      const [oldestRunnable, lastActive] = await Promise.all([
+        prisma.backgroundJob.findFirst({
+          where: { status: BackgroundJobStatus.QUEUED, availableAt: { lte: new Date(now) } },
+          orderBy: { availableAt: "asc" },
+          select: { availableAt: true },
+        }),
+        prisma.backgroundJob.findFirst({
+          where: { lastAttemptAt: { not: null } },
+          orderBy: { lastAttemptAt: "desc" },
+          select: { lastAttemptAt: true },
+        }),
+      ]);
+      const oldestAge = oldestRunnable ? now - oldestRunnable.availableAt.getTime() : undefined;
+      processor = {
+        status: oldestAge !== undefined && oldestAge > PROCESSOR_STALL_THRESHOLD_MS ? "STALLED" : "READY",
+        oldestRunnableJobAgeMs: oldestAge,
+        lastActivityAt: lastActive?.lastAttemptAt?.toISOString(),
       };
     } catch (err) {
-      workerLogger.warn("[QueueHealth] Failed to get queue counts", {
-        error: err instanceof Error ? err.message : String(err),
-      });
-      return { waiting: 0, active: 0, completed: 0, failed: 0, delayed: 0 };
+      logger.warn("[QueueHealth] Processor liveness check failed:", err instanceof Error ? err.message : String(err));
     }
   }
 
-  // 4. Helper to inspect recent failed jobs (dead-letter visibility)
-  async function getRecentFailedJobs(queueGetter: () => Queue): Promise<FailedJobSummary[]> {
-    try {
-      if (!isWorkerless && !redisConnected) return [];
-      const queue = queueGetter();
-      const failed = await queue.getFailed(0, 4); // Latest 5 failed jobs
-      return failed.map((job) => ({
-        id: job.id || "unknown",
-        name: job.name,
-        failedReason: (sanitizeLogValue("failedReason", job.failedReason) as string) || "Unknown failure",
-        attemptsMade: job.attemptsMade,
-        failedTimestamp: job.finishedOn,
-      }));
-    } catch {
-      return [];
-    }
-  }
-
-  const [transactionalCounts, campaignCounts, eventsCounts] = await Promise.all([
-    safeJobCounts(getTransactionalQueue),
-    safeJobCounts(getCampaignQueue),
-    safeJobCounts(getEventsQueue),
-  ]);
-
-  const [failedTransactional, failedCampaign] = await Promise.all([
-    getRecentFailedJobs(getTransactionalQueue),
-    getRecentFailedJobs(getCampaignQueue),
-  ]);
-
-  // 5. Query active worker heartbeats from Redis
-  let activeClusterWorkers: WorkerTelemetrySnapshot[] = [];
-  if (redisConnected) {
-    try {
-      const redis = getRedisConnection();
-      activeClusterWorkers = await getActiveWorkerHeartbeats(redis);
-    } catch {
-      activeClusterWorkers = [];
-    }
-  }
-
-  const localTelemetry = workerTelemetry.getSnapshot();
-
-  // 6. Overall Status Determination
-  let status: "HEALTHY" | "DEGRADED" | "DOWN" = "HEALTHY";
-  if (!postgresConnected || (!isWorkerless && !redisConnected)) {
+  let status: EmailQueueHealthReport["status"] = "HEALTHY";
+  if (!postgresConnected) {
     status = "DOWN";
   } else if (
+    processor.status === "STALLED" ||
     transactionalCounts.failed > 50 ||
     campaignCounts.failed > 50 ||
-    (!isWorkerless && redisLatencyMs && redisLatencyMs > 500) ||
-    (postgresLatencyMs && postgresLatencyMs > 500)
+    (postgresLatencyMs !== undefined && postgresLatencyMs > 500)
   ) {
     status = "DEGRADED";
   }
 
   return {
     status,
-    redis: {
-      connected: redisConnected,
-      latencyMs: redisLatencyMs,
-      target: safeTarget,
-      error: redisError,
-    },
     postgres: {
       connected: postgresConnected,
       latencyMs: postgresLatencyMs,
       error: postgresError,
     },
-    workers: {
-      activeWorkerCount: activeClusterWorkers.length,
-      cluster: activeClusterWorkers,
-      localTelemetry,
-    },
+    processor,
     queues: {
       transactional: transactionalCounts,
       campaign: campaignCounts,

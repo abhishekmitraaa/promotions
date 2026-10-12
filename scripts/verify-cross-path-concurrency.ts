@@ -16,7 +16,7 @@ if (!process.env.DATABASE_URL || process.env.DATABASE_URL.includes("peqynzeioiau
 if (!process.env.DIRECT_URL || process.env.DIRECT_URL.includes("peqynzeioiauynfpdsdv") || process.env.DIRECT_URL.includes("supabase.co")) {
   process.env.DIRECT_URL = "postgresql://postgres:postgres@127.0.0.1:5433/email_test";
 }
-process.env.WORKERLESS_MODE = "true";
+
 process.env.NODE_ENV = "test";
 process.env.ALLOW_DESTRUCTIVE_TESTS = "true";
 process.env.INTERNAL_PROCESSOR_SECRET = "test-internal-processor-secret-1234567890";
@@ -39,7 +39,8 @@ import { RetryableError, isRetryableError } from "../src/lib/errors/job-errors";
 import { checkRateLimit } from "../src/lib/rate-limit";
 import { RetryableEmailError } from "../src/lib/email/queue/types";
 import { SEND_IN_FLIGHT_SUFFIX, SEND_OUTCOME_UNKNOWN } from "../src/lib/services/executors/claim-lock";
-import { isWorkerlessMode } from "../src/lib/email/queue/queues";
+import { getCampaignQueue } from "../src/lib/email/queue/queues";
+import { JOB_NAMES } from "../src/lib/email/queue/types";
 import * as envModule from "../src/lib/env";
 import { NextRequest } from "next/server";
 import {
@@ -77,6 +78,7 @@ class TrackingMockProvider implements EmailProvider {
   // Test hooks: run a side effect during send (e.g. simulate a stale reclaim), or fail the next send
   onSend: (() => Promise<void>) | null = null;
   nextError: Error | null = null;
+  nextFailure: EmailSendResult["error"] | null = null;
 
   async send(request: EmailSendRequest): Promise<EmailSendResult> {
     this.sendCount++;
@@ -86,6 +88,11 @@ class TrackingMockProvider implements EmailProvider {
       const err = this.nextError;
       this.nextError = null;
       throw err;
+    }
+    if (this.nextFailure) {
+      const error = this.nextFailure;
+      this.nextFailure = null;
+      return { accepted: false, success: false, providerName: this.name, providerType: this.providerType, providerStatus: "FAILED", error };
     }
     // Add artificial jitter to expose concurrent race windows
     await new Promise((resolve) => setTimeout(resolve, 30));
@@ -797,37 +804,164 @@ async function main() {
   }
 
   // ============================================================================
+  // Test 16: Single promotional sends enforce consent, unsubscribe headers and tracking
+  // ============================================================================
+  console.log("\n▶ [Regression 16] Promotional deliveries enforce consent and add unsubscribe/tracking...");
+
+  await prisma.emailContact.createMany({
+    data: [
+      { clientId: testTenant, email: "no-consent@example.com", normalizedEmail: "no-consent@example.com", status: "PENDING", hasMarketingConsent: false },
+      { clientId: testTenant, email: "opted-in@example.com", normalizedEmail: "opted-in@example.com", status: "SUBSCRIBED", hasMarketingConsent: true },
+    ],
+  });
+  const promoBase = {
+    clientId: testTenant,
+    providerType: EmailProviderType.MOCK,
+    category: EmailType.PROMOTIONAL,
+    from: "marketing@example.com",
+    subject: "Promo",
+    htmlContent: '<p>Deal: <a href="https://shop.example.com/deal">open</a></p>',
+    status: EmailDeliveryStatus.QUEUED,
+  };
+  const noConsentDelivery = await prisma.emailDelivery.create({ data: { ...promoBase, to: "no-consent@example.com" } });
+  const optedInDelivery = await prisma.emailDelivery.create({ data: { ...promoBase, to: "opted-in@example.com" } });
+
+  trackingProvider.sendCount = 0;
+  trackingProvider.sentPayloads = [];
+  let consentThrew = false;
+  try {
+    await EmailDeliveryExecutor.execute({ deliveryId: noConsentDelivery.id });
+  } catch {
+    consentThrew = true;
+  }
+  const noConsentAfter = await prisma.emailDelivery.findUnique({ where: { id: noConsentDelivery.id } });
+  assert(consentThrew && trackingProvider.sendCount === 0, `No-consent contact is not emailed (sendCount: ${trackingProvider.sendCount})`);
+  assert(
+    noConsentAfter?.status === EmailDeliveryStatus.FAILED && noConsentAfter?.errorCode === "MARKETING_CONSENT_REQUIRED",
+    `No-consent delivery FAILED with MARKETING_CONSENT_REQUIRED (actual: ${noConsentAfter?.status}/${noConsentAfter?.errorCode})`
+  );
+
+  await EmailDeliveryExecutor.execute({ deliveryId: optedInDelivery.id });
+  const optedInPayload = trackingProvider.sentPayloads.find((p) => p.to === "opted-in@example.com");
+  assert(Boolean(optedInPayload?.headers?.["List-Unsubscribe"]), "Opted-in promotional email carries List-Unsubscribe header");
+  assert(
+    Boolean(optedInPayload?.html?.includes("/api/email/track/open/")) && Boolean(optedInPayload?.html?.includes("/api/email/track/click/")),
+    "Promotional HTML has open pixel and wrapped links"
+  );
+
+  // ============================================================================
+  // Test 17: Campaign emails carry open/click tracking bound to their delivery
+  // ============================================================================
+  console.log("\n▶ [Regression 17] Campaign recipient emails are tracked...");
+
+  const trackedVersion = await prisma.emailTemplateVersion.create({
+    data: {
+      templateId: template.id,
+      version: 2,
+      subject: "Tracked Campaign",
+      htmlContent: '<p>Hi {{email}} <a href="https://shop.example.com/sale">Sale</a></p>',
+      textContent: "Hi {{email}}",
+    },
+  });
+  const trackedCampaign = await prisma.emailCampaign.create({
+    data: { clientId: testTenant, name: "Tracked Campaign", templateVersionId: trackedVersion.id, status: EmailCampaignStatus.RUNNING, totalRecipients: 1 },
+  });
+  const trackedRecipient = await prisma.emailCampaignRecipient.create({
+    data: { campaignId: trackedCampaign.id, email: "tracked@example.com", status: "PENDING" },
+  });
+  trackingProvider.sentPayloads = [];
+  const trackedResult = await CampaignRecipientExecutor.executeRecipient({ recipientId: trackedRecipient.id });
+  const trackedPayload = trackingProvider.sentPayloads.find((p) => p.to === "tracked@example.com");
+  const trackedDelivery = trackedResult.deliveryId
+    ? await prisma.emailDelivery.findUnique({ where: { id: trackedResult.deliveryId } })
+    : null;
+  assert(
+    Boolean(trackedPayload?.html?.includes("/api/email/track/open/")) && Boolean(trackedPayload?.html?.includes("/api/email/track/click/")),
+    "Campaign HTML has open pixel and wrapped links"
+  );
+  assert(trackedDelivery?.status === EmailDeliveryStatus.SENT, `Tracked campaign delivery recorded as SENT (actual: ${trackedDelivery?.status})`);
+
+  // ============================================================================
+  // Test 18: Provider-reported retryable failures are retried (not keyword-guessed)
+  // ============================================================================
+  console.log("\n▶ [Regression 18] Provider retryable flag drives retry classification...");
+
+  const timeoutDelivery = await prisma.emailDelivery.create({
+    data: {
+      clientId: testTenant,
+      providerType: EmailProviderType.MOCK,
+      category: EmailType.TRANSACTIONAL,
+      from: "timeout@example.com",
+      to: "timeout-recipient@example.com",
+      subject: "Provider timeout",
+      textContent: "Retry me",
+      status: EmailDeliveryStatus.QUEUED,
+    },
+  });
+  trackingProvider.nextFailure = { code: "NETWORK_TIMEOUT", message: "Gmail API send timed out after 10000ms", retryable: true, statusCode: 408 };
+  try {
+    await EmailDeliveryExecutor.execute({ deliveryId: timeoutDelivery.id });
+  } catch {
+    // expected retryable error
+  }
+  const timeoutAfter = await prisma.emailDelivery.findUnique({ where: { id: timeoutDelivery.id } });
+  assert(timeoutAfter?.status === EmailDeliveryStatus.QUEUED, `Provider timeout is retried (actual: ${timeoutAfter?.status})`);
+
+  const rejectedDelivery = await prisma.emailDelivery.create({
+    data: {
+      clientId: testTenant,
+      providerType: EmailProviderType.MOCK,
+      category: EmailType.TRANSACTIONAL,
+      from: "rejected@example.com",
+      to: "rejected-recipient@example.com",
+      subject: "Provider rejection",
+      textContent: "Do not retry",
+      status: EmailDeliveryStatus.QUEUED,
+    },
+  });
+  trackingProvider.nextFailure = { code: "AUTHENTICATION_FAILED", message: "Gmail OAuth token rejected or revoked (503 upstream)", retryable: false, statusCode: 401 };
+  try {
+    await EmailDeliveryExecutor.execute({ deliveryId: rejectedDelivery.id });
+  } catch {
+    // expected permanent error
+  }
+  const rejectedAfter = await prisma.emailDelivery.findUnique({ where: { id: rejectedDelivery.id } });
+  assert(rejectedAfter?.status === EmailDeliveryStatus.FAILED, `Provider non-retryable failure is final (actual: ${rejectedAfter?.status})`);
+  await prisma.emailDelivery.updateMany({
+    where: { id: { in: [timeoutDelivery.id] } },
+    data: { status: EmailDeliveryStatus.FAILED },
+  });
+
+  // ============================================================================
   // Test 15: Configuration safety (queue mode, public URL)
   // ============================================================================
   console.log("\n▶ [Regression 15] Configuration safety defaults...");
 
-  const savedWorkerless = process.env.WORKERLESS_MODE;
-  const savedRedis = process.env.REDIS_URL;
-  try {
-    delete process.env.WORKERLESS_MODE;
-    process.env.REDIS_URL = "rediss://default:secret@example-remote.upstash.io:6379";
-    assert(isWorkerlessMode() === true, "Remote REDIS_URL alone does not switch async email to BullMQ");
-    process.env.WORKERLESS_MODE = "false";
-    assert(isWorkerlessMode() === false, "WORKERLESS_MODE=false explicitly opts into BullMQ");
+  const recurringJob = await getCampaignQueue().add(
+    JOB_NAMES.TRIGGER_RECURRING_AUTOMATION,
+    { automationId: `auto-${Date.now()}`, clientId: testTenant },
+    { delay: 60 * 60 * 1000 }
+  );
+  const recurringRow = await prisma.backgroundJob.findFirst({
+    where: { OR: [{ id: recurringJob.id }, { deduplicationKey: recurringJob.id }] },
+  });
+  assert(
+    recurringRow?.type === "RECURRING_AUTOMATION",
+    `Recurring automation jobs are stored as RECURRING_AUTOMATION, not CAMPAIGN_TRIGGER (actual: ${recurringRow?.type})`
+  );
+  if (recurringRow) await prisma.backgroundJob.delete({ where: { id: recurringRow.id } });
 
-    delete process.env.REDIS_URL;
-    const criticalLimit = await checkRateLimit(`rl:regression-${Date.now()}`, 5, 60000, {
-      criticality: "CRITICAL",
-      failClosed: true,
-    });
-    assert(
-      criticalLimit.success === true && criticalLimit.backend === "postgres",
-      `Without REDIS_URL, critical limits use PostgreSQL instead of failing closed (success: ${criticalLimit.success}, backend: ${criticalLimit.backend})`
-    );
+  const criticalLimit = await checkRateLimit(`rl:regression-${Date.now()}`, 5, 60000, {
+    criticality: "CRITICAL",
+    failClosed: true,
+  });
+  assert(
+    criticalLimit.success === true && criticalLimit.backend === "postgres",
+    `Critical limits are enforced in PostgreSQL (success: ${criticalLimit.success}, backend: ${criticalLimit.backend})`
+  );
 
-    const transientDbError = Object.assign(new Error("Can't reach database server"), { code: "P1001" });
-    assert(isRetryableError(transientDbError) === true, "Prisma connection errors (P1001) are retryable");
-  } finally {
-    if (savedWorkerless === undefined) delete process.env.WORKERLESS_MODE;
-    else process.env.WORKERLESS_MODE = savedWorkerless;
-    if (savedRedis === undefined) delete process.env.REDIS_URL;
-    else process.env.REDIS_URL = savedRedis;
-  }
+  const transientDbError = Object.assign(new Error("Can't reach database server"), { code: "P1001" });
+  assert(isRetryableError(transientDbError) === true, "Prisma connection errors (P1001) are retryable");
 
   const getPublicAppUrl = (envModule as { getPublicAppUrl?: () => string }).getPublicAppUrl;
   const savedAppUrl = process.env.APP_URL;

@@ -34,7 +34,6 @@ export async function POST(req: NextRequest) {
 
   const rl = await checkRateLimit(`create_auto_${auth.clientId}`, 20, 60000, {
     criticality: "HIGH",
-    syncToDb: true,
   });
   if (!rl.success) {
     return rateLimitResponse(rl, "Too many automation creation requests. Please wait.");

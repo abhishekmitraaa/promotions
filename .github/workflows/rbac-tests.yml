@@ -24,23 +24,11 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
 
     env:
       NODE_ENV: test
       DATABASE_URL: postgresql://postgres:postgres@localhost:5432/whatsapp_hub
       DIRECT_URL: postgresql://postgres:postgres@localhost:5432/whatsapp_hub
-      REDIS_URL: redis://localhost:6379
-      REDIS_HOST: localhost
-      REDIS_PORT: "6379"
       AUTH_SESSION_SECRET: rbac-ci-session-secret-32-characters-minimum
       API_KEY_PEPPER: rbac-ci-api-key-pepper-32-characters-min
       WEBHOOK_SECRET_ENCRYPTION_KEY: rbac-ci-webhook-key-32-characters-min

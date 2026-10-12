@@ -18,7 +18,10 @@
  * 14. ADMIN success (complete browser redirect flow)
  */
 
-process.env.REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
+// Never touch production: the OAuth state store is PostgreSQL-backed.
+if (!process.env.DATABASE_URL || process.env.DATABASE_URL.includes("peqynzeioiauynfpdsdv") || process.env.DATABASE_URL.includes("supabase.co") || process.env.DATABASE_URL.includes("supabase.com")) {
+  process.env.DATABASE_URL = "postgresql://postgres:postgres@127.0.0.1:5433/email_test";
+}
 
 import { NextRequest } from "next/server";
 import { GET as getOAuthUrl } from "../src/app/api/admin/email/providers/google/oauth/route";
@@ -27,13 +30,12 @@ import { GET as listProviders } from "../src/app/api/admin/email/providers/route
 import {
   createOAuthState,
   OAuthTransactionStore,
-  RedisOAuthTransactionStore,
+  PostgresOAuthTransactionStore,
   verifyAndConsumeOAuthState,
   generateGoogleAuthUrl,
 } from "../src/lib/email/providers/gmail/oauth";
 import { GMAIL_SEND_SCOPE, GOOGLE_TOKEN_ENDPOINT } from "../src/lib/email/providers/gmail/gmail-provider";
 import { GOOGLE_USERINFO_ENDPOINT } from "../src/lib/email/providers/gmail/oauth";
-import { closeRedisConnections } from "../src/lib/email/queue/connection";
 import { createSessionToken, hashSessionToken, SESSION_COOKIE } from "../src/lib/auth";
 import { decryptProviderCredential } from "../src/lib/crypto";
 import { prisma } from "../src/lib/prisma";
@@ -644,8 +646,8 @@ async function runOAuthVerification() {
     console.log("\n--- [17] Multi-Instance & Process Restart Simulation ---");
 
     // Simulation A: Multi-Instance State Sharing
-    const instanceAStore = new RedisOAuthTransactionStore();
-    const instanceBStore = new RedisOAuthTransactionStore();
+    const instanceAStore = new PostgresOAuthTransactionStore();
+    const instanceBStore = new PostgresOAuthTransactionStore();
     const multiInstNonce = "multi-inst-" + Date.now();
 
     await instanceAStore.save(multiInstNonce, {
@@ -666,7 +668,7 @@ async function runOAuthVerification() {
     testAssert(instanceBConsume.status === "OK", "MULTI-INSTANCE: Instance B successfully consumes state created on Instance A");
 
     // Instance C attempts to consume already consumed state
-    const instanceCStore = new RedisOAuthTransactionStore();
+    const instanceCStore = new PostgresOAuthTransactionStore();
     const instanceCConsume = await instanceCStore.consume(multiInstNonce);
     testAssert(instanceCConsume.status === "ALREADY_USED", "MULTI-INSTANCE: Instance C receives ALREADY_USED for state consumed on Instance B");
 
@@ -676,7 +678,7 @@ async function runOAuthVerification() {
     // Simulate process crash: clear in-process singleton backend reference
     OAuthTransactionStore.setBackend(null);
 
-    // New process instance boots up and validates state from Redis
+    // New process instance boots up and validates state from PostgreSQL
     const verifyAfterRestart = await verifyAndConsumeOAuthState(restartState, adminId);
     testAssert(verifyAfterRestart.valid === true, "PROCESS RESTART: Valid state survives process restart and in-memory wipe");
 
@@ -728,7 +730,7 @@ async function runOAuthVerification() {
     (prisma.emailSenderIdentity as any).upsert = origIdentityUpsert;
     (prisma.emailSenderIdentity as any).findMany = origIdentityFindMany;
     await OAuthTransactionStore.clear();
-    await closeRedisConnections();
+    await prisma.$disconnect();
   }
 
   console.log("\n-------------------------------------------------");

@@ -18,7 +18,6 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
   // Tenant limit: 10 test sends per minute
   const rl = await checkRateLimit(`test_email_${auth.clientId}`, 10, 60000, {
     criticality: "HIGH",
-    syncToDb: true,
   });
   if (!rl.success) {
     return rateLimitResponse(

@@ -43,7 +43,6 @@ All configurations are defined in `.env.local` for local development, or configu
 | `DATABASE_URL` | String | Required | Supabase PostgreSQL pooled connection URL (port 6543, `?pgbouncer=true`). |
 | `DIRECT_URL` | String | Optional | Supabase PostgreSQL direct connection URL (port 5432) for migrations. |
 | `APP_URL` | String | `http://localhost:3000` | Base public URL of your service. |
-| `REDIS_URL` | String | `redis://localhost:6379` | Optional Redis URL for distributed rate limiting (no BullMQ worker required). |
 | `AUTH_SESSION_SECRET` | String | Min 32 chars | Cryptographic secret for signing HttpOnly session cookies. Required in production. |
 | `INTERNAL_PROCESSOR_SECRET` | String | Min 32 chars | Machine-to-machine authentication secret for Supabase Cron workerless processor (`/api/internal/process-jobs`). |
 | `API_KEY_PEPPER` | String | Auto-generated | Secret pepper used for HMAC-SHA256 hashing of API keys. Min 32 chars in production. |
@@ -87,19 +86,16 @@ To connect Gmail / Google Workspace as an email provider:
 
 ---
 
-## 5. BullMQ Email Worker Daemon
+## 5. Background Job Processing (no worker process)
 
-Asynchronous email dispatches, campaign recipient fan-outs, and delivery retries are executed by a persistent BullMQ worker daemon:
+Asynchronous email dispatches, campaign fan-outs and retries are stored as `BackgroundJob` rows. In production, Supabase Cron calls `POST /api/internal/process-jobs` every minute. Locally, trigger a cycle by hand:
 
 ```bash
-# Start the local email background worker
-npm run worker:email
+curl -X POST http://localhost:3000/api/internal/process-jobs \
+  -H "Authorization: Bearer $INTERNAL_PROCESSOR_SECRET"
 ```
 
-Ensure Redis is running locally:
-```bash
-docker run -d -p 6379:6379 redis:7-alpine
-```
+or, as an Admin, `POST /api/admin/jobs/process` from the dashboard session.
 
 ---
 
@@ -126,7 +122,7 @@ npm test
 npm run test:email
 
 # Specific subsystem email tests
-npm run test:email:queue      # BullMQ queue, retries, bounded backoff, idempotency
+npm run test:email:queue      # Delivery executor, retries, bounded backoff, idempotency
 npm run test:email:campaign   # Safe template engine, immutable versioning, campaign lifecycle
 npm run test:email:security   # Cross-tenant isolation (9 domains), RBAC, rate limiting, audit logging
 

@@ -4,17 +4,18 @@
 
 In a multi-instance serverless or containerized deployment, in-memory rate limiters maintain isolated state per instance. This flaw enables attackers to bypass quotas via instance-hopping, allows high-concurrency bursts across distributed instances, and permits noisy neighbors to deplete shared shared capacity.
 
-The WhatsApp & Email Platform employs an atomic, distributed rate-limiting engine powered by **Redis** (with transactional Lua sliding-window scripts) and backed by PostgreSQL dual-layer persistence for auditability and graceful degradation.
+The WhatsApp & Email Platform employs an atomic, distributed rate-limiting engine backed by the **PostgreSQL `RateLimit` table**, which every serverless instance shares. There is no Redis.
 
 ---
 
-## 2. Sliding Window Lua Engine
+## 2. Atomic Fixed-Window Counter
 
-Rate limiting is implemented using an atomic sliding-window algorithm executed server-side via Redis Lua scripts:
-- **`ZREMRANGEBYSCORE`**: Evicts timestamps older than `now - windowMs`.
-- **`ZCARD`**: Evaluates total requests within the active sliding window.
-- **`ZADD` & `PEXPIRE`**: Atomically records current request timestamps if under quota.
-- **Deterministic Reset Calculation**: When a request is throttled, the oldest score in the set is inspected to compute the exact remaining seconds until the window opens, returned deterministically via the `Retry-After` header.
+Each check is a single `INSERT ... ON CONFLICT DO UPDATE ... RETURNING` on the `RateLimit` row for the key:
+- If the window (`resetAt`) has expired, the counter restarts at 1 with a new `resetAt`.
+- Otherwise the counter is incremented; the request is allowed while `count <= limit`.
+- `Retry-After` is the number of seconds until `resetAt`.
+
+Because the increment and the read happen in one statement, concurrent requests across instances cannot over-admit (verified: exactly 10 of 40 simultaneous requests pass a limit of 10).
 
 ---
 
@@ -22,10 +23,10 @@ Rate limiting is implemented using an atomic sliding-window algorithm executed s
 
 Endpoints are categorized into criticality tiers to ensure system resilience and fail-safe security:
 
-| Criticality Tier | Failure Mode | Behavior on Redis Outage | Use Case |
+| Criticality Tier | Failure Mode | Behavior if the database limiter is unavailable | Use Case |
 | :--- | :--- | :--- | :--- |
 | **`CRITICAL`** | **Fail-Closed** | Rejects with HTTP `503 Service Unavailable`, `RATE_LIMITER_UNAVAILABLE`, and `Retry-After: 5`. | Auth login, Password reset, Email verification, OTP request/verify. |
-| **`HIGH`** | **Graceful Degradation** | Degrades to secondary PostgreSQL rate limit table or emergency memory store. | Public email send (`/api/v1/email/send`), Public WhatsApp send (`/api/v1/messages`). |
+| **`HIGH`** | **Graceful Degradation** | Degrades to a per-instance in-memory limiter. | Public email send (`/api/v1/email/send`), Public WhatsApp send (`/api/v1/messages`). |
 | **`STANDARD`** | **Graceful Degradation** | Degrades to fallback storage; preserves business operations with warning logs. | Campaign dispatch, template test sends, admin management actions. |
 | **`LOW`** | **Fail-Open** | Allows traffic without blocking inbound webhooks; logs alerts for monitoring. | Inbound webhook receivers (WhatsApp webhook, Gmail/SES webhooks). |
 
@@ -64,16 +65,16 @@ Rate limiting is evaluated along multiple dimensions simultaneously to prevent e
 | `/api/v1/messages` (WhatsApp) | POST | Tenant Quota | 60 | 60s (1m) | `HIGH` | `RATE_LIMIT_EXCEEDED` | 429 |
 | `/api/v1/messages` (WhatsApp) | POST | Client IP | 60 | 60s (1m) | `HIGH` | `RATE_LIMIT_EXCEEDED` | 429 |
 | `/api/v1/messages` (WhatsApp) | POST | Recipient Phone (`rl:tenant:*:phone:*`) | 30 | 60s (1m) | `HIGH` | `RECIPIENT_RATE_LIMITED` | 429 |
-| `/api/v1/otp/request` | POST | Client IP & Destination | 5 | 900s (15m) | `CRITICAL` | `RATE_LIMIT_EXCEEDED` | 429 (503 on Redis fail) |
-| `/api/v1/otp/verify` | POST | Client IP & Destination | 5 | 900s (15m) | `CRITICAL` | `RATE_LIMIT_EXCEEDED` | 429 (503 on Redis fail) |
-| `/api/auth/login` | POST | Client IP (`login:{ip}`) | 10 | 900s (15m) | `CRITICAL` | `RATE_LIMIT_EXCEEDED` | 429 (503 on Redis fail) |
-| `/api/auth/login` | POST | Target Account (`rl:acct:{email}:login`) | 25 | 900s (15m) | `CRITICAL` | `ACCOUNT_RATE_LIMITED` | 429 (503 on Redis fail) |
-| `/api/auth/forgot-password` | POST | Client IP | 5 | 900s (15m) | `CRITICAL` | `RATE_LIMIT_EXCEEDED` | 429 (503 on Redis fail) |
-| `/api/auth/forgot-password` | POST | Target Account | 3 | 900s (15m) | `CRITICAL` | `RATE_LIMIT_EXCEEDED` | 429 (503 on Redis fail) |
-| `/api/auth/reset-password` | POST | Client IP | 10 | 900s (15m) | `CRITICAL` | `RATE_LIMIT_EXCEEDED` | 429 (503 on Redis fail) |
-| `/api/auth/send-verification` | POST | Client IP | 5 | 900s (15m) | `CRITICAL` | `RATE_LIMIT_EXCEEDED` | 429 (503 on Redis fail) |
-| `/api/auth/send-verification` | POST | Target Account | 3 | 900s (15m) | `CRITICAL` | `RATE_LIMIT_EXCEEDED` | 429 (503 on Redis fail) |
-| `/api/auth/verify-email` | GET | Client IP | 20 | 900s (15m) | `CRITICAL` | `RATE_LIMIT_EXCEEDED` | 429 (503 on Redis fail) |
+| `/api/v1/otp/request` | POST | Client IP & Destination | 5 | 900s (15m) | `CRITICAL` | `RATE_LIMIT_EXCEEDED` | 429 (503 if limiter unavailable) |
+| `/api/v1/otp/verify` | POST | Client IP & Destination | 5 | 900s (15m) | `CRITICAL` | `RATE_LIMIT_EXCEEDED` | 429 (503 if limiter unavailable) |
+| `/api/auth/login` | POST | Client IP (`login:{ip}`) | 10 | 900s (15m) | `CRITICAL` | `RATE_LIMIT_EXCEEDED` | 429 (503 if limiter unavailable) |
+| `/api/auth/login` | POST | Target Account (`rl:acct:{email}:login`) | 25 | 900s (15m) | `CRITICAL` | `ACCOUNT_RATE_LIMITED` | 429 (503 if limiter unavailable) |
+| `/api/auth/forgot-password` | POST | Client IP | 5 | 900s (15m) | `CRITICAL` | `RATE_LIMIT_EXCEEDED` | 429 (503 if limiter unavailable) |
+| `/api/auth/forgot-password` | POST | Target Account | 3 | 900s (15m) | `CRITICAL` | `RATE_LIMIT_EXCEEDED` | 429 (503 if limiter unavailable) |
+| `/api/auth/reset-password` | POST | Client IP | 10 | 900s (15m) | `CRITICAL` | `RATE_LIMIT_EXCEEDED` | 429 (503 if limiter unavailable) |
+| `/api/auth/send-verification` | POST | Client IP | 5 | 900s (15m) | `CRITICAL` | `RATE_LIMIT_EXCEEDED` | 429 (503 if limiter unavailable) |
+| `/api/auth/send-verification` | POST | Target Account | 3 | 900s (15m) | `CRITICAL` | `RATE_LIMIT_EXCEEDED` | 429 (503 if limiter unavailable) |
+| `/api/auth/verify-email` | GET | Client IP | 20 | 900s (15m) | `CRITICAL` | `RATE_LIMIT_EXCEEDED` | 429 (503 if limiter unavailable) |
 | `/api/email/templates/[id]/test-send` | POST | Tenant Quota | 10 | 60s (1m) | `STANDARD` | `RATE_LIMIT_EXCEEDED` | 429 |
 | `/api/email/templates/[id]/test-send` | POST | Test Recipient | 5 | 60s (1m) | `STANDARD` | `RECIPIENT_RATE_LIMITED` | 429 |
 | `/api/email/campaigns/[id]/test-send` | POST | Tenant Quota | 10 | 60s (1m) | `STANDARD` | `RATE_LIMIT_EXCEEDED` | 429 |
@@ -109,7 +110,7 @@ X-RateLimit-Reset: 35
 }
 ```
 
-When a **`CRITICAL`** rate limiter fails closed due to Redis outage:
+When a **`CRITICAL`** rate limiter fails closed because the database limiter is unavailable:
 ```http
 HTTP/1.1 503 Service Unavailable
 Content-Type: application/json
@@ -138,13 +139,12 @@ Rate limiter health is monitored in real-time through:
   ```json
   {
     "status": "healthy",
-    "backend": "redis",
-    "redisConnected": true,
+    "backend": "postgres",
     "latencyMs": 4
   }
   ```
 - **`GET /api/admin/email/queue/health`**:
-  Exposes Redis connectivity, queue latency, and rate limiter operational health to administrators.
+  Exposes PostgreSQL connectivity, queue depth, processor liveness and rate limiter health to administrators.
 
 ---
 
@@ -159,4 +159,4 @@ This suite verifies:
 2. **Cross-Tenant Isolation**: Tenant A exhausting quota has zero impact on Tenant B.
 3. **Instance Hopping Defense**: Shared IP state across simulated instances blocks evasion.
 4. **Per-Recipient Protection**: Throttles individual recipient targeting while permitting distinct recipients.
-5. **Fail-Closed vs Safe Degradation**: Simulates Redis outages to prove `CRITICAL` fails closed with HTTP 503 while `STANDARD`/`LOW` degrades gracefully.
+5. **Fail-Closed vs Safe Degradation**: Simulates a limiter backend outage to prove `CRITICAL` fails closed with HTTP 503 while `STANDARD`/`LOW` degrades gracefully.

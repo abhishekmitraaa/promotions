@@ -27,16 +27,16 @@ The Email platform is designed as an enterprise-grade multi-tenant messaging inf
                                 │
                                 ▼ Enqueue
  ┌────────────────────────────────────────────────────────────┐
- │               Redis BullMQ Queue Infrastructure            │
+ │        PostgreSQL BackgroundJob table (durable queue)      │
  │                                                            │
- │  * email-deliveries: Single dispatches & delivery attempts │
- │  * email-campaigns: Scheduled batches & fan-out jobs       │
+ │  * Transactional / promotional delivery jobs               │
+ │  * Campaign triggers, recipient jobs, automation steps     │
  └──────────────────────────────┬─────────────────────────────┘
                                 │
                                 ▼ Dequeue & Process
  ┌────────────────────────────────────────────────────────────┐
- │               Dedicated BullMQ Email Worker                │
- │                  (`npm run worker:email`)                  │
+ │  Serverless processor (Supabase Cron -> Vercel function)   │
+ │            POST /api/internal/process-jobs                 │
  │                                                            │
  │  * Audience Resolution (Lists + Segments)                  │
  │  * Deduplication & Suppression Filtering                   │
@@ -111,22 +111,25 @@ Based on an architectural audit of operational adapters, the production email in
 
 ---
 
-## 3. Asynchronous BullMQ Queue Architecture
+## 3. Asynchronous Job Queue (PostgreSQL, workerless)
 
-The email platform uses dedicated Redis-backed queues partitioned by delivery profile:
+Jobs are rows in the `BackgroundJob` table, grouped into three logical queues (all executed by the same processor):
 
-| Queue Name | Purpose | Concurrency | Retry Strategy |
-|---|---|---|---|
-| `email-transactional` | Latency-critical transactional sends (OTPs, notifications, password resets) | 5 | Exponential backoff (3 attempts: 2s, 10s, 30s) |
-| `email-campaign` | Promotional single sends and campaign recipient jobs | 5 | Exponential backoff (3 attempts: 2s, 10s, 30s) |
-| `email-events` | Webhook delivery feedback processing (delivered, bounced, complained) | 3 | Exponential backoff (3 attempts) |
+| Queue Name | Job types | Purpose |
+|---|---|---|
+| `email-transactional` | `TRANSACTIONAL_EMAIL`, `PROMOTIONAL_EMAIL` | Single sends (OTPs, notifications, password resets, one-off promotions) |
+| `email-campaign` | `CAMPAIGN_RECIPIENT`, `CAMPAIGN_TRIGGER`, `AUTOMATION_STEP`, `RECURRING_AUTOMATION` | Campaign fan-out and journeys |
+| `email-events` | `EMAIL_EVENT` | Provider feedback (delivered, bounced, complained) |
+
+Supabase Cron calls `POST /api/internal/process-jobs` every minute; the route claims due jobs with `FOR UPDATE SKIP LOCKED` and runs the executors in `src/lib/services/executors/`. Reconciliation runs every five minutes.
 
 ### Key Queue Invariants:
-1. **Idempotency & Business Keys**: All jobs use deterministic IDs (e.g., `email-transactional-{deliveryId}`, `email-promotional-{deliveryId}`, `email-campaign-{recipientId}`). Redis strictly rejects duplicate active jobs.
-2. **Permanent Error Protection**: Unrecoverable errors (e.g. invalid recipient syntax, recipient suppressed, unauthorized credentials) throw `UnrecoverableError` / `PermanentEmailError` immediately and are never retried.
-3. **Transient Failure Handling**: Network timeouts, 429 rate limits, and 503 service unavailabilities throw `RetryableEmailError`, triggering automatic BullMQ backoff retry.
-4. **Honest Queue Reporting**: If Redis is unreachable during send or schedule operations, the API returns HTTP 500 (`QUEUE_ERROR`) and records `EmailDelivery` as `FAILED` (`QUEUE_ENQUEUE_FAILED`). The API never falsely claims a job was queued.
-5. **No Serverless Workers**: Workers run as persistent Node.js daemons (`npm run worker:email`), never as serverless functions.
+1. **Idempotency & Business Keys**: Jobs carry deterministic keys (e.g. `email-transactional-{deliveryId}`, `email-campaign-{recipientId}`); enqueueing the same key twice returns the existing job.
+2. **Permanent Error Protection**: Unrecoverable errors (suppressed recipient, missing consent, rejected credentials) throw `PermanentError` and are never retried.
+3. **Transient Failure Handling**: Provider results flagged `retryable` (timeouts, 429, 5xx) and transient database errors throw `RetryableError`; the work item is re-queued with exponential backoff (max 5 attempts).
+4. **Duplicate-Send Protection**: Work items are claimed atomically; every later write is bound to the claim token; an in-flight marker prevents an automatic re-send after a crash mid-send (such rows become `FAILED / SEND_OUTCOME_UNKNOWN`). See `src/lib/services/executors/claim-lock.ts`.
+5. **Honest Queue Reporting**: If a job cannot be persisted, the API returns HTTP 500 (`QUEUE_ERROR`) and records the `EmailDelivery` as `FAILED` (`QUEUE_ENQUEUE_FAILED`).
+6. **No Workers**: There is no Redis and no long-running worker process.
 
 ---
 
@@ -181,11 +184,11 @@ Campaigns progress through a deterministic, strictly guarded state machine:
 ```
 
 ### Lifecycle Operations:
-- **Scheduling**: Campaign status transitions to `SCHEDULED`. BullMQ delayed trigger job is enqueued to `email-campaign` queue. If executed prematurely, worker throws a retryable error until `scheduledAt` has arrived.
+- **Scheduling**: Campaign status transitions to `SCHEDULED`. A delayed `CAMPAIGN_TRIGGER` job is persisted; the processor also sweeps due scheduled campaigns. If executed prematurely, the trigger throws a retryable error until `scheduledAt` has arrived.
 - **Launch / Fan-Out**: When due or triggered via "Send Now", the trigger worker acquires the advisory lock, snapshots eligible recipients, and transitions status to `RUNNING`. Each recipient is enqueued with a deterministic job ID (`email-campaign-{recipientId}`).
 - **Pause (`POST /pause`)**: Transitions campaign to `PAUSED`. If recipient jobs arrive at the worker while paused, the worker skips execution and leaves the recipient in `PENDING` status.
 - **Resume (`POST /resume`)**: Transitions campaign back to `RUNNING` and requeues any unsent `PENDING` recipients. Already `SENT` recipients are skipped to guarantee zero duplicate sends.
-- **Cancel (`POST /cancel`)**: Transitions campaign to `CANCELLED`. Any delayed trigger jobs in BullMQ are removed. All unexecuted `PENDING` snapshot recipients are transitioned to `CANCELLED`. Already transmitted `SENT` emails remain acknowledged and immutable.
+- **Cancel (`POST /cancel`)**: Transitions campaign to `CANCELLED`. Any pending trigger job becomes a no-op. All unexecuted `PENDING` snapshot recipients are transitioned to `CANCELLED`. Already transmitted `SENT` emails remain acknowledged and immutable.
 - **Deterministic Auto-Completion**: Whenever a recipient finishes execution (`SENT`, `FAILED`, `SUPPRESSED`, or `CANCELLED`), `checkAndCompleteCampaign` checks if active recipients remain. When zero remain, campaign atomically transitions to `COMPLETED`.
 
 ---

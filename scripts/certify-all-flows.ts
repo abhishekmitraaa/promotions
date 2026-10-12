@@ -3,7 +3,6 @@
  *
  * Fully certifies Flows A through W and 14 Adversarial Cases on disposable infrastructure:
  * - Real Disposable PostgreSQL (5433)
- * - Real Disposable Redis (6379)
  * - Real Next.js route handlers
  * - Real Prisma database operations
  * - Real BullMQ queues
@@ -47,7 +46,7 @@
  *   [ADV-10] CRLF injection
  *   [ADV-11] Unsafe URL
  *   [ADV-12] Provider failure (retryable vs terminal)
- *   [ADV-13] Redis outage
+ *   [ADV-13] Queue persistence outage
  *   [ADV-14] PostgreSQL outage
  */
 
@@ -57,9 +56,6 @@ if (!process.env.DATABASE_URL || process.env.DATABASE_URL.includes("peqynzeioiau
 if (!process.env.DIRECT_URL || process.env.DIRECT_URL.includes("peqynzeioiauynfpdsdv") || process.env.DIRECT_URL.includes("supabase.co")) {
   process.env.DIRECT_URL = "postgresql://postgres:postgres@127.0.0.1:5433/email_test";
 }
-process.env.REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
-process.env.REDIS_HOST = process.env.REDIS_HOST || "127.0.0.1";
-process.env.REDIS_PORT = process.env.REDIS_PORT || "6379";
 process.env.NODE_ENV = "test";
 process.env.ALLOW_DESTRUCTIVE_TESTS = "true";
 process.env.AUTH_SESSION_SECRET = "certification-master-session-secret-32-chars";
@@ -72,7 +68,7 @@ import { NextRequest } from "next/server";
 import { prisma } from "../src/lib/prisma";
 import { generateApiKey } from "../src/lib/crypto";
 import { createSessionToken, hashSessionToken, SESSION_COOKIE } from "../src/lib/auth";
-import { getTransactionalQueue, getCampaignQueue, getEventsQueue, closeAllQueues } from "../src/lib/email/queue/queues";
+import { getTransactionalQueue, getCampaignQueue, getEventsQueue } from "../src/lib/email/queue/queues";
 import {
   JOB_NAMES,
   getTransactionalJobId,
@@ -84,12 +80,12 @@ import {
   RetryableEmailError,
   PermanentEmailError,
 } from "../src/lib/email/queue/types";
-import { processTransactionalJob as processTransactionalDeliveryJob } from "../src/lib/email/queue/worker";
-import { processPromotionalDeliveryJob } from "../src/lib/email/queue/promotional-delivery-worker";
-import { processCampaignRecipientJob, checkAndCompleteCampaign } from "../src/lib/email/queue/campaign-worker";
-import { processScheduledCampaignTriggerJob } from "../src/lib/email/queue/campaign-trigger-worker";
-import { processEmailEventJob } from "../src/lib/email/queue/event-worker";
-import { reconcileAbandonedJobs } from "../src/lib/email/queue/reconciliation";
+import { EmailDeliveryExecutor } from "../src/lib/services/executors/email-delivery-executor";
+import { CampaignRecipientExecutor } from "../src/lib/services/executors/campaign-recipient-executor";
+import { CampaignTriggerService } from "../src/lib/services/executors/campaign-trigger-service";
+import { EmailEventProcessor } from "../src/lib/services/executors/email-event-processor";
+import { ReconciliationExecutor } from "../src/lib/services/executors/reconciliation-executor";
+import { PermanentError } from "../src/lib/errors/job-errors";
 import { EmailCampaignService } from "../src/lib/services/email-campaign-service";
 import { EmailAudienceResolver } from "../src/lib/services/email-audience-resolver";
 import { EmailSuppressionService } from "../src/lib/services/email-suppression-service";
@@ -120,7 +116,6 @@ import {
   EmailEventType,
   EmailSuppressionReason,
 } from "@prisma/client";
-import { Job, UnrecoverableError } from "bullmq";
 
 // Route Handlers for actual HTTP testing
 import { POST as sendEmailRoute } from "../src/app/api/v1/email/send/route";
@@ -236,7 +231,7 @@ async function cleanDatabase() {
 async function runMasterCertification() {
   console.log("==================================================================");
   console.log("🏆 MASTER END-TO-END CERTIFICATION PASS (FLOWS A - W + ADVERSARIAL)");
-  console.log("   Target: Real Disposable PostgreSQL (5433) + Redis (6379)");
+  console.log("   Target: Real Disposable PostgreSQL (5433)");
   console.log("==================================================================\n");
 
   // Destructive test safety guard invariant check
@@ -371,15 +366,9 @@ async function runMasterCertification() {
   testAssert("A", txnDelivery?.category === EmailType.TRANSACTIONAL, "Delivery categorized as TRANSACTIONAL");
 
   const txnJob = await txnQueue.getJob(getTransactionalJobId(txnData.deliveryId));
-  testAssert("A", txnJob !== null && txnJob !== undefined, "BullMQ job exists on email-transactional queue with stable ID");
+  testAssert("A", txnJob !== null && txnJob !== undefined, "Job exists on email-transactional queue with stable ID");
 
-  const txnWorkerRes = await processTransactionalDeliveryJob(
-    {
-      id: getTransactionalJobId(txnData.deliveryId),
-      data: { deliveryId: txnData.deliveryId, clientId: tenantA.id },
-    } as Job<TransactionalJobData>,
-    { providerOverride: mockProvider }
-  );
+  const txnWorkerRes = await EmailDeliveryExecutor.execute({ deliveryId: txnData.deliveryId, providerOverride: mockProvider });
   testAssert("A", txnWorkerRes.success === true, "Transactional worker executes successfully");
 
   const refreshedTxnDelivery = await prisma.emailDelivery.findUnique({
@@ -422,13 +411,7 @@ async function runMasterCertification() {
   testAssert("B", promoJob !== null && promoJob !== undefined, "Job enqueued on campaign promotional queue");
 
   mockProvider.sentRequests = [];
-  const promoWorkerRes = await processPromotionalDeliveryJob(
-    {
-      id: getPromotionalJobId(promoData.deliveryId),
-      data: { deliveryId: promoData.deliveryId, clientId: tenantA.id, category: "PROMOTIONAL" },
-    } as Job<PromotionalJobData>,
-    { providerOverride: mockProvider }
-  );
+  const promoWorkerRes = await EmailDeliveryExecutor.execute({ deliveryId: promoData.deliveryId, providerOverride: mockProvider });
   testAssert("B", promoWorkerRes.success === true, "Promotional worker dispatches successfully");
 
   const sentPromoReq = mockProvider.sentRequests[0];
@@ -527,13 +510,7 @@ async function runMasterCertification() {
   testAssert("C", recipients.length === 3, "Recipient snapshot contains exactly 3 rows");
 
   for (const r of recipients) {
-    const jobRes = await processCampaignRecipientJob(
-      {
-        id: getCampaignJobId(r.id),
-        data: { campaignRecipientId: r.id, campaignId: campaign.id, clientId: tenantA.id },
-      } as Job<CampaignJobData>,
-      { providerOverride: mockProvider }
-    );
+    const jobRes = await CampaignRecipientExecutor.executeRecipient({ recipientId: r.id, providerOverride: mockProvider });
     testAssert("C", jobRes.success === true, `Worker successfully sent campaign recipient ${r.email}`);
   }
 
@@ -561,14 +538,11 @@ async function runMasterCertification() {
 
   let prematureThrew = false;
   try {
-    await processScheduledCampaignTriggerJob({
-      id: `trigger-${schedCampaign.id}`,
-      data: { campaignId: schedCampaign.id, clientId: tenantA.id, scheduledAt: futureDate.toISOString() },
-    } as any);
+    await CampaignTriggerService.triggerScheduledCampaign({ campaignId: schedCampaign.id, clientId: tenantA.id });
   } catch (err: any) {
     prematureThrew = err.isRetryable === true;
   }
-  testAssert("D", prematureThrew, "Trigger processor throws RetryableEmailError if scheduled time has not arrived");
+  testAssert("D", prematureThrew, "Trigger processor throws a retryable error if scheduled time has not arrived");
 
   const pastTriggerDate = new Date(Date.now() - 5000);
   await prisma.emailCampaign.update({
@@ -576,10 +550,7 @@ async function runMasterCertification() {
     data: { scheduledAt: pastTriggerDate },
   });
 
-  const dueTriggerRes = await processScheduledCampaignTriggerJob({
-    id: `trigger-${schedCampaign.id}`,
-    data: { campaignId: schedCampaign.id, clientId: tenantA.id, scheduledAt: pastTriggerDate.toISOString() },
-  } as any);
+  const dueTriggerRes = await CampaignTriggerService.triggerScheduledCampaign({ campaignId: schedCampaign.id, clientId: tenantA.id });
   testAssert("D", dueTriggerRes.success === true, "Trigger processor succeeds when scheduled time arrives");
 
   const triggeredCampaign = await prisma.emailCampaign.findUnique({ where: { id: schedCampaign.id } });
@@ -611,13 +582,7 @@ async function runMasterCertification() {
   });
   testAssert("E", Boolean(firstSchedRecip), "Found pending recipient in paused campaign");
 
-  const pausedJobRes = await processCampaignRecipientJob(
-    {
-      id: getCampaignJobId(firstSchedRecip!.id),
-      data: { campaignRecipientId: firstSchedRecip!.id, campaignId: schedCampaign.id, clientId: tenantA.id },
-    } as Job<CampaignJobData>,
-    { providerOverride: mockProvider }
-  );
+  const pausedJobRes = await CampaignRecipientExecutor.executeRecipient({ recipientId: firstSchedRecip!.id, providerOverride: mockProvider });
   testAssert("E", pausedJobRes.skipped === true && pausedJobRes.reason === "CAMPAIGN_PAUSED", "Worker skips paused campaign job without sending");
 
   // ---------------------------------------------------------------------------
@@ -639,13 +604,7 @@ async function runMasterCertification() {
   const resumedCampaign = await prisma.emailCampaign.findUnique({ where: { id: schedCampaign.id } });
   testAssert("F", resumedCampaign?.status === EmailCampaignStatus.RUNNING, "Campaign transitioned back to RUNNING");
 
-  await processCampaignRecipientJob(
-    {
-      id: getCampaignJobId(firstSchedRecip!.id),
-      data: { campaignRecipientId: firstSchedRecip!.id, campaignId: schedCampaign.id, clientId: tenantA.id },
-    } as Job<CampaignJobData>,
-    { providerOverride: mockProvider }
-  );
+  await CampaignRecipientExecutor.executeRecipient({ recipientId: firstSchedRecip!.id, providerOverride: mockProvider });
   const sentRecip = await prisma.emailCampaignRecipient.findUnique({ where: { id: firstSchedRecip!.id } });
   testAssert("F", sentRecip?.status === "SENT", "Recipient sent successfully after resume");
 
@@ -862,11 +821,7 @@ async function runMasterCertification() {
   const bounceEventId = bounceWebhookBody.data?.results?.[0]?.eventId;
   testAssert("M", Boolean(bounceEventId), "Webhook created authoritative EmailEvent");
 
-  await processEmailEventJob({
-    id: `event-${bounceEventId}`,
-    data: { eventRecordId: bounceEventId, eventType: "BOUNCED", providerType: EmailProviderType.MOCK },
-    attemptsMade: 0,
-  } as any);
+  await EmailEventProcessor.process({ eventId: bounceEventId });
 
   const bounceSupp = await EmailSuppressionService.isSuppressed(tenantA.id, bounceEmail);
   testAssert("M", bounceSupp.suppressed === true, "Hard bounce creates authoritative suppression");
@@ -918,11 +873,7 @@ async function runMasterCertification() {
   const complaintEventId = complaintWebhookBody.data?.results?.[0]?.eventId;
   testAssert("N", Boolean(complaintEventId), "Webhook created authoritative EmailEvent");
 
-  await processEmailEventJob({
-    id: `event-${complaintEventId}`,
-    data: { eventRecordId: complaintEventId, eventType: "COMPLAINT", providerType: EmailProviderType.MOCK },
-    attemptsMade: 0,
-  } as any);
+  await EmailEventProcessor.process({ eventId: complaintEventId });
 
   const complaintSupp = await EmailSuppressionService.isSuppressed(tenantA.id, complaintEmail);
   testAssert("N", complaintSupp.suppressed === true, "Complaint creates suppression entry");
@@ -1181,7 +1132,7 @@ async function runMasterCertification() {
 
   txnQueue.add = origTxnAdd; // restore immediately
 
-  testAssert("S", queueFailRes.status === 500, "API returns HTTP 500 on Redis queue failure (never fake 202)");
+  testAssert("S", queueFailRes.status === 500, "API returns HTTP 500 on queue failure (never fake 202)");
   const queueFailBody = await queueFailRes.json();
   testAssert("S", queueFailBody.error?.code === "QUEUE_ERROR", "Error response code is QUEUE_ERROR");
 
@@ -1210,7 +1161,7 @@ async function runMasterCertification() {
     },
   });
 
-  const reconciliationReport = await reconcileAbandonedJobs({ staleThresholdMinutes: 0 });
+  const reconciliationReport = await ReconciliationExecutor.reconcile({ staleMinutes: 10 });
   testAssert("T", reconciliationReport.recoveredDeliveries >= 1, "Reconciliation recovered abandoned PROCESSING delivery");
 
   const recoveredDelivery = await prisma.emailDelivery.findUnique({
@@ -1247,7 +1198,7 @@ async function runMasterCertification() {
   // ---------------------------------------------------------------------------
   console.log("\n--- [V] FLOW V: DISTRIBUTED RATE LIMITING ---");
   const rlHealth = await getRateLimiterHealth();
-  testAssert("V", rlHealth.status === "HEALTHY" && rlHealth.backend === "redis", "Distributed rate limiter is HEALTHY backed by Redis");
+  testAssert("V", rlHealth.status === "HEALTHY" && rlHealth.backend === "postgres", "Distributed rate limiter is HEALTHY backed by PostgreSQL");
 
   const rlKey = `cert_rl_${runId}_${Date.now()}`;
   const RL_LIMIT = 5;
@@ -1308,13 +1259,7 @@ async function runMasterCertification() {
   });
 
   mockProvider.sentRequests = [];
-  await processTransactionalDeliveryJob(
-    {
-      id: getTransactionalJobId(contentDelivery.id),
-      data: { deliveryId: contentDelivery.id, clientId: tenantA.id },
-    } as Job<TransactionalJobData>,
-    { providerOverride: mockProvider }
-  );
+  await EmailDeliveryExecutor.execute({ deliveryId: contentDelivery.id, providerOverride: mockProvider });
 
   const capturedSend = mockProvider.sentRequests[0];
   testAssert("W", capturedSend?.html?.includes("Welcome Alice!") === true, "Rendered HTML contains substituted variables");
@@ -1520,17 +1465,11 @@ async function runMasterCertification() {
   mockProvider.shouldFailRetryable = true;
   let caughtRetryable = false;
   try {
-    await processTransactionalDeliveryJob(
-      {
-        id: getTransactionalJobId(failTxnDelivery1.id),
-        data: { deliveryId: failTxnDelivery1.id, clientId: tenantA.id },
-      } as Job<TransactionalJobData>,
-      { providerOverride: mockProvider }
-    );
+    await EmailDeliveryExecutor.execute({ deliveryId: failTxnDelivery1.id, providerOverride: mockProvider });
   } catch (err: any) {
     caughtRetryable = err instanceof RetryableEmailError || err.isRetryable === true;
   }
-  testAssert("ADV-12", caughtRetryable, "Provider 429 backoff rethrown as RetryableEmailError for BullMQ");
+  testAssert("ADV-12", caughtRetryable, "Provider 429 backoff rethrown as a retryable error");
 
   const failTxnDelivery2 = await prisma.emailDelivery.create({
     data: {
@@ -1549,34 +1488,28 @@ async function runMasterCertification() {
   mockProvider.shouldFailPermanent = true;
   let caughtPermanent = false;
   try {
-    await processTransactionalDeliveryJob(
-      {
-        id: getTransactionalJobId(failTxnDelivery2.id),
-        data: { deliveryId: failTxnDelivery2.id, clientId: tenantA.id },
-      } as Job<TransactionalJobData>,
-      { providerOverride: mockProvider }
-    );
+    await EmailDeliveryExecutor.execute({ deliveryId: failTxnDelivery2.id, providerOverride: mockProvider });
   } catch (err: any) {
-    caughtPermanent = err instanceof UnrecoverableError || err.isRetryable === false || err instanceof PermanentEmailError;
+    caughtPermanent = err instanceof PermanentError || err.isRetryable === false || err instanceof PermanentEmailError;
   }
-  testAssert("ADV-12", caughtPermanent, "Provider 401 unrecoverable error rethrown as PermanentEmailError");
+  testAssert("ADV-12", caughtPermanent, "Provider 401 unrecoverable error rethrown as a permanent error");
 
-  // [ADV-13] Redis outage
-  console.log("\n--- [ADV-13] REDIS OUTAGE ---");
+  // [ADV-13] Queue persistence outage
+  console.log("\n--- [ADV-13] QUEUE PERSISTENCE OUTAGE ---");
   const origAdd = txnQueue.add;
   (txnQueue as any).add = async () => {
-    throw new Error("Redis connection timed out");
+    throw new Error("Queue persistence timed out");
   };
-  const redisOutageRes = await sendEmailRoute(
+  const queueOutageRes = await sendEmailRoute(
     makeRequest("/api/v1/email/send", "POST", {
       type: "TRANSACTIONAL",
-      to: `redis-outage-${runId}@test.com`,
-      subject: "Redis Outage Test",
+      to: `queue-outage-${runId}@test.com`,
+      subject: "Queue Outage Test",
       text: "Text",
     }, "BEARER", keyGenA.rawKey)
   );
   txnQueue.add = origAdd; // restore
-  testAssert("ADV-13", redisOutageRes.status === 500, "Send API handles Redis outage with HTTP 500 QUEUE_ERROR");
+  testAssert("ADV-13", queueOutageRes.status === 500, "Send API handles queue outage with HTTP 500 QUEUE_ERROR");
 
   // [ADV-14] PostgreSQL outage
   console.log("\n--- [ADV-14] POSTGRESQL OUTAGE ---");
@@ -1613,12 +1546,10 @@ async function runMasterCertification() {
   console.log("==================================================================\n");
 
   if (failed > 0 || Object.values(flowMatrix).some((v) => !v)) {
-    await closeAllQueues();
     await prisma.$disconnect();
     process.exit(1);
   }
 
-  await closeAllQueues();
   await prisma.$disconnect();
   process.exit(0);
 }

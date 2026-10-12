@@ -156,3 +156,15 @@ export function classifyJobError(err: unknown): {
     message,
   };
 }
+
+/**
+ * Converts a provider's failed send result into a typed job error. The provider's own
+ * `retryable` flag decides retry vs. permanent failure (message keywords are unreliable).
+ */
+export function providerFailureError(
+  error: { code?: string; message?: string; retryable?: boolean } | undefined
+): JobError {
+  const message = error?.message || "Provider returned failure";
+  const code = error?.code || "PROVIDER_FAILURE";
+  return error?.retryable ? new RetryableError(message, code) : new PermanentError(message, code);
+}

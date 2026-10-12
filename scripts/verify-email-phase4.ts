@@ -2,7 +2,6 @@
  * Phase 4 Email Queue & Worker Verification Test Suite
  *
  * Validates:
- * 1. Redis connection configuration & credential sanitization
  * 2. Queue topology & job ID generation
  * 3. Idempotency & duplicate job prevention contracts
  * 4. Error classification (Retryable vs Permanent / Unrecoverable)
@@ -13,15 +12,11 @@
  *    - Suppressed recipient rejection
  *    - Provider timeout (transient retryable)
  *    - Provider 429 rate limit (transient retryable)
- *    - Permanent rejection (UnrecoverableError)
+ *    - Permanent rejection (PermanentError)
  *    - Concurrent execution race defense
  * 7. Queue health reporting & credential redaction
  */
 
-import {
-  sanitizeRedisUrl,
-  getRedisUrl,
-} from "../src/lib/email/queue/connection";
 import {
   QUEUE_NAMES,
   JOB_NAMES,
@@ -32,13 +27,13 @@ import {
   PermanentEmailError,
   isRetryableError,
 } from "../src/lib/email/queue/types";
-import { processTransactionalJob } from "../src/lib/email/queue/worker";
-import { queueTransactionalEmail } from "../src/lib/email/queue/producer";
+import { EmailDeliveryExecutor } from "../src/lib/services/executors/email-delivery-executor";
+import { RetryableError, PermanentError } from "../src/lib/errors/job-errors";
+import { matchesWhere, applyUpdate } from "./lib/in-memory-where";
 import { getEmailQueueHealth } from "../src/lib/email/queue/health";
 import { EmailProvider, EmailSendRequest, EmailSendResult } from "../src/lib/email/types";
 import { EmailDeliveryStatus, EmailProviderType } from "@prisma/client";
 import { prisma } from "../src/lib/prisma";
-import { UnrecoverableError } from "bullmq";
 
 // Mock Provider for testing worker processor behaviors
 class MockQueueProvider implements EmailProvider {
@@ -114,7 +109,7 @@ class MockQueueProvider implements EmailProvider {
 
 async function runPhase4Tests() {
   console.log("==================================================================");
-  console.log("📬 RUNNING PHASE 4 EMAIL QUEUE & BULLMQ INTEGRATION CHECKS");
+  console.log("📬 RUNNING PHASE 4 EMAIL QUEUE & DELIVERY EXECUTOR CHECKS");
   console.log("==================================================================\n");
 
   let passed = 0;
@@ -129,32 +124,6 @@ async function runPhase4Tests() {
       failed++;
     }
   }
-
-  // -------------------------------------------------------------------------
-  // 1. Redis Connection Configuration & Credential Sanitization
-  // -------------------------------------------------------------------------
-  const sanitized1 = sanitizeRedisUrl("redis://:mySecretPassword123@redis.example.com:6379/0");
-  testAssert(!sanitized1.includes("mySecretPassword123"), "sanitizeRedisUrl masks password in URL");
-  testAssert(sanitized1.includes(":***@"), "sanitizeRedisUrl replaces credentials with :***@ placeholder");
-
-  const sanitizedUser = sanitizeRedisUrl("rediss://admin:superSecret@redis.example.com:6380/1");
-  testAssert(!sanitizedUser.includes("superSecret") && !sanitizedUser.includes("admin"), "sanitizeRedisUrl masks both username and password");
-
-  const origRedisUrl = process.env.REDIS_URL;
-  let threwBadProtocol = false;
-  try {
-    process.env.REDIS_URL = "http://invalid-redis.com";
-    getRedisUrl();
-  } catch {
-    threwBadProtocol = true;
-  } finally {
-    if (origRedisUrl) {
-      process.env.REDIS_URL = origRedisUrl;
-    } else {
-      delete process.env.REDIS_URL;
-    }
-  }
-  testAssert(threwBadProtocol, "getRedisUrl strictly rejects non-redis protocols");
 
   // -------------------------------------------------------------------------
   // 2. Queue Topology & Job ID Generation
@@ -192,26 +161,12 @@ async function runPhase4Tests() {
   // -------------------------------------------------------------------------
   const inMemoryDeliveries = new Map<string, any>();
   const inMemorySuppressions = new Map<string, any>();
-  const inMemoryEnqueuedJobs = new Map<string, any>();
 
   const origDeliveryFindUnique = prisma.emailDelivery.findUnique;
   const origDeliveryFindFirst = prisma.emailDelivery.findFirst;
   const origDeliveryCreate = prisma.emailDelivery.create;
   const origDeliveryUpdateMany = prisma.emailDelivery.updateMany;
   const origSuppressionFindFirst = prisma.emailSuppression.findFirst;
-
-  // Mock BullMQ queue.add to track jobs in-memory without requiring live Redis
-  const mockQueue = {
-    async add(name: string, data: any, opts: any) {
-      if (inMemoryEnqueuedJobs.has(opts.jobId)) {
-        // BullMQ behavior: custom jobId ignores duplicate insertion
-        return { id: opts.jobId, name, data, duplicate: true };
-      }
-      const job = { id: opts.jobId, name, data, opts };
-      inMemoryEnqueuedJobs.set(opts.jobId, job);
-      return job;
-    },
-  };
 
   (prisma.emailDelivery as any).findUnique = async ({ where }: any) => {
     return inMemoryDeliveries.get(where.id) || null;
@@ -229,7 +184,7 @@ async function runPhase4Tests() {
 
   (prisma.emailDelivery as any).create = async ({ data }: any) => {
     const id = data.id || `del-${Date.now()}-${Math.random().toString(36).substring(7)}`;
-    const record = { id, ...data, attemptCount: data.attemptCount || 0, createdAt: new Date() };
+    const record = { lockedAt: null, lockedBy: null, lastAttemptAt: null, ...data, id, attemptCount: data.attemptCount || 0, createdAt: new Date() };
     inMemoryDeliveries.set(id, record);
     return record;
   };
@@ -237,19 +192,8 @@ async function runPhase4Tests() {
   (prisma.emailDelivery as any).updateMany = async ({ where, data }: any) => {
     let count = 0;
     for (const record of inMemoryDeliveries.values()) {
-      if (where.id && record.id !== where.id) continue;
-      if (where.status) {
-        if (where.status.in && !where.status.in.includes(record.status)) continue;
-        if (typeof where.status === "string" && record.status !== where.status) continue;
-      }
-
-      if (data.status) record.status = data.status;
-      if (data.providerMessageId) record.providerMessageId = data.providerMessageId;
-      if (data.sentAt) record.sentAt = data.sentAt;
-      if (data.failedAt) record.failedAt = data.failedAt;
-      if (data.errorCode !== undefined) record.errorCode = data.errorCode;
-      if (data.errorMessage !== undefined) record.errorMessage = data.errorMessage;
-      if (data.attemptCount?.increment) record.attemptCount += data.attemptCount.increment;
+      if (!matchesWhere(record, where)) continue;
+      applyUpdate(record, data);
       count++;
     }
     return { count };
@@ -295,9 +239,7 @@ async function runPhase4Tests() {
     } as any;
 
     mockProvider.mode = "SUCCESS";
-    const workerRes = await processTransactionalJob(successJob, {
-      providerOverride: mockProvider,
-    });
+    const workerRes = await EmailDeliveryExecutor.execute({ deliveryId: successJob.data.deliveryId, providerOverride: mockProvider });
 
     testAssert(workerRes.success === true, "Worker successfully processes transactional job");
     testAssert(workerRes.providerMessageId !== undefined, "Worker returns providerMessageId");
@@ -319,10 +261,8 @@ async function runPhase4Tests() {
       },
     } as any;
 
-    const staleRes = await processTransactionalJob(staleJob, {
-      providerOverride: mockProvider,
-    });
-    testAssert(staleRes.skipped === true && staleRes.reason === "ALREADY_COMPLETED", "Worker skips duplicate execution of already SENT delivery (stale guard)");
+    const staleRes = await EmailDeliveryExecutor.execute({ deliveryId: staleJob.data.deliveryId, providerOverride: mockProvider });
+    testAssert(staleRes.skipped === true && staleRes.reason === "ALREADY_TERMINAL", "Worker skips duplicate execution of already SENT delivery (stale guard)");
     testAssert(updatedSuccess.attemptCount === 1, "Attempt count was NOT incremented on stale skip");
 
     // -------------------------------------------------------------------------
@@ -350,24 +290,14 @@ async function runPhase4Tests() {
     let threwSuppressed = false;
     let isUnrecoverable = false;
     try {
-      await processTransactionalJob(
-        {
-          id: "email-transactional-del-suppressed-1",
-          data: {
-            deliveryId: suppressedDelivery.id,
-            clientId: "tenant-1",
-            category: "TRANSACTIONAL",
-          },
-        } as any,
-        { providerOverride: mockProvider }
-      );
+      await EmailDeliveryExecutor.execute({ deliveryId: suppressedDelivery.id, providerOverride: mockProvider });
     } catch (err: any) {
       threwSuppressed = true;
-      isUnrecoverable = err instanceof UnrecoverableError;
+      isUnrecoverable = err instanceof PermanentError;
     }
 
     testAssert(threwSuppressed, "Worker throws when recipient is suppressed");
-    testAssert(isUnrecoverable, "Suppressed recipient throws UnrecoverableError to stop BullMQ retries");
+    testAssert(isUnrecoverable, "Suppressed recipient throws PermanentError (no retries)");
     const updatedSuppressed = inMemoryDeliveries.get(suppressedDelivery.id);
     testAssert(updatedSuppressed.status === EmailDeliveryStatus.FAILED, "Suppressed delivery status marked FAILED");
     testAssert(updatedSuppressed.errorCode === "RECIPIENT_SUPPRESSED", "Suppressed delivery errorCode is RECIPIENT_SUPPRESSED");
@@ -395,24 +325,14 @@ async function runPhase4Tests() {
     let isRetryable = false;
 
     try {
-      await processTransactionalJob(
-        {
-          id: "email-transactional-del-timeout-1",
-          data: {
-            deliveryId: timeoutDelivery.id,
-            clientId: "tenant-1",
-            category: "TRANSACTIONAL",
-          },
-        } as any,
-        { providerOverride: mockProvider }
-      );
+      await EmailDeliveryExecutor.execute({ deliveryId: timeoutDelivery.id, providerOverride: mockProvider });
     } catch (err: any) {
       threwTimeout = true;
-      isRetryable = err instanceof RetryableEmailError;
+      isRetryable = err instanceof RetryableError;
     }
 
     testAssert(threwTimeout, "Worker throws on provider timeout");
-    testAssert(isRetryable, "Provider timeout throws RetryableEmailError allowing BullMQ exponential retry");
+    testAssert(isRetryable, "Provider timeout throws RetryableError (scheduled for retry)");
 
     // -------------------------------------------------------------------------
     // 9. Provider 429 Rate Limit (Retryable Error)
@@ -437,24 +357,14 @@ async function runPhase4Tests() {
     let isRetryable429 = false;
 
     try {
-      await processTransactionalJob(
-        {
-          id: "email-transactional-del-429-1",
-          data: {
-            deliveryId: rateLimitDelivery.id,
-            clientId: "tenant-1",
-            category: "TRANSACTIONAL",
-          },
-        } as any,
-        { providerOverride: mockProvider }
-      );
+      await EmailDeliveryExecutor.execute({ deliveryId: rateLimitDelivery.id, providerOverride: mockProvider });
     } catch (err: any) {
       threw429 = true;
-      isRetryable429 = err instanceof RetryableEmailError;
+      isRetryable429 = err instanceof RetryableError;
     }
 
     testAssert(threw429, "Worker throws on provider 429 rate limit");
-    testAssert(isRetryable429, "Provider 429 throws RetryableEmailError so BullMQ backs off");
+    testAssert(isRetryable429, "Provider 429 throws RetryableError so delivery backs off");
 
     // -------------------------------------------------------------------------
     // 10. Permanent Provider Failure (UnrecoverableError)
@@ -479,24 +389,14 @@ async function runPhase4Tests() {
     let isPermUnrecoverable = false;
 
     try {
-      await processTransactionalJob(
-        {
-          id: "email-transactional-del-perm-1",
-          data: {
-            deliveryId: permDelivery.id,
-            clientId: "tenant-1",
-            category: "TRANSACTIONAL",
-          },
-        } as any,
-        { providerOverride: mockProvider }
-      );
+      await EmailDeliveryExecutor.execute({ deliveryId: permDelivery.id, providerOverride: mockProvider });
     } catch (err: any) {
       threwPerm = true;
-      isPermUnrecoverable = err instanceof UnrecoverableError;
+      isPermUnrecoverable = err instanceof PermanentError;
     }
 
     testAssert(threwPerm, "Worker throws on permanent 400 error");
-    testAssert(isPermUnrecoverable, "Permanent rejection throws UnrecoverableError to prevent retry waste");
+    testAssert(isPermUnrecoverable, "Permanent rejection throws PermanentError to prevent retry waste");
     const updatedPerm = inMemoryDeliveries.get(permDelivery.id);
     testAssert(updatedPerm.status === EmailDeliveryStatus.FAILED, "Permanent failure marks delivery FAILED in DB");
 
@@ -530,20 +430,24 @@ async function runPhase4Tests() {
 
     // Simulate 2 parallel workers picking up the same job concurrently
     const [resA, resB] = await Promise.all([
-      processTransactionalJob(raceJob, { providerOverride: mockProvider }),
-      processTransactionalJob(raceJob, { providerOverride: mockProvider }),
+      EmailDeliveryExecutor.execute({ deliveryId: raceJob.data.deliveryId, providerOverride: mockProvider }),
+      EmailDeliveryExecutor.execute({ deliveryId: raceJob.data.deliveryId, providerOverride: mockProvider }),
     ]);
 
-    const oneSucceeded = resA.success || resB.success;
-    const oneHandled = (resA.skipped && resA.reason === "ALREADY_COMPLETED") || (resB.skipped && resB.reason === "ALREADY_COMPLETED") || (resA.success && resB.success);
-    testAssert(oneSucceeded && oneHandled, "Concurrent worker execution handled safely without duplicate sends");
+    const raceSends = mockProvider.sentMessages.filter((m) => m.to === "race@example.test").length;
+    const loser = resA.skipped ? resA : resB;
+    testAssert(raceSends === 1, `Concurrent execution sends exactly once (sends: ${raceSends})`);
+    testAssert(
+      loser.skipped === true && (loser.reason === "CONTENTION_LOCK_HELD" || loser.reason === "ALREADY_TERMINAL"),
+      "Losing concurrent executor skipped without sending"
+    );
 
     // -------------------------------------------------------------------------
     // 12. Queue Health Observability & Sanitization
     // -------------------------------------------------------------------------
     const health = await getEmailQueueHealth();
     testAssert(health.status === "HEALTHY" || health.status === "DEGRADED" || health.status === "DOWN", "Health report returns valid status code");
-    testAssert(!health.redis.target.includes(":password@"), "Health report never exposes Redis password");
+    testAssert(["READY", "STALLED", "UNKNOWN"].includes(health.processor.status), "Health report includes processor liveness");
     testAssert(typeof health.queues.transactional.waiting === "number", "Health report includes transactional queue waiting count");
     testAssert(typeof health.queues.campaign.waiting === "number", "Health report includes campaign queue waiting count");
     testAssert(typeof health.queues.events.waiting === "number", "Health report includes events queue waiting count");

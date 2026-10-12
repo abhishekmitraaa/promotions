@@ -129,12 +129,20 @@ export class ReconciliationExecutor {
           { lockedAt: null, lastAttemptAt: null, updatedAt: { lt: staleCutoff } },
         ],
       },
+      include: { campaign: { select: { status: true } } },
       take: 100,
     });
 
     for (const recipient of staleRecipients) {
       if (checkTime()) break;
-      if (isSendInFlight(recipient.lockedBy)) {
+      if (!isSendInFlight(recipient.lockedBy) && recipient.campaign?.status === EmailCampaignStatus.CANCELLED) {
+        // Never resurrect work for a cancelled campaign (the recipient sweep ignores it anyway)
+        await prisma.emailCampaignRecipient.updateMany({
+          where: { id: recipient.id, status: "PROCESSING" },
+          data: { status: "CANCELLED", lockedAt: null, lockedBy: null },
+        });
+        recoveredRecipients++;
+      } else if (isSendInFlight(recipient.lockedBy)) {
         await prisma.emailCampaignRecipient.updateMany({
           where: { id: recipient.id, status: "PROCESSING", lockedBy: recipient.lockedBy },
           data: {

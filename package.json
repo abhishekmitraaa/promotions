@@ -12,7 +12,6 @@
     "prisma:push": "prisma db push",
     "create:api-key": "tsx scripts/create-api-key.ts",
     "setup": "tsx scripts/setup.ts",
-    "worker:email": "tsx workers/email-worker.ts",
     "test:workerless": "tsx scripts/verify-workerless-pipeline.ts && tsx scripts/verify-cross-path-concurrency.ts",
     "test:concurrency": "tsx scripts/verify-cross-path-concurrency.ts",
     "test:communication": "tsx scripts/verify-unified-communication.ts",
@@ -66,9 +65,7 @@
   },
   "dependencies": {
     "@prisma/client": "^6.19.0",
-    "bullmq": "^6.3.8",
     "dotenv": "^17.4.2",
-    "ioredis": "^6.0.0",
     "next": "16.3.5",
     "node-html-parser": "^9.0.4",
     "prisma": "^6.19.0",
@@ -77,8 +74,6 @@
     "zod": "^4.6.2"
   },
   "devDependencies": {
-    "@netlify/functions": "^6.0.0",
-    "@netlify/plugin-nextjs": "^5.15.13",
     "@tailwindcss/postcss": "^4.3.3",
     "@types/node": "^20",
     "@types/react": "^19",

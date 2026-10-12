@@ -9,7 +9,7 @@
  * 5. Audience Resolution (lists, segments, deduplication)
  * 6. Suppression & Consent Filtering (promotional safety)
  * 7. Recipient Snapshotting (frozen metadata, count calculation)
- * 8. Small individual BullMQ job dispatching with stable job IDs
+ * 8. Individual recipient execution via CampaignRecipientExecutor (workerless)
  * 9. Campaign Pause & Cancel behaviors in worker
  * 10. Multi-tenant isolation across templates and campaigns
  * 11. RBAC enforcement (VIEWER mutation denial vs ADMIN authorization)
@@ -19,8 +19,8 @@ import { TemplateEngine } from "../src/lib/email/template-engine";
 import { EmailTemplateService } from "../src/lib/services/email-template-service";
 import { EmailCampaignService } from "../src/lib/services/email-campaign-service";
 import { EmailAudienceResolver } from "../src/lib/services/email-audience-resolver";
-import { processCampaignRecipientJob } from "../src/lib/email/queue/campaign-worker";
-import { getCampaignJobId } from "../src/lib/email/queue/types";
+import { CampaignRecipientExecutor } from "../src/lib/services/executors/campaign-recipient-executor";
+import { matchesWhere, applyUpdate } from "./lib/in-memory-where";
 import { prisma } from "../src/lib/prisma";
 import {
   EmailCampaignStatus,
@@ -147,6 +147,8 @@ async function runPhase6Tests() {
   const origDeliveryFindFirst = prisma.emailDelivery.findFirst;
   const origDeliveryUpdate = prisma.emailDelivery.update;
   const origDeliveryUpdateMany = prisma.emailDelivery.updateMany;
+  const origDeliveryFindUnique = prisma.emailDelivery.findUnique;
+  const origTransaction = prisma.$transaction;
   const origSuppressionFindUnique = prisma.emailSuppression.findUnique;
   const origSuppressionFindMany = prisma.emailSuppression.findMany;
   const origListMemberFindMany = prisma.emailListMember.findMany;
@@ -351,16 +353,15 @@ async function runPhase6Tests() {
 
     (prisma.emailCampaignRecipient as any).update = async ({ where, data }: any) => {
       const record = inMemoryRecipients.get(where.id);
-      Object.assign(record, data, { updatedAt: new Date() });
+      applyUpdate(record, data);
       return record;
     };
 
     (prisma.emailCampaignRecipient as any).updateMany = async ({ where, data }: any) => {
       let count = 0;
       for (const r of inMemoryRecipients.values()) {
-        if (where.campaignId && r.campaignId !== where.campaignId) continue;
-        if (where.status && r.status !== where.status) continue;
-        Object.assign(r, data, { updatedAt: new Date() });
+        if (!matchesWhere(r, where)) continue;
+        applyUpdate(r, data);
         count++;
       }
       return { count };
@@ -369,10 +370,7 @@ async function runPhase6Tests() {
     (prisma.emailCampaignRecipient as any).count = async ({ where }: any) => {
       let count = 0;
       for (const r of inMemoryRecipients.values()) {
-        if (where?.campaignId && r.campaignId !== where.campaignId) continue;
-        if (where?.status?.in && !where.status.in.includes(r.status)) continue;
-        if (where?.status && typeof where.status === "string" && r.status !== where.status) continue;
-        count++;
+        if (matchesWhere(r, where)) count++;
       }
       return count;
     };
@@ -380,8 +378,14 @@ async function runPhase6Tests() {
     // Deliveries mock
     (prisma.emailDelivery as any).findFirst = async ({ where }: any) => {
       for (const d of inMemoryDeliveries.values()) {
-        if (where?.campaignRecipientId && d.campaignRecipientId !== where.campaignRecipientId) continue;
-        return d;
+        if (matchesWhere(d, where)) return d;
+      }
+      return null;
+    };
+
+    (prisma.emailDelivery as any).findUnique = async ({ where }: any) => {
+      for (const d of inMemoryDeliveries.values()) {
+        if (matchesWhere(d, where)) return d;
       }
       return null;
     };
@@ -395,19 +399,22 @@ async function runPhase6Tests() {
 
     (prisma.emailDelivery as any).update = async ({ where, data }: any) => {
       const record = inMemoryDeliveries.get(where.id);
-      if (record) Object.assign(record, data, { updatedAt: new Date() });
+      if (record) applyUpdate(record, data);
       return record;
     };
 
     (prisma.emailDelivery as any).updateMany = async ({ where, data }: any) => {
       let count = 0;
       for (const d of inMemoryDeliveries.values()) {
-        if (where?.id && d.id !== where.id) continue;
-        Object.assign(d, data, { updatedAt: new Date() });
+        if (!matchesWhere(d, where)) continue;
+        applyUpdate(d, data);
         count++;
       }
       return { count };
     };
+
+    // Interactive transactions run against the same mocked client
+    (prisma as any).$transaction = async (fn: any) => (typeof fn === "function" ? fn(prisma) : Promise.all(fn));
 
     // Suppression mock
     (prisma.emailSuppression as any).findUnique = async ({ where }: any) => {
@@ -624,18 +631,9 @@ async function runPhase6Tests() {
     // Transition campaign to RUNNING
     inMemoryCampaigns.get(campaign1.id).status = EmailCampaignStatus.RUNNING;
 
-    const recipientJob = {
-      id: getCampaignJobId(snapshot.id),
-      data: {
-        campaignRecipientId: snapshot.id,
-        campaignId: campaign1.id,
-        clientId: "tenant-alpha",
-      },
-    } as any;
+    const recipientJob = { recipientId: snapshot.id, providerOverride: mockProvider };
 
-    const workerRes = await processCampaignRecipientJob(recipientJob, {
-      providerOverride: mockProvider,
-    });
+    const workerRes = await CampaignRecipientExecutor.executeRecipient(recipientJob);
 
     testAssert(workerRes.success === true, "Worker processes campaign recipient job successfully");
     testAssert(snapshot.status === "SENT", "Recipient status transitioned to SENT");
@@ -645,9 +643,7 @@ async function runPhase6Tests() {
     // -------------------------------------------------------------------------
     // 8. Stale Guard & Idempotency
     // -------------------------------------------------------------------------
-    const retryJobRes = await processCampaignRecipientJob(recipientJob, {
-      providerOverride: mockProvider,
-    });
+    const retryJobRes = await CampaignRecipientExecutor.executeRecipient(recipientJob);
     testAssert(retryJobRes.skipped === true && retryJobRes.reason === "ALREADY_SENT", "Stale execution skipped for already SENT recipient");
 
     // -------------------------------------------------------------------------
@@ -669,18 +665,9 @@ async function runPhase6Tests() {
       templateVersionId: template.activeVersion.id,
     });
 
-    const pausedJob = {
-      id: getCampaignJobId(recipientPaused.id),
-      data: {
-        campaignRecipientId: recipientPaused.id,
-        campaignId: "cmp-paused",
-        clientId: "tenant-alpha",
-      },
-    } as any;
+    const pausedJob = { recipientId: recipientPaused.id, providerOverride: mockProvider };
 
-    const pausedRes = await processCampaignRecipientJob(pausedJob, {
-      providerOverride: mockProvider,
-    });
+    const pausedRes = await CampaignRecipientExecutor.executeRecipient(pausedJob);
     testAssert(pausedRes.skipped === true && pausedRes.reason === "CAMPAIGN_PAUSED", "Worker skips processing when campaign is PAUSED");
     testAssert(recipientPaused.status === "PENDING", "Recipient remains PENDING when paused (resumable)");
 
@@ -700,18 +687,9 @@ async function runPhase6Tests() {
       templateVersionId: template.activeVersion.id,
     });
 
-    const cancelJob = {
-      id: getCampaignJobId(recipientCancelled.id),
-      data: {
-        campaignRecipientId: recipientCancelled.id,
-        campaignId: "cmp-cancelled",
-        clientId: "tenant-alpha",
-      },
-    } as any;
+    const cancelJob = { recipientId: recipientCancelled.id, providerOverride: mockProvider };
 
-    const cancelRes = await processCampaignRecipientJob(cancelJob, {
-      providerOverride: mockProvider,
-    });
+    const cancelRes = await CampaignRecipientExecutor.executeRecipient(cancelJob);
     testAssert(cancelRes.skipped === true && cancelRes.reason === "CAMPAIGN_CANCELLED", "Worker skips processing when campaign is CANCELLED");
     testAssert(recipientCancelled.status === "CANCELLED", "Recipient marked CANCELLED");
 
@@ -762,6 +740,8 @@ async function runPhase6Tests() {
     (prisma.emailDelivery as any).findFirst = origDeliveryFindFirst;
     (prisma.emailDelivery as any).update = origDeliveryUpdate;
     (prisma.emailDelivery as any).updateMany = origDeliveryUpdateMany;
+    (prisma.emailDelivery as any).findUnique = origDeliveryFindUnique;
+    (prisma as any).$transaction = origTransaction;
     (prisma.emailSuppression as any).findUnique = origSuppressionFindUnique;
     if (origSuppressionFindMany) (prisma.emailSuppression as any).findMany = origSuppressionFindMany;
     if (origRecipientCreateMany) (prisma.emailCampaignRecipient as any).createMany = origRecipientCreateMany;

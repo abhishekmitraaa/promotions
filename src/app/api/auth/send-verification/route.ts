@@ -11,7 +11,6 @@ export async function POST(req: NextRequest) {
   const rl = await checkRateLimit(`send_ver_ip_${ip}`, 5, 15 * 60 * 1000, {
     criticality: "CRITICAL",
     failClosed: true,
-    syncToDb: true,
   });
   if (!rl.success) {
     return rateLimitResponse(
@@ -54,7 +53,6 @@ export async function POST(req: NextRequest) {
   const emailRl = await checkRateLimit(`send_ver_email_${normalized}`, 3, 15 * 60 * 1000, {
     criticality: "CRITICAL",
     failClosed: true,
-    syncToDb: true,
   });
   if (!emailRl.success) {
     return rateLimitResponse(

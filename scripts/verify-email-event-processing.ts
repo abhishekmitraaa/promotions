@@ -5,7 +5,7 @@
  * 1. Webhook authenticity verification & secure tenant binding via EmailProviderConfig.
  * 2. Strict rejection of ambiguous webhook events (recipient-only inference strictly forbidden).
  * 3. Authoritative EmailEvent persistence with explicit lifecycle: RECEIVED -> PROCESSING -> PROCESSED / FAILED.
- * 4. BullMQ asynchronous event-worker execution.
+ * 4. Asynchronous event execution via EmailEventProcessor (workerless).
  * 5. Monotonic delivery state machine:
  *    - SENT -> DELIVERED
  *    - DELIVERED -> SENT rejected
@@ -25,9 +25,6 @@ if (!process.env.DATABASE_URL || process.env.DATABASE_URL.includes("peqynzeioiau
 if (!process.env.DIRECT_URL || process.env.DIRECT_URL.includes("peqynzeioiauynfpdsdv") || process.env.DIRECT_URL.includes("supabase.co")) {
   process.env.DIRECT_URL = "postgresql://postgres:postgres@127.0.0.1:5433/email_test";
 }
-process.env.REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
-process.env.REDIS_HOST = process.env.REDIS_HOST || "127.0.0.1";
-process.env.REDIS_PORT = process.env.REDIS_PORT || "6379";
 process.env.ALLOW_DESTRUCTIVE_TESTS = "true";
 process.env.NODE_ENV = "test";
 process.env.AUTH_SESSION_SECRET = "event-processing-test-session-secret-32-chars";
@@ -36,11 +33,9 @@ process.env.EMAIL_WEBHOOK_SECRET = "event-processing-webhook-secret-key-32";
 
 import crypto from "crypto";
 import { prisma } from "../src/lib/prisma";
-import { getEventsQueue, closeAllQueues } from "../src/lib/email/queue/queues";
-import {
-  createEventWorker,
-  processEmailEventJob,
-} from "../src/lib/email/queue/event-worker";
+import { getEventsQueue } from "../src/lib/email/queue/queues";
+import { EmailEventProcessor } from "../src/lib/services/executors/email-event-processor";
+import { PermanentError } from "../src/lib/errors/job-errors";
 import {
   EmailEventService,
   canTransitionDeliveryStatus,
@@ -60,7 +55,6 @@ import {
   EmailEventProcessingStatus,
   EmailCampaignStatus,
 } from "@prisma/client";
-import { Job } from "bullmq";
 import { EmailEventJobData, RetryableEmailError, PermanentEmailError } from "../src/lib/email/queue/types";
 
 let passed = 0;
@@ -79,7 +73,7 @@ function assert(condition: boolean, message: string) {
 async function run() {
   console.log("================================================================================");
   console.log("STARTING EMAIL EVENT QUEUE & DURABLE PROCESSING INTEGRATION TESTS");
-  console.log("Using Real Disposable PostgreSQL (5433) + Real Disposable Redis (6379)");
+  console.log("Using Real Disposable PostgreSQL (5433)");
   console.log("================================================================================\n");
 
   const eventsQueue = getEventsQueue();
@@ -318,10 +312,10 @@ async function run() {
       providerMessageId: delivery1.providerMessageId!,
     },
     attemptsMade: 0,
-  } as unknown as Job<EmailEventJobData>;
+  };
 
-  const workerResult = await processEmailEventJob(jobStub);
-  assert(workerResult.success === true, "Worker processEmailEventJob completed with success");
+  const workerResult = await EmailEventProcessor.process({ eventId: jobStub.data.eventRecordId });
+  assert(workerResult.success === true, "EmailEventProcessor completed with success");
   assert(workerResult.statusUpdated === true, "Worker applied state machine update");
 
   // Verify DB state after worker execution
@@ -351,7 +345,7 @@ async function run() {
   console.log("\n--- Phase 4: Idempotency & Stale/Out-of-Order Events ---");
 
   // Reprocess same event: must be idempotent, no double increment
-  const duplicateWorkerResult = await processEmailEventJob(jobStub);
+  const duplicateWorkerResult = await EmailEventProcessor.process({ eventId: jobStub.data.eventRecordId });
   assert(duplicateWorkerResult.success === true && duplicateWorkerResult.deduplicated === true, "Reprocessing same event is idempotent");
 
   const campaignAfterDup = await prisma.emailCampaign.findUnique({
@@ -371,11 +365,7 @@ async function run() {
   )[0];
 
   const staleRecord = await EmailEventService.recordAndEnqueueEvent(staleSentEvent, providerConfig);
-  const staleWorkerResult = await processEmailEventJob({
-    id: `job-${staleRecord.eventId}`,
-    data: { eventRecordId: staleRecord.eventId! },
-    attemptsMade: 0,
-  } as unknown as Job<EmailEventJobData>);
+  const staleWorkerResult = await EmailEventProcessor.process({ eventId: staleRecord.eventId! });
 
   assert(staleWorkerResult.success === true, "Worker handles stale event without error");
   assert(staleWorkerResult.statusUpdated === false, "State machine rejected downgrading DELIVERED -> SENT");
@@ -441,11 +431,7 @@ async function run() {
   )[0];
 
   const hbRecord = await EmailEventService.recordAndEnqueueEvent(hardBounceEvent, providerConfig);
-  const hbWorkerResult = await processEmailEventJob({
-    id: `job-${hbRecord.eventId}`,
-    data: { eventRecordId: hbRecord.eventId! },
-    attemptsMade: 0,
-  } as unknown as Job<EmailEventJobData>);
+  const hbWorkerResult = await EmailEventProcessor.process({ eventId: hbRecord.eventId! });
 
   assert(hbWorkerResult.statusUpdated === true, "Delivery updated to BOUNCED");
   assert(hbWorkerResult.suppressionCreated === true, "Hard bounce triggered suppression creation");
@@ -491,11 +477,7 @@ async function run() {
   )[0];
 
   const lateDelRecord = await EmailEventService.recordAndEnqueueEvent(lateDelAfterBounce, providerConfig);
-  const lateDelWorkerResult = await processEmailEventJob({
-    id: `job-${lateDelRecord.eventId}`,
-    data: { eventRecordId: lateDelRecord.eventId! },
-    attemptsMade: 0,
-  } as unknown as Job<EmailEventJobData>);
+  const lateDelWorkerResult = await EmailEventProcessor.process({ eventId: lateDelRecord.eventId! });
 
   assert(lateDelWorkerResult.statusUpdated === false, "Late DELIVERED after BOUNCED was REJECTED");
   const del2Check = await prisma.emailDelivery.findUnique({ where: { id: delivery2.id } });
@@ -513,11 +495,7 @@ async function run() {
   )[0];
 
   const failBounceRecord = await EmailEventService.recordAndEnqueueEvent(failedAfterBounce, providerConfig);
-  const failBounceResult = await processEmailEventJob({
-    id: `job-${failBounceRecord.eventId}`,
-    data: { eventRecordId: failBounceRecord.eventId! },
-    attemptsMade: 0,
-  } as unknown as Job<EmailEventJobData>);
+  const failBounceResult = await EmailEventProcessor.process({ eventId: failBounceRecord.eventId! });
 
   assert(failBounceResult.statusUpdated === false, "FAILED after BOUNCED was REJECTED");
   const del2Check2 = await prisma.emailDelivery.findUnique({ where: { id: delivery2.id } });
@@ -539,11 +517,7 @@ async function run() {
   )[0];
 
   const sbRecord = await EmailEventService.recordAndEnqueueEvent(softBounceEvent, providerConfig);
-  const sbResult = await processEmailEventJob({
-    id: `job-${sbRecord.eventId}`,
-    data: { eventRecordId: sbRecord.eventId! },
-    attemptsMade: 0,
-  } as unknown as Job<EmailEventJobData>);
+  const sbResult = await EmailEventProcessor.process({ eventId: sbRecord.eventId! });
 
   assert(sbResult.suppressionCreated === false, "Soft bounce did NOT create permanent suppression");
   const sbSuppression = await prisma.emailSuppression.findUnique({
@@ -576,11 +550,7 @@ async function run() {
   )[0];
 
   const compRecord = await EmailEventService.recordAndEnqueueEvent(complaintEvent, providerConfig);
-  const compResult = await processEmailEventJob({
-    id: `job-${compRecord.eventId}`,
-    data: { eventRecordId: compRecord.eventId! },
-    attemptsMade: 0,
-  } as unknown as Job<EmailEventJobData>);
+  const compResult = await EmailEventProcessor.process({ eventId: compRecord.eventId! });
 
   assert(compResult.statusUpdated === true, "COMPLAINT successfully transitioned delivery from DELIVERED to COMPLAINED");
   assert(compResult.suppressionCreated === true, "COMPLAINT created suppression");
@@ -615,13 +585,9 @@ async function run() {
 
   let threwPermanent = false;
   try {
-    await processEmailEventJob({
-      id: `job-corrupt-${corruptEvent.id}`,
-      data: { eventRecordId: corruptEvent.id },
-      attemptsMade: 0,
-    } as unknown as Job<EmailEventJobData>);
+    await EmailEventProcessor.process({ eventId: corruptEvent.id });
   } catch (err) {
-    if (err instanceof PermanentEmailError) {
+    if (err instanceof PermanentError) {
       threwPermanent = true;
     }
   }
@@ -633,23 +599,17 @@ async function run() {
   // Non-existent event record ID must throw PermanentEmailError
   let nonExistentPermanent = false;
   try {
-    await processEmailEventJob({
-      id: `job-nonexistent`,
-      data: { eventRecordId: "00000000-0000-0000-0000-000000000000" },
-      attemptsMade: 0,
-    } as unknown as Job<EmailEventJobData>);
+    await EmailEventProcessor.process({ eventId: "00000000-0000-0000-0000-000000000000" });
   } catch (err) {
-    if (err instanceof PermanentEmailError) {
+    if (err instanceof PermanentError) {
       nonExistentPermanent = true;
     }
   }
-  assert(nonExistentPermanent, "Non-existent event record threw PermanentEmailError for BullMQ");
+  assert(nonExistentPermanent, "Non-existent event record threw PermanentError");
 
   // -----------------------------------------------------------------------------
   // CLEANUP & SUMMARY
   // -----------------------------------------------------------------------------
-  await eventsQueue.close();
-  await closeAllQueues();
   await prisma.$disconnect();
 
   console.log("\n================================================================================");
