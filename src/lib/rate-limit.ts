@@ -120,6 +120,14 @@ export function formatRateLimitKey(identifier: string): string {
 }
 
 /**
+ * Redis is only used when explicitly configured. Without REDIS_URL the PostgreSQL RateLimit
+ * table is the shared (multi-instance) backend, instead of dialing a non-existent localhost Redis.
+ */
+function isRedisConfigured(): boolean {
+  return testForceRedisFailure || testRedisClientOverride !== undefined || Boolean(process.env.REDIS_URL);
+}
+
+/**
  * Resolves active Redis connection for rate limiting.
  */
 function getRateLimiterRedis(): Redis | null {
@@ -148,7 +156,8 @@ export async function checkRateLimit(
 ): Promise<RateLimitResult> {
   const criticality = options?.criticality || "STANDARD";
   const shouldFailClosed = options?.failClosed ?? (criticality === "CRITICAL");
-  const redis = getRateLimiterRedis();
+  const redisConfigured = isRedisConfigured();
+  const redis = redisConfigured ? getRateLimiterRedis() : null;
 
   if (redis && !testForceRedisFailure) {
     try {
@@ -214,7 +223,7 @@ export async function checkRateLimit(
         };
       }
     }
-  } else if (shouldFailClosed) {
+  } else if (redisConfigured && shouldFailClosed) {
     logger.error(
       `[RateLimit:FailClosed] Critical rate limiter failing closed for '${identifier}' because Redis is offline.`
     );
@@ -238,6 +247,18 @@ export async function checkRateLimit(
       `[RateLimit] PostgreSQL rate limiting unavailable for '${identifier}', falling back to memory:`,
       pgErr instanceof Error ? pgErr.message : pgErr
     );
+    if (shouldFailClosed) {
+      // Per-instance memory is not a safe limiter for auth/OTP endpoints on serverless.
+      return {
+        success: false,
+        limit,
+        remaining: 0,
+        resetSeconds: Math.ceil(windowMs / 1000),
+        failedClosed: true,
+        error: "RATE_LIMITER_UNAVAILABLE",
+        backend: "postgres",
+      };
+    }
   }
 
   // Final fallback: Local in-process memory

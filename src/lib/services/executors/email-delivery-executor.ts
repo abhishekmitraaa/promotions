@@ -7,6 +7,8 @@
  * - Verifies suppression list and sender identity
  * - Resolves tenant provider binding
  * - Uses clean JobError taxonomy (RetryableError / PermanentError)
+ * - Every post-claim write is bound to the claim token, and the row carries an in-flight
+ *   send marker while the provider call is outstanding (see claim-lock.ts)
  */
 
 import { prisma } from "../../prisma";
@@ -17,13 +19,19 @@ import {
   EmailDelivery,
 } from "@prisma/client";
 import { providerRegistry } from "../../email/registry";
-import { EmailProvider } from "../../email/types";
+import { EmailProvider, EmailSendResult } from "../../email/types";
 import {
   RetryableError,
   PermanentError,
   classifyJobError,
 } from "../../errors/job-errors";
 import { logger } from "../../logger";
+import {
+  newClaimToken,
+  notSendInFlight,
+  sendInFlightToken,
+  staleLockCutoff,
+} from "./claim-lock";
 
 export interface ExecuteEmailDeliveryOptions {
   deliveryId: string;
@@ -43,6 +51,14 @@ export interface ExecuteEmailDeliveryResult {
   errorCode?: string;
   errorMessage?: string;
 }
+
+const TERMINAL_STATUSES: EmailDeliveryStatus[] = [
+  EmailDeliveryStatus.SENT,
+  EmailDeliveryStatus.DELIVERED,
+  EmailDeliveryStatus.BOUNCED,
+  EmailDeliveryStatus.COMPLAINED,
+  EmailDeliveryStatus.FAILED,
+];
 
 export class EmailDeliveryExecutor {
   static async execute(options: ExecuteEmailDeliveryOptions): Promise<ExecuteEmailDeliveryResult> {
@@ -66,13 +82,8 @@ export class EmailDeliveryExecutor {
       throw new PermanentError(`Authoritative EmailDelivery '${deliveryId}' not found.`);
     }
 
-    // 2. Terminal State Guard: If already SENT, DELIVERED, or terminal, skip!
-    if (
-      delivery.status === EmailDeliveryStatus.SENT ||
-      delivery.status === EmailDeliveryStatus.DELIVERED ||
-      delivery.status === EmailDeliveryStatus.BOUNCED ||
-      delivery.status === EmailDeliveryStatus.COMPLAINED
-    ) {
+    // 2. Terminal State Guard (FAILED is terminal: retryable failures are re-queued as QUEUED)
+    if (TERMINAL_STATUSES.includes(delivery.status)) {
       logger.info(`[EmailDeliveryExecutor] Delivery ${deliveryId} is already in terminal state ${delivery.status}. Skipping.`);
       return {
         success: true,
@@ -84,8 +95,11 @@ export class EmailDeliveryExecutor {
     }
 
     // 3. Authoritative Atomic Claim Mechanism
+    let lockToken: string;
+    let currentAttempt: number;
+
     if (claimToken) {
-      // Caller has pre-claimed the row. Verify ownership.
+      // Caller has pre-claimed the row (and already incremented attemptCount). Verify ownership.
       if (delivery.status !== EmailDeliveryStatus.PROCESSING || delivery.lockedBy !== claimToken) {
         logger.warn(
           `[EmailDeliveryExecutor] Delivery ${deliveryId} claimToken mismatch or lock lost. Current status: ${delivery.status}, lockedBy: ${delivery.lockedBy}. Skipping.`
@@ -98,23 +112,29 @@ export class EmailDeliveryExecutor {
           reason: "CLAIM_TOKEN_MISMATCH",
         };
       }
+      lockToken = claimToken;
+      currentAttempt = delivery.attemptCount || 1;
     } else {
       // Caller has NOT pre-claimed. Atomically claim via conditional update.
-      const workerClaimToken = `executor-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const staleCutoff = new Date(Date.now() - 10 * 60 * 1000);
+      lockToken = newClaimToken("executor");
+      const staleCutoff = staleLockCutoff();
 
       const claimResult = await prisma.emailDelivery.updateMany({
         where: {
           id: delivery.id,
           OR: [
             { status: EmailDeliveryStatus.QUEUED },
-            { status: EmailDeliveryStatus.FAILED, attemptCount: { lt: maxAttempts } },
-            // Stale lock recovery: in PROCESSING but abandoned (>10m)
+            // Stale lock recovery: in PROCESSING but abandoned, and never reached the provider send
             {
               status: EmailDeliveryStatus.PROCESSING,
-              OR: [
-                { lockedAt: { lt: staleCutoff } },
-                { lockedAt: null, lastAttemptAt: { lt: staleCutoff } },
+              AND: [
+                notSendInFlight,
+                {
+                  OR: [
+                    { lockedAt: { lt: staleCutoff } },
+                    { lockedAt: null, lastAttemptAt: { lt: staleCutoff } },
+                  ],
+                },
               ],
             },
           ],
@@ -124,7 +144,7 @@ export class EmailDeliveryExecutor {
           attemptCount: { increment: 1 },
           lastAttemptAt: new Date(),
           lockedAt: new Date(),
-          lockedBy: workerClaimToken,
+          lockedBy: lockToken,
         },
       });
 
@@ -134,7 +154,7 @@ export class EmailDeliveryExecutor {
           where: { id: delivery.id },
         });
 
-        if (fresh?.status === EmailDeliveryStatus.SENT || fresh?.status === EmailDeliveryStatus.DELIVERED) {
+        if (fresh && TERMINAL_STATUSES.includes(fresh.status)) {
           return {
             success: true,
             deliveryId,
@@ -145,6 +165,7 @@ export class EmailDeliveryExecutor {
         }
 
         if (fresh?.status === EmailDeliveryStatus.PROCESSING) {
+          // Includes stale rows with an in-flight send marker: reconciliation resolves those.
           logger.info(
             `[EmailDeliveryExecutor] Delivery ${deliveryId} actively held by claimant '${fresh.lockedBy}'. Skipping without external send.`
           );
@@ -165,9 +186,10 @@ export class EmailDeliveryExecutor {
           reason: "CLAIM_CONTENTION",
         };
       }
+      currentAttempt = (delivery.attemptCount || 0) + 1;
     }
 
-    const currentAttempt = (delivery.attemptCount || 0) + 1;
+    const ownedByUs = { id: delivery.id, status: EmailDeliveryStatus.PROCESSING, lockedBy: lockToken };
 
     // 4. Verify Suppression List
     const isSuppressed = await prisma.emailSuppression.findFirst({
@@ -179,7 +201,7 @@ export class EmailDeliveryExecutor {
 
     if (isSuppressed) {
       await prisma.emailDelivery.updateMany({
-        where: { id: delivery.id, status: EmailDeliveryStatus.PROCESSING },
+        where: ownedByUs,
         data: {
           status: EmailDeliveryStatus.FAILED,
           errorCode: "RECIPIENT_SUPPRESSED",
@@ -215,14 +237,14 @@ export class EmailDeliveryExecutor {
 
         if (!delivery.providerConfigId && resolved.configId) {
           await prisma.emailDelivery.updateMany({
-            where: { id: delivery.id },
+            where: ownedByUs,
             data: { providerConfigId: resolved.configId },
           });
         }
       } catch (resolveErr) {
         const msg = resolveErr instanceof Error ? resolveErr.message : "Provider resolution failed";
         await prisma.emailDelivery.updateMany({
-          where: { id: delivery.id, status: EmailDeliveryStatus.PROCESSING },
+          where: ownedByUs,
           data: {
             status: EmailDeliveryStatus.FAILED,
             errorCode: "PROVIDER_RESOLUTION_FAILED",
@@ -236,7 +258,7 @@ export class EmailDeliveryExecutor {
       }
     }
 
-    // 6. Execute Send via Resolved Provider
+    // 6. Validate content
     const outgoingHtml = delivery.htmlContent || undefined;
     const outgoingText = delivery.textContent || undefined;
 
@@ -245,7 +267,7 @@ export class EmailDeliveryExecutor {
         `EmailDelivery '${delivery.id}' has neither htmlContent nor textContent.`
       );
       await prisma.emailDelivery.updateMany({
-        where: { id: delivery.id, status: EmailDeliveryStatus.PROCESSING },
+        where: ownedByUs,
         data: {
           status: EmailDeliveryStatus.FAILED,
           errorCode: "EMPTY_CONTENT",
@@ -260,8 +282,29 @@ export class EmailDeliveryExecutor {
 
     const fromAddress = providerSenderEmail || delivery.from;
 
+    // 7. Mark the send as in flight. From here on, a crash leaves a marker that prevents an
+    //    automatic re-send (the provider may already have accepted the message).
+    const inFlightToken = sendInFlightToken(lockToken);
+    const marked = await prisma.emailDelivery.updateMany({
+      where: ownedByUs,
+      data: { lockedBy: inFlightToken, lockedAt: new Date() },
+    });
+    if (marked.count === 0) {
+      logger.warn(`[EmailDeliveryExecutor] Delivery ${delivery.id} lock lost before send. Skipping without external send.`);
+      return {
+        success: true,
+        deliveryId,
+        status: delivery.status,
+        skipped: true,
+        reason: "CLAIM_LOST",
+      };
+    }
+    const ownedInFlight = { id: delivery.id, status: EmailDeliveryStatus.PROCESSING, lockedBy: inFlightToken };
+
+    // 8. Execute Send via Resolved Provider
+    let sendResult: EmailSendResult;
     try {
-      const sendResult = await provider.send({
+      sendResult = await provider.send({
         clientId: delivery.clientId,
         from: fromAddress,
         to: delivery.to,
@@ -276,31 +319,6 @@ export class EmailDeliveryExecutor {
       if (!sendResult.success) {
         throw new Error(sendResult.error?.message || "Provider returned failure");
       }
-
-      // 7. Update to SENT
-      await prisma.emailDelivery.updateMany({
-        where: { id: delivery.id, status: EmailDeliveryStatus.PROCESSING },
-        data: {
-          status: EmailDeliveryStatus.SENT,
-          sentAt: new Date(),
-          providerType,
-          providerMessageId: sendResult.providerMessageId || null,
-          smtpCode: sendResult.error?.statusCode ? String(sendResult.error.statusCode) : null,
-          lockedAt: null,
-          lockedBy: null,
-        },
-      });
-
-      logger.info(
-        `[EmailDeliveryExecutor] Delivery ${delivery.id} SENT successfully via ${providerType}`
-      );
-
-      return {
-        success: true,
-        deliveryId: delivery.id,
-        status: EmailDeliveryStatus.SENT,
-        providerMessageId: sendResult.providerMessageId,
-      };
     } catch (sendErr) {
       const classification = classifyJobError(sendErr);
 
@@ -309,7 +327,7 @@ export class EmailDeliveryExecutor {
         const nextAttemptAt = new Date(Date.now() + backoffMs);
 
         await prisma.emailDelivery.updateMany({
-          where: { id: delivery.id },
+          where: ownedInFlight,
           data: {
             status: EmailDeliveryStatus.QUEUED,
             nextAttemptAt,
@@ -329,29 +347,71 @@ export class EmailDeliveryExecutor {
           classification.code,
           backoffMs
         );
-      } else {
-        // Permanent failure
-        await prisma.emailDelivery.updateMany({
-          where: { id: delivery.id },
-          data: {
-            status: EmailDeliveryStatus.FAILED,
-            failedAt: new Date(),
-            errorCode: classification.code,
-            errorMessage: classification.message,
-            lockedAt: null,
-            lockedBy: null,
-          },
-        });
+      }
 
-        logger.error(
-          `[EmailDeliveryExecutor] Delivery ${delivery.id} permanently failed: ${classification.message}`
-        );
+      // Permanent failure
+      await prisma.emailDelivery.updateMany({
+        where: ownedInFlight,
+        data: {
+          status: EmailDeliveryStatus.FAILED,
+          failedAt: new Date(),
+          errorCode: classification.code,
+          errorMessage: classification.message,
+          lockedAt: null,
+          lockedBy: null,
+        },
+      });
 
-        throw new PermanentError(
-          `Permanent error sending delivery ${delivery.id}: ${classification.message}`,
-          classification.code
+      logger.error(
+        `[EmailDeliveryExecutor] Delivery ${delivery.id} permanently failed: ${classification.message}`
+      );
+
+      throw new PermanentError(
+        `Permanent error sending delivery ${delivery.id}: ${classification.message}`,
+        classification.code
+      );
+    }
+
+    // 9. Record SENT. The provider has accepted the message, so a failure here must never lead
+    //    to a re-send: the in-flight marker stays and reconciliation flags the row instead.
+    try {
+      const recorded = await prisma.emailDelivery.updateMany({
+        where: ownedInFlight,
+        data: {
+          status: EmailDeliveryStatus.SENT,
+          sentAt: new Date(),
+          providerType,
+          providerMessageId: sendResult.providerMessageId || null,
+          smtpCode: sendResult.error?.statusCode ? String(sendResult.error.statusCode) : null,
+          lockedAt: null,
+          lockedBy: null,
+        },
+      });
+      if (recorded.count === 0) {
+        logger.warn(
+          `[EmailDeliveryExecutor] Delivery ${delivery.id} was sent (providerMessageId: ${sendResult.providerMessageId}) but its lock changed owner; SENT not recorded.`
         );
       }
+    } catch (recordErr) {
+      logger.error(
+        `[EmailDeliveryExecutor] Delivery ${delivery.id} was sent (providerMessageId: ${sendResult.providerMessageId}) but recording SENT failed. Leaving in-flight marker to prevent a duplicate send.`,
+        recordErr
+      );
+      throw new PermanentError(
+        `Delivery ${delivery.id} sent but status could not be recorded: ${recordErr instanceof Error ? recordErr.message : String(recordErr)}`,
+        "SENT_NOT_RECORDED"
+      );
     }
+
+    logger.info(
+      `[EmailDeliveryExecutor] Delivery ${delivery.id} SENT successfully via ${providerType}`
+    );
+
+    return {
+      success: true,
+      deliveryId: delivery.id,
+      status: EmailDeliveryStatus.SENT,
+      providerMessageId: sendResult.providerMessageId,
+    };
   }
 }

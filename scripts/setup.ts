@@ -27,23 +27,18 @@ async function main() {
     console.log("📄 No .env.local found. Generating fresh configuration from .env.example...");
     let content = fs.readFileSync(envExamplePath, "utf-8");
 
-    // Generate cryptographically random pepper & session secret
-    const generatedPepper = crypto.randomBytes(32).toString("hex");
-    const generatedSessionSecret = crypto.randomBytes(32).toString("hex");
-    activePepper = generatedPepper;
-
-    content = content.replace(
-      /API_KEY_PEPPER="[^"]*"/,
-      `API_KEY_PEPPER="${generatedPepper}"`
-    );
-    content = content.replace(
-      /AUTH_SESSION_SECRET="[^"]*"/,
-      `AUTH_SESSION_SECRET="${generatedSessionSecret}"`
-    );
+    // Replace every placeholder secret (values starting with "change_this") with a random one
+    const generated: string[] = [];
+    content = content.replace(/^([A-Z0-9_]+)="change_this[^"]*"/gm, (_match, name: string) => {
+      const value = crypto.randomBytes(32).toString("hex");
+      if (name === "API_KEY_PEPPER") activePepper = value;
+      generated.push(name);
+      return `${name}="${value}"`;
+    });
 
     fs.writeFileSync(envLocalPath, content, "utf-8");
     createdLocalEnv = true;
-    console.log("✅ Created .env.local with random API pepper and session secret");
+    console.log(`✅ Created .env.local with random values for: ${generated.join(", ")}`);
   } else {
     console.log("✅ Environment configuration file present");
     const targetFile = fs.existsSync(envLocalPath) ? envLocalPath : envPath;

@@ -35,6 +35,13 @@ import { EmailEventService } from "../src/lib/services/email-event-service";
 import { ReconciliationExecutor } from "../src/lib/services/executors/reconciliation-executor";
 import { providerRegistry } from "../src/lib/email/registry";
 import { EmailProvider, EmailSendRequest, EmailSendResult, EmailProviderHealthResult } from "../src/lib/email/types";
+import { RetryableError, isRetryableError } from "../src/lib/errors/job-errors";
+import { checkRateLimit } from "../src/lib/rate-limit";
+import { RetryableEmailError } from "../src/lib/email/queue/types";
+import { SEND_IN_FLIGHT_SUFFIX, SEND_OUTCOME_UNKNOWN } from "../src/lib/services/executors/claim-lock";
+import { isWorkerlessMode } from "../src/lib/email/queue/queues";
+import * as envModule from "../src/lib/env";
+import { NextRequest } from "next/server";
 import {
   EmailDeliveryStatus,
   EmailCampaignStatus,
@@ -67,10 +74,19 @@ class TrackingMockProvider implements EmailProvider {
   readonly providerType = EmailProviderType.MOCK;
   sendCount = 0;
   sentPayloads: EmailSendRequest[] = [];
+  // Test hooks: run a side effect during send (e.g. simulate a stale reclaim), or fail the next send
+  onSend: (() => Promise<void>) | null = null;
+  nextError: Error | null = null;
 
   async send(request: EmailSendRequest): Promise<EmailSendResult> {
     this.sendCount++;
     this.sentPayloads.push(request);
+    if (this.onSend) await this.onSend();
+    if (this.nextError) {
+      const err = this.nextError;
+      this.nextError = null;
+      throw err;
+    }
     // Add artificial jitter to expose concurrent race windows
     await new Promise((resolve) => setTimeout(resolve, 30));
     return {
@@ -452,6 +468,382 @@ async function main() {
     );
   } finally {
     ReconciliationExecutor.reconcile = originalReconcile;
+  }
+
+  // ============================================================================
+  // Test 6: Retryable event error releases the event for immediate retry
+  // ============================================================================
+  console.log("\n▶ [Regression 6] Retryable EmailEvent error releases claim...");
+
+  const retryEvent = await prisma.emailEvent.create({
+    data: {
+      clientId: testTenant,
+      eventType: EmailEventType.DELIVERED,
+      recipient: "retry-event@example.com",
+      payload: JSON.stringify({}),
+      status: EmailEventProcessingStatus.RECEIVED,
+    },
+  });
+
+  const eventServiceInternals = EmailEventService as unknown as { resolveDelivery: (...args: unknown[]) => Promise<unknown> };
+  const originalResolveDelivery = eventServiceInternals.resolveDelivery;
+  eventServiceInternals.resolveDelivery = async () => {
+    throw new RetryableEmailError("Simulated transient database timeout");
+  };
+  let retryEventThrew = false;
+  try {
+    await EmailEventService.processEventFromWorker(retryEvent.id);
+  } catch {
+    retryEventThrew = true;
+  } finally {
+    eventServiceInternals.resolveDelivery = originalResolveDelivery;
+  }
+
+  const releasedEvent = await prisma.emailEvent.findUnique({ where: { id: retryEvent.id } });
+  assert(retryEventThrew, "Retryable error propagated to caller");
+  assert(
+    releasedEvent?.status === EmailEventProcessingStatus.RECEIVED,
+    `Event released to RECEIVED after retryable error (actual: ${releasedEvent?.status})`
+  );
+  const immediateRetry = await EmailEventService.processEventFromWorker(retryEvent.id);
+  const retriedEvent = await prisma.emailEvent.findUnique({ where: { id: retryEvent.id } });
+  assert(
+    immediateRetry.success === true && !(immediateRetry as { skipped?: boolean }).skipped,
+    "Immediate retry claims and processes the event (no 10-minute stall)"
+  );
+  assert(retriedEvent?.status === EmailEventProcessingStatus.PROCESSED, "Retried event reached PROCESSED");
+
+  // ============================================================================
+  // Test 7: Contention yields must not consume BackgroundJob attempts
+  // ============================================================================
+  console.log("\n▶ [Regression 7] Contention yields do not burn BackgroundJob attempts...");
+
+  const heldDelivery = await prisma.emailDelivery.create({
+    data: {
+      clientId: testTenant,
+      providerType: EmailProviderType.MOCK,
+      category: EmailType.TRANSACTIONAL,
+      from: "held@example.com",
+      to: "held-recipient@example.com",
+      subject: "Held Delivery",
+      textContent: "Held by another worker",
+      status: EmailDeliveryStatus.PROCESSING,
+      lockedAt: new Date(Date.now() - 30 * 1000),
+      lockedBy: "holder-worker",
+      attemptCount: 1,
+    },
+  });
+  const yieldingJob = await prisma.backgroundJob.create({
+    data: {
+      clientId: testTenant,
+      type: "TRANSACTIONAL_EMAIL",
+      payload: JSON.stringify({ deliveryId: heldDelivery.id }),
+      status: BackgroundJobStatus.QUEUED,
+      maxAttempts: 5,
+    },
+  });
+
+  for (let i = 0; i < 7; i++) {
+    await prisma.backgroundJob.update({
+      where: { id: yieldingJob.id },
+      data: { availableAt: new Date(Date.now() - 1000) },
+    });
+    await ServerlessJobProcessor.processBackgroundJobs(10);
+  }
+  const yieldedJob = await prisma.backgroundJob.findUnique({ where: { id: yieldingJob.id } });
+  assert(
+    yieldedJob?.status === BackgroundJobStatus.QUEUED,
+    `Job still QUEUED after 7 contention yields (actual: ${yieldedJob?.status})`
+  );
+  assert(yieldedJob?.attemptCount === 0, `Yields did not consume attempts (actual attemptCount: ${yieldedJob?.attemptCount})`);
+  await prisma.backgroundJob.delete({ where: { id: yieldingJob.id } });
+  await prisma.emailDelivery.update({
+    where: { id: heldDelivery.id },
+    data: { status: EmailDeliveryStatus.FAILED, lockedAt: null, lockedBy: null },
+  });
+
+  // ============================================================================
+  // Test 8: Permanently FAILED deliveries are terminal
+  // ============================================================================
+  console.log("\n▶ [Regression 8] FAILED delivery is never re-sent...");
+
+  const failedDelivery = await prisma.emailDelivery.create({
+    data: {
+      clientId: testTenant,
+      providerType: EmailProviderType.MOCK,
+      category: EmailType.TRANSACTIONAL,
+      from: "failed@example.com",
+      to: "rejected@example.com",
+      subject: "Permanently rejected",
+      textContent: "Do not resend",
+      status: EmailDeliveryStatus.FAILED,
+      errorCode: "PERMANENT_REJECT",
+      attemptCount: 1,
+    },
+  });
+  trackingProvider.sendCount = 0;
+  const failedResult = await EmailDeliveryExecutor.execute({ deliveryId: failedDelivery.id });
+  assert(trackingProvider.sendCount === 0, `FAILED delivery not re-sent (sendCount: ${trackingProvider.sendCount})`);
+  assert(failedResult.reason === "ALREADY_TERMINAL", `FAILED treated as terminal (reason: ${failedResult.reason})`);
+
+  // ============================================================================
+  // Test 9: Sweep path counts attempts correctly (no off-by-one)
+  // ============================================================================
+  console.log("\n▶ [Regression 9] Sweep-claimed delivery uses the real attempt number...");
+
+  const attemptDelivery = await prisma.emailDelivery.create({
+    data: {
+      clientId: testTenant,
+      providerType: EmailProviderType.MOCK,
+      category: EmailType.TRANSACTIONAL,
+      from: "attempts@example.com",
+      to: "attempts-recipient@example.com",
+      subject: "Attempt counting",
+      textContent: "Fourth attempt",
+      status: EmailDeliveryStatus.QUEUED,
+      attemptCount: 3,
+    },
+  });
+  trackingProvider.nextError = new RetryableError("Simulated provider 503");
+  await ServerlessJobProcessor.processTransactionalEmails(10);
+  trackingProvider.nextError = null;
+  const attemptAfter = await prisma.emailDelivery.findUnique({ where: { id: attemptDelivery.id } });
+  assert(attemptAfter?.attemptCount === 4, `Attempt count is 4 after the fourth attempt (actual: ${attemptAfter?.attemptCount})`);
+  assert(
+    attemptAfter?.status === EmailDeliveryStatus.QUEUED,
+    `Transient error on attempt 4 of 5 is retried, not failed (actual: ${attemptAfter?.status})`
+  );
+  await prisma.emailDelivery.update({
+    where: { id: attemptDelivery.id },
+    data: { status: EmailDeliveryStatus.FAILED, lockedAt: null, lockedBy: null },
+  });
+
+  // ============================================================================
+  // Test 10: Campaign recipient retry after a delivery was already recorded
+  // ============================================================================
+  console.log("\n▶ [Regression 10] Campaign recipient retry does not re-send an already-sent email...");
+
+  const retryCampaign = await prisma.emailCampaign.create({
+    data: {
+      clientId: testTenant,
+      name: "Retry Campaign",
+      templateVersionId: tmplVersion.id,
+      status: EmailCampaignStatus.RUNNING,
+      sentCount: 0,
+      totalRecipients: 1,
+    },
+  });
+  const retryRecipient = await prisma.emailCampaignRecipient.create({
+    data: { campaignId: retryCampaign.id, email: "campaign-retry@example.com", status: "PENDING", attemptCount: 1 },
+  });
+  await prisma.emailDelivery.create({
+    data: {
+      clientId: testTenant,
+      providerType: EmailProviderType.MOCK,
+      campaignId: retryCampaign.id,
+      campaignRecipientId: retryRecipient.id,
+      category: EmailType.PROMOTIONAL,
+      from: "campaigns@example.com",
+      to: retryRecipient.email,
+      subject: "Race Campaign Subject",
+      textContent: "Hello",
+      status: EmailDeliveryStatus.SENT,
+      sentAt: new Date(),
+      idempotencyKey: `campaign-${retryCampaign.id}-recipient-${retryRecipient.id}`,
+    },
+  });
+
+  trackingProvider.sendCount = 0;
+  let retryRecipientError: unknown = null;
+  try {
+    await CampaignRecipientExecutor.executeRecipient({ recipientId: retryRecipient.id });
+  } catch (err) {
+    retryRecipientError = err;
+  }
+  const retriedRecipient = await prisma.emailCampaignRecipient.findUnique({ where: { id: retryRecipient.id } });
+  const retryDeliveries = await prisma.emailDelivery.count({ where: { campaignRecipientId: retryRecipient.id } });
+  const retryCampaignAfter = await prisma.emailCampaign.findUnique({ where: { id: retryCampaign.id } });
+  assert(retryRecipientError === null, `Retry completes without error (error: ${retryRecipientError instanceof Error ? retryRecipientError.message : "none"})`);
+  assert(trackingProvider.sendCount === 0, `No second provider send (sendCount: ${trackingProvider.sendCount})`);
+  assert(retriedRecipient?.status === "SENT", `Recipient marked SENT (actual: ${retriedRecipient?.status})`);
+  assert(retryDeliveries === 1, `Still exactly one delivery row (actual: ${retryDeliveries})`);
+  assert(retryCampaignAfter?.sentCount === 1, `sentCount incremented once (actual: ${retryCampaignAfter?.sentCount})`);
+
+  // ============================================================================
+  // Test 11: Early errors after claim release the recipient lock
+  // ============================================================================
+  console.log("\n▶ [Regression 11] Early recipient errors release the lock and finish the campaign...");
+
+  const brokenCampaign = await prisma.emailCampaign.create({
+    data: {
+      clientId: testTenant,
+      name: "Campaign Without Template",
+      status: EmailCampaignStatus.RUNNING,
+      totalRecipients: 1,
+    },
+  });
+  const brokenRecipient = await prisma.emailCampaignRecipient.create({
+    data: { campaignId: brokenCampaign.id, email: "no-template@example.com", status: "PENDING" },
+  });
+  let brokenThrew = false;
+  try {
+    await CampaignRecipientExecutor.executeRecipient({ recipientId: brokenRecipient.id });
+  } catch {
+    brokenThrew = true;
+  }
+  const brokenAfter = await prisma.emailCampaignRecipient.findUnique({ where: { id: brokenRecipient.id } });
+  const brokenCampaignAfter = await prisma.emailCampaign.findUnique({ where: { id: brokenCampaign.id } });
+  assert(brokenThrew, "Missing template surfaces as an error");
+  assert(brokenAfter?.status === "FAILED", `Recipient moved to FAILED (actual: ${brokenAfter?.status})`);
+  assert(brokenAfter?.lockedBy === null, `Recipient lock released (lockedBy: ${brokenAfter?.lockedBy})`);
+  assert(
+    brokenCampaignAfter?.status === EmailCampaignStatus.COMPLETED,
+    `Campaign does not stay RUNNING forever (actual: ${brokenCampaignAfter?.status})`
+  );
+
+  // ============================================================================
+  // Test 12: Stale delivery with an in-flight send is not re-sent
+  // ============================================================================
+  console.log("\n▶ [Regression 12] Crashed mid-send delivery is flagged, not re-sent...");
+
+  const inFlightDelivery = await prisma.emailDelivery.create({
+    data: {
+      clientId: testTenant,
+      providerType: EmailProviderType.MOCK,
+      category: EmailType.TRANSACTIONAL,
+      from: "inflight@example.com",
+      to: "inflight-recipient@example.com",
+      subject: "Crashed during send",
+      textContent: "Maybe already delivered",
+      status: EmailDeliveryStatus.PROCESSING,
+      lockedAt: new Date(Date.now() - 15 * 60 * 1000),
+      lockedBy: `crashed-worker${SEND_IN_FLIGHT_SUFFIX}`,
+      attemptCount: 1,
+    },
+  });
+  trackingProvider.sendCount = 0;
+  await EmailDeliveryExecutor.execute({ deliveryId: inFlightDelivery.id });
+  assert(trackingProvider.sendCount === 0, `In-flight stale delivery not re-sent (sendCount: ${trackingProvider.sendCount})`);
+  await ReconciliationExecutor.reconcile({ staleMinutes: 10 });
+  const inFlightAfter = await prisma.emailDelivery.findUnique({ where: { id: inFlightDelivery.id } });
+  assert(
+    inFlightAfter?.status === EmailDeliveryStatus.FAILED && inFlightAfter?.errorCode === SEND_OUTCOME_UNKNOWN,
+    `Reconciliation flags it ${SEND_OUTCOME_UNKNOWN} (actual: ${inFlightAfter?.status}/${inFlightAfter?.errorCode})`
+  );
+
+  // ============================================================================
+  // Test 13: A worker that lost its lock cannot overwrite the new owner
+  // ============================================================================
+  console.log("\n▶ [Regression 13] Final writes are bound to the claim token...");
+
+  const stolenDelivery = await prisma.emailDelivery.create({
+    data: {
+      clientId: testTenant,
+      providerType: EmailProviderType.MOCK,
+      category: EmailType.TRANSACTIONAL,
+      from: "stolen@example.com",
+      to: "stolen-recipient@example.com",
+      subject: "Lock stolen mid-send",
+      textContent: "Slow send",
+      status: EmailDeliveryStatus.QUEUED,
+    },
+  });
+  trackingProvider.onSend = async () => {
+    await prisma.emailDelivery.update({
+      where: { id: stolenDelivery.id },
+      data: { lockedBy: "reclaiming-worker", lockedAt: new Date() },
+    });
+  };
+  trackingProvider.nextError = new RetryableError("Simulated provider timeout");
+  try {
+    await EmailDeliveryExecutor.execute({ deliveryId: stolenDelivery.id });
+  } catch {
+    // expected retryable error
+  } finally {
+    trackingProvider.onSend = null;
+    trackingProvider.nextError = null;
+  }
+  const stolenAfter = await prisma.emailDelivery.findUnique({ where: { id: stolenDelivery.id } });
+  assert(
+    stolenAfter?.lockedBy === "reclaiming-worker" && stolenAfter?.status === EmailDeliveryStatus.PROCESSING,
+    `New owner's lock left intact (actual: ${stolenAfter?.status}/${stolenAfter?.lockedBy})`
+  );
+  await prisma.emailDelivery.update({
+    where: { id: stolenDelivery.id },
+    data: { status: EmailDeliveryStatus.FAILED, lockedAt: null, lockedBy: null },
+  });
+
+  // ============================================================================
+  // Test 14: Processor endpoint returns non-200 when processing fails
+  // ============================================================================
+  console.log("\n▶ [Regression 14] /api/internal/process-jobs reports failures in the HTTP status...");
+
+  const { POST: processJobsPost } = await import("../src/app/api/internal/process-jobs/route");
+  ReconciliationExecutor.reconcile = async () => {
+    throw new Error("Simulated reconciliation failure");
+  };
+  try {
+    const res = await processJobsPost(
+      new NextRequest("http://localhost/api/internal/process-jobs?reconcile=true", {
+        method: "POST",
+        headers: { authorization: `Bearer ${process.env.INTERNAL_PROCESSOR_SECRET}` },
+      })
+    );
+    const body = await res.json();
+    assert(res.status === 500, `HTTP status is 500 on processing failure (actual: ${res.status})`);
+    assert(body.success === false, `Response body success=false (actual: ${body.success})`);
+  } finally {
+    ReconciliationExecutor.reconcile = originalReconcile;
+  }
+
+  // ============================================================================
+  // Test 15: Configuration safety (queue mode, public URL)
+  // ============================================================================
+  console.log("\n▶ [Regression 15] Configuration safety defaults...");
+
+  const savedWorkerless = process.env.WORKERLESS_MODE;
+  const savedRedis = process.env.REDIS_URL;
+  try {
+    delete process.env.WORKERLESS_MODE;
+    process.env.REDIS_URL = "rediss://default:secret@example-remote.upstash.io:6379";
+    assert(isWorkerlessMode() === true, "Remote REDIS_URL alone does not switch async email to BullMQ");
+    process.env.WORKERLESS_MODE = "false";
+    assert(isWorkerlessMode() === false, "WORKERLESS_MODE=false explicitly opts into BullMQ");
+
+    delete process.env.REDIS_URL;
+    const criticalLimit = await checkRateLimit(`rl:regression-${Date.now()}`, 5, 60000, {
+      criticality: "CRITICAL",
+      failClosed: true,
+    });
+    assert(
+      criticalLimit.success === true && criticalLimit.backend === "postgres",
+      `Without REDIS_URL, critical limits use PostgreSQL instead of failing closed (success: ${criticalLimit.success}, backend: ${criticalLimit.backend})`
+    );
+
+    const transientDbError = Object.assign(new Error("Can't reach database server"), { code: "P1001" });
+    assert(isRetryableError(transientDbError) === true, "Prisma connection errors (P1001) are retryable");
+  } finally {
+    if (savedWorkerless === undefined) delete process.env.WORKERLESS_MODE;
+    else process.env.WORKERLESS_MODE = savedWorkerless;
+    if (savedRedis === undefined) delete process.env.REDIS_URL;
+    else process.env.REDIS_URL = savedRedis;
+  }
+
+  const getPublicAppUrl = (envModule as { getPublicAppUrl?: () => string }).getPublicAppUrl;
+  const savedAppUrl = process.env.APP_URL;
+  const savedPublicUrl = process.env.NEXT_PUBLIC_APP_URL;
+  try {
+    delete process.env.NEXT_PUBLIC_APP_URL;
+    process.env.APP_URL = "https://hub.example.test/";
+    assert(
+      typeof getPublicAppUrl === "function" && getPublicAppUrl() === "https://hub.example.test",
+      `Public links use APP_URL when no override is set (actual: ${typeof getPublicAppUrl === "function" ? getPublicAppUrl() : "missing"})`
+    );
+  } finally {
+    if (savedAppUrl === undefined) delete process.env.APP_URL;
+    else process.env.APP_URL = savedAppUrl;
+    if (savedPublicUrl === undefined) delete process.env.NEXT_PUBLIC_APP_URL;
+    else process.env.NEXT_PUBLIC_APP_URL = savedPublicUrl;
   }
 
   // ============================================================================

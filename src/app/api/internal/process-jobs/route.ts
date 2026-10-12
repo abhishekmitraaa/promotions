@@ -7,8 +7,7 @@ import { timingSafeEqualSecret } from "@/lib/timing-safe";
  * Machine-to-Machine Internal Job Processing Endpoint
  *
  * Triggered exclusively by Supabase Cron via pg_net HTTP POST.
- * Requires dedicated INTERNAL_PROCESSOR_SECRET provided via Bearer Authorization header
- * or x-processor-secret header.
+ * Requires dedicated INTERNAL_PROCESSOR_SECRET provided via Bearer Authorization header.
  *
  * Fails closed in production if secret is unconfigured or mismatch occurs.
  * Never allows processing on GET requests (returns HTTP 405).
@@ -54,10 +53,17 @@ export async function POST(req: NextRequest) {
       runReconciliation,
     });
 
-    return NextResponse.json({
-      success: true,
-      data: result,
-    });
+    // Report category failures in the HTTP status so pg_net / cron monitoring can see them.
+    if (!result.success) {
+      logger.error("[API:ProcessJobs] Processing cycle reported errors:", result.errors);
+    }
+    return NextResponse.json(
+      {
+        success: result.success,
+        data: result,
+      },
+      { status: result.success ? 200 : 500 }
+    );
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : "Error during serverless job processing";
     logger.error("[API:ProcessJobs] Error during execution:", err);

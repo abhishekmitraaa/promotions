@@ -18,6 +18,7 @@ import {
   classifyJobError,
 } from "../../errors/job-errors";
 import { logger } from "../../logger";
+import { MAX_EVENT_ATTEMPTS, staleLockCutoff } from "./claim-lock";
 
 export interface ProcessEmailEventOptions {
   eventId: string;
@@ -55,10 +56,10 @@ export class EmailEventProcessor {
    * Excludes active PROCESSING events (only claims RECEIVED or stale abandoned PROCESSING >10m).
    */
   static async findPendingEvents(limit = 50) {
-    const staleCutoff = new Date(Date.now() - 10 * 60 * 1000);
+    const staleCutoff = staleLockCutoff();
     return prisma.emailEvent.findMany({
       where: {
-        attempts: { lt: 5 },
+        attempts: { lt: MAX_EVENT_ATTEMPTS },
         OR: [
           { status: "RECEIVED" },
           {

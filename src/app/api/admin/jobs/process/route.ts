@@ -23,11 +23,14 @@ export async function POST(req: NextRequest) {
       runReconciliation,
     });
 
-    return NextResponse.json({
-      success: true,
-      data: result,
-      triggeredBy: auth.user.email,
-    });
+    return NextResponse.json(
+      {
+        success: result.success,
+        data: result,
+        triggeredBy: auth.user.email,
+      },
+      { status: result.success ? 200 : 500 }
+    );
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : "Error during manual admin job processing";
     logger.error("[API:AdminProcessJobs] Error during execution:", err);

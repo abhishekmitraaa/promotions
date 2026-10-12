@@ -83,6 +83,12 @@ export class InvalidRecipientError extends PermanentError {
 }
 
 /**
+ * Prisma error codes for transient database conditions (connection loss, pool exhaustion,
+ * transaction conflicts). These must be retried rather than failing the work item.
+ */
+const PRISMA_TRANSIENT_CODES = new Set(["P1001", "P1002", "P1008", "P1017", "P2024", "P2034"]);
+
+/**
  * Helper to determine whether an arbitrary error is retryable
  */
 export function isRetryableError(err: unknown): boolean {
@@ -107,6 +113,7 @@ export function isRetryableError(err: unknown): boolean {
       code === "ETIMEDOUT" ||
       code === "ENOTFOUND" ||
       code === "EAI_AGAIN" ||
+      PRISMA_TRANSIENT_CODES.has(code) ||
       message.includes("timeout") ||
       message.includes("econnrefused") ||
       message.includes("429") ||

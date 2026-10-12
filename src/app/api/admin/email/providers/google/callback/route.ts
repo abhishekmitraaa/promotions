@@ -114,8 +114,10 @@ export async function GET(req: NextRequest) {
     });
   }
 
-  const googleClientId = searchParams.get("googleClientId") || process.env.GMAIL_CLIENT_ID;
-  const googleClientSecret = searchParams.get("googleClientSecret") || process.env.GMAIL_CLIENT_SECRET;
+  // OAuth client credentials come from server configuration only: accepting them from the
+  // query string would put the client secret in browser history and access logs.
+  const googleClientId = process.env.GMAIL_CLIENT_ID;
+  const googleClientSecret = process.env.GMAIL_CLIENT_SECRET;
   const redirectUri =
     searchParams.get("redirectUri") ||
     `${process.env.APP_URL || new URL(req.url).origin}/api/admin/email/providers/google/callback`;

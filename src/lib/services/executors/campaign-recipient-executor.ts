@@ -2,23 +2,25 @@
  * CampaignRecipientExecutor
  *
  * Neutral, BullMQ-free execution service for campaign recipient delivery.
- * - Atomically claims recipients via SELECT ... FOR UPDATE SKIP LOCKED
+ * - Atomically claims recipients via conditional update (or verifies a sweep's pre-claim)
  * - Renders immutable template version with frozen recipient metadata
  * - Embeds RFC 8058 one-click unsubscribe headers
- * - Dispatches via resolved tenant provider
- * - Creates authoritative EmailDelivery record
- * - Updates recipient and campaign aggregate counters
+ * - Dispatches via resolved tenant provider, with an in-flight send marker (see claim-lock.ts)
+ * - Creates authoritative EmailDelivery record; a retry that finds it never re-sends
+ * - Updates recipient and campaign aggregate counters atomically
+ * - Every post-claim exit releases the recipient lock
  * - Uses clean JobError taxonomy
  */
 
 import { prisma } from "../../prisma";
 import {
   EmailCampaignStatus,
+  EmailDelivery,
   EmailDeliveryStatus,
   EmailProviderType,
 } from "@prisma/client";
 import { providerRegistry } from "../../email/registry";
-import { EmailProvider } from "../../email/types";
+import { EmailProvider, EmailSendResult } from "../../email/types";
 import { EmailSuppressionService } from "../email-suppression-service";
 import { EmailUnsubscribeService } from "../email-unsubscribe-service";
 import { TemplateEngine } from "../../email/template-engine";
@@ -28,7 +30,14 @@ import {
   classifyJobError,
 } from "../../errors/job-errors";
 import { logger } from "../../logger";
+import { getPublicAppUrl } from "../../env";
 import { CampaignTriggerService } from "./campaign-trigger-service";
+import {
+  newClaimToken,
+  notSendInFlight,
+  sendInFlightToken,
+  staleLockCutoff,
+} from "./claim-lock";
 
 export interface ExecuteCampaignRecipientOptions {
   recipientId: string;
@@ -75,7 +84,11 @@ export class CampaignRecipientExecutor {
     }
 
     // 3. Authoritative Atomic Claim Mechanism
+    let lockToken: string;
+    let currentAttempt: number;
+
     if (claimToken) {
+      // Sweep has pre-claimed the row (and already incremented attemptCount). Verify ownership.
       if (recipient.status !== "PROCESSING" || recipient.lockedBy !== claimToken) {
         logger.warn(
           `[CampaignRecipientExecutor] Recipient ${recipientId} claimToken mismatch or lock lost. Current status: ${recipient.status}, lockedBy: ${recipient.lockedBy}. Skipping.`
@@ -88,21 +101,27 @@ export class CampaignRecipientExecutor {
           reason: "CLAIM_TOKEN_MISMATCH",
         };
       }
+      lockToken = claimToken;
+      currentAttempt = recipient.attemptCount || 1;
     } else {
-      const workerClaimToken = `camp-recip-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const staleCutoff = new Date(Date.now() - 10 * 60 * 1000);
+      lockToken = newClaimToken("camp-recip");
+      const staleCutoff = staleLockCutoff();
 
       const claimResult = await prisma.emailCampaignRecipient.updateMany({
         where: {
           id: recipient.id,
           OR: [
             { status: { in: ["PENDING", "RETRYING"] } },
-            { status: "FAILED", attemptCount: { lt: maxAttempts } },
             {
               status: "PROCESSING",
-              OR: [
-                { lockedAt: { lt: staleCutoff } },
-                { lockedAt: null, lastAttemptAt: { lt: staleCutoff } },
+              AND: [
+                notSendInFlight,
+                {
+                  OR: [
+                    { lockedAt: { lt: staleCutoff } },
+                    { lockedAt: null, lastAttemptAt: { lt: staleCutoff } },
+                  ],
+                },
               ],
             },
           ],
@@ -112,7 +131,7 @@ export class CampaignRecipientExecutor {
           attemptCount: { increment: 1 },
           lastAttemptAt: new Date(),
           lockedAt: new Date(),
-          lockedBy: workerClaimToken,
+          lockedBy: lockToken,
         },
       });
 
@@ -146,192 +165,235 @@ export class CampaignRecipientExecutor {
           reason: "CLAIM_CONTENTION",
         };
       }
+      currentAttempt = (recipient.attemptCount || 0) + 1;
     }
 
-    const currentAttempt = (recipient.attemptCount || 0) + 1;
+    // Current lock owner value; switches to the in-flight token right before the provider send.
+    let ownerToken = lockToken;
+    const owned = () => ({ id: recipient.id, status: "PROCESSING", lockedBy: ownerToken });
 
-    // 4. Load Campaign & Lifecycle Checks
-    const campaign = await prisma.emailCampaign.findUnique({
-      where: { id: recipient.campaignId },
-      include: {
-        templateVersion: true,
-        senderIdentity: {
-          include: {
-            providerConfig: true,
+    let sent = false;
+    let deliveryRecorded = false;
+    let campaignId = recipient.campaignId;
+
+    try {
+      // 4. Load Campaign & Lifecycle Checks
+      const campaign = await prisma.emailCampaign.findUnique({
+        where: { id: recipient.campaignId },
+        include: {
+          templateVersion: true,
+          senderIdentity: {
+            include: {
+              providerConfig: true,
+            },
           },
         },
-      },
-    });
-
-    if (!campaign) {
-      throw new PermanentError(`Campaign '${recipient.campaignId}' not found.`);
-    }
-
-    if (campaign.status === EmailCampaignStatus.CANCELLED) {
-      await prisma.emailCampaignRecipient.update({
-        where: { id: recipient.id },
-        data: { status: "CANCELLED", lockedAt: null, lockedBy: null },
       });
-      await CampaignTriggerService.checkAndCompleteCampaign(campaign.id);
-      return { success: false, recipientId, status: "CANCELLED", skipped: true, reason: "CAMPAIGN_CANCELLED" };
-    }
 
-    if (campaign.status === EmailCampaignStatus.PAUSED) {
-      await prisma.emailCampaignRecipient.update({
-        where: { id: recipient.id },
-        data: { status: "PENDING", lockedAt: null, lockedBy: null },
-      });
-      return { success: false, recipientId, status: "PAUSED", skipped: true, reason: "CAMPAIGN_PAUSED" };
-    }
-
-    if (campaign.status === EmailCampaignStatus.COMPLETED) {
-      return { success: true, recipientId, status: "COMPLETED", skipped: true, reason: "CAMPAIGN_ALREADY_COMPLETED" };
-    }
-
-    const { clientId } = campaign;
-
-    // 5. Verify Suppression List
-    const suppCheck = await EmailSuppressionService.isSuppressed(clientId, recipient.email);
-    if (suppCheck.suppressed) {
-      await prisma.emailCampaignRecipient.update({
-        where: { id: recipient.id },
-        data: { status: "SUPPRESSED", errorCode: "SUPPRESSED", errorMessage: suppCheck.reason, lockedAt: null, lockedBy: null },
-      });
-      await CampaignTriggerService.checkAndCompleteCampaign(campaign.id);
-      throw new PermanentError(`Recipient '${recipient.email}' is suppressed (${suppCheck.reason || "SUPPRESSED"}).`);
-    }
-
-    // 6. Template & Variable Resolution
-    if (!campaign.templateVersion) {
-      throw new PermanentError(`Campaign '${campaign.id}' has no bound template version.`);
-    }
-
-    let snapshotData: Record<string, unknown> = {};
-    if (recipient.metadataSnapshot) {
-      try {
-        snapshotData = JSON.parse(recipient.metadataSnapshot);
-      } catch {
-        snapshotData = {};
+      if (!campaign) {
+        throw new PermanentError(`Campaign '${recipient.campaignId}' not found.`);
       }
-    }
+      campaignId = campaign.id;
 
-    const rendered = TemplateEngine.renderTemplate(campaign.templateVersion, {
-      email: recipient.email,
-      ...snapshotData,
-    });
-
-    // 7. Resolve Sender Identity and Provider
-    let provider: EmailProvider;
-    let providerType: EmailProviderType = EmailProviderType.GMAIL;
-    let fromAddress: string;
-    let replyToAddress: string | undefined;
-
-    if (campaign.senderIdentityId && campaign.senderIdentity) {
-      const senderIdentity = campaign.senderIdentity;
-      if (!senderIdentity.verified) {
-        throw new PermanentError(`Sender identity '${senderIdentity.email}' is not verified.`);
+      if (campaign.status === EmailCampaignStatus.CANCELLED) {
+        await prisma.emailCampaignRecipient.updateMany({
+          where: owned(),
+          data: { status: "CANCELLED", lockedAt: null, lockedBy: null },
+        });
+        await CampaignTriggerService.checkAndCompleteCampaign(campaign.id);
+        return { success: false, recipientId, status: "CANCELLED", skipped: true, reason: "CAMPAIGN_CANCELLED" };
       }
 
-      fromAddress = senderIdentity.name
-        ? `"${senderIdentity.name}" <${senderIdentity.email}>`
-        : senderIdentity.email;
-      replyToAddress = senderIdentity.replyToEmail || undefined;
+      if (campaign.status === EmailCampaignStatus.PAUSED) {
+        // Pausing is not an attempt: give the claim's increment back.
+        await prisma.emailCampaignRecipient.updateMany({
+          where: owned(),
+          data: { status: "PENDING", lockedAt: null, lockedBy: null, attemptCount: { decrement: 1 } },
+        });
+        return { success: false, recipientId, status: "PAUSED", skipped: true, reason: "CAMPAIGN_PAUSED" };
+      }
 
-      if (options.providerOverride) {
-        provider = options.providerOverride;
-        providerType = provider.providerType;
+      if (campaign.status === EmailCampaignStatus.COMPLETED) {
+        await prisma.emailCampaignRecipient.updateMany({
+          where: owned(),
+          data: { status: "CANCELLED", errorCode: "CAMPAIGN_ALREADY_COMPLETED", lockedAt: null, lockedBy: null },
+        });
+        return { success: true, recipientId, status: "COMPLETED", skipped: true, reason: "CAMPAIGN_ALREADY_COMPLETED" };
+      }
+
+      const { clientId } = campaign;
+
+      // 5. Verify Suppression List
+      const suppCheck = await EmailSuppressionService.isSuppressed(clientId, recipient.email);
+      if (suppCheck.suppressed) {
+        await prisma.emailCampaignRecipient.updateMany({
+          where: owned(),
+          data: { status: "SUPPRESSED", errorCode: "SUPPRESSED", errorMessage: suppCheck.reason, lockedAt: null, lockedBy: null },
+        });
+        await CampaignTriggerService.checkAndCompleteCampaign(campaign.id);
+        throw new PermanentError(`Recipient '${recipient.email}' is suppressed (${suppCheck.reason || "SUPPRESSED"}).`);
+      }
+
+      // 6. Template & Variable Resolution
+      if (!campaign.templateVersion) {
+        throw new PermanentError(`Campaign '${campaign.id}' has no bound template version.`);
+      }
+
+      let snapshotData: Record<string, unknown> = {};
+      if (recipient.metadataSnapshot) {
+        try {
+          snapshotData = JSON.parse(recipient.metadataSnapshot);
+        } catch {
+          snapshotData = {};
+        }
+      }
+
+      const rendered = TemplateEngine.renderTemplate(campaign.templateVersion, {
+        email: recipient.email,
+        ...snapshotData,
+      });
+
+      // 7. Resolve Sender Identity and Provider
+      let provider: EmailProvider;
+      let providerType: EmailProviderType = EmailProviderType.GMAIL;
+      let fromAddress: string;
+      let replyToAddress: string | undefined;
+
+      if (campaign.senderIdentityId && campaign.senderIdentity) {
+        const senderIdentity = campaign.senderIdentity;
+        if (!senderIdentity.verified) {
+          throw new PermanentError(`Sender identity '${senderIdentity.email}' is not verified.`);
+        }
+
+        fromAddress = senderIdentity.name
+          ? `"${senderIdentity.name}" <${senderIdentity.email}>`
+          : senderIdentity.email;
+        replyToAddress = senderIdentity.replyToEmail || undefined;
+
+        if (options.providerOverride) {
+          provider = options.providerOverride;
+          providerType = provider.providerType;
+        } else {
+          const resolved = await providerRegistry.resolveForTenant(
+            clientId,
+            senderIdentity.providerConfigId || undefined
+          );
+          provider = resolved.provider;
+          providerType = resolved.providerType;
+        }
       } else {
-        const resolved = await providerRegistry.resolveForTenant(
-          clientId,
-          senderIdentity.providerConfigId || undefined
+        if (options.providerOverride) {
+          provider = options.providerOverride;
+          providerType = provider.providerType;
+          fromAddress = "campaigns@whatsapphub.internal";
+        } else {
+          const resolved = await providerRegistry.resolveForTenant(clientId);
+          provider = resolved.provider;
+          providerType = resolved.providerType;
+          fromAddress = resolved.senderEmail || "campaigns@whatsapphub.internal";
+        }
+      }
+
+      // 8. One-Click Unsubscribe Headers
+      let unsubscribeHeaders: Record<string, string> | undefined;
+      if (recipient.contactId) {
+        const unsubToken = EmailUnsubscribeService.generateUnsubscribeToken(clientId, recipient.contactId);
+        unsubscribeHeaders = EmailUnsubscribeService.getOneClickUnsubscribeHeaders(
+          getPublicAppUrl(),
+          unsubToken
         );
-        provider = resolved.provider;
-        providerType = resolved.providerType;
       }
-    } else {
-      if (options.providerOverride) {
-        provider = options.providerOverride;
-        providerType = provider.providerType;
-        fromAddress = "campaigns@whatsapphub.internal";
-      } else {
-        const resolved = await providerRegistry.resolveForTenant(clientId);
-        provider = resolved.provider;
-        providerType = resolved.providerType;
-        fromAddress = resolved.senderEmail || "campaigns@whatsapphub.internal";
-      }
-    }
 
-    // 8. One-Click Unsubscribe Headers
-    let unsubscribeHeaders: Record<string, string> | undefined;
-    if (recipient.contactId) {
-      const unsubToken = EmailUnsubscribeService.generateUnsubscribeToken(clientId, recipient.contactId);
-      const appUrl = process.env.NEXTAUTH_URL || "https://app.whatsapphub.internal";
-      unsubscribeHeaders = EmailUnsubscribeService.getOneClickUnsubscribeHeaders(
-        appUrl,
-        unsubToken
-      );
-    }
-
-    // 9. Dispatch
-    const idempotencyKey = `campaign-${campaign.id}-recipient-${recipient.id}`;
-    try {
-      const sendResult = await provider.send({
-        clientId,
-        from: fromAddress,
-        to: recipient.email,
-        subject: rendered.subject,
-        html: rendered.html,
-        text: rendered.text,
-        replyTo: replyToAddress,
-        type: "PROMOTIONAL",
-        headers: unsubscribeHeaders,
-        idempotencyKey,
+      // 9. Idempotency: a delivery row for this recipient means an earlier attempt already sent it.
+      const idempotencyKey = `campaign-${campaign.id}-recipient-${recipient.id}`;
+      let delivery: EmailDelivery | null = await prisma.emailDelivery.findUnique({
+        where: { clientId_idempotencyKey: { clientId, idempotencyKey } },
       });
 
-      if (!sendResult.success) {
-        throw new Error(sendResult.error?.message || "Provider returned failure");
-      }
+      if (delivery) {
+        sent = true;
+        deliveryRecorded = true;
+        logger.info(
+          `[CampaignRecipientExecutor] Recipient ${recipient.id} already has delivery ${delivery.id}; finishing bookkeeping without re-sending.`
+        );
+      } else {
+        // 10. Mark send in flight, then dispatch
+        const inFlightToken = sendInFlightToken(lockToken);
+        const marked = await prisma.emailCampaignRecipient.updateMany({
+          where: owned(),
+          data: { lockedBy: inFlightToken, lockedAt: new Date() },
+        });
+        if (marked.count === 0) {
+          logger.warn(`[CampaignRecipientExecutor] Recipient ${recipient.id} lock lost before send. Skipping without dispatch.`);
+          return { success: true, recipientId, status: "PROCESSING", skipped: true, reason: "CLAIM_LOST" };
+        }
+        ownerToken = inFlightToken;
 
-      // 10. Persist Delivery & Update Recipient
-      const delivery = await prisma.emailDelivery.create({
-        data: {
+        const sendResult: EmailSendResult = await provider.send({
           clientId,
-          providerType,
-          providerMessageId: sendResult.providerMessageId || null,
-          campaignId: campaign.id,
-          campaignRecipientId: recipient.id,
-          category: "PROMOTIONAL",
           from: fromAddress,
           to: recipient.email,
-          replyTo: replyToAddress,
           subject: rendered.subject,
-          htmlContent: rendered.html,
-          textContent: rendered.text,
-          templateId: campaign.templateVersion.templateId,
-          templateVersionId: campaign.templateVersion.id,
-          senderIdentityId: campaign.senderIdentityId,
-          status: EmailDeliveryStatus.SENT,
-          sentAt: new Date(),
-          smtpCode: sendResult.error?.statusCode ? String(sendResult.error.statusCode) : null,
+          html: rendered.html,
+          text: rendered.text,
+          replyTo: replyToAddress,
+          type: "PROMOTIONAL",
+          headers: unsubscribeHeaders,
           idempotencyKey,
-        },
+        });
+
+        if (!sendResult.success) {
+          throw new Error(sendResult.error?.message || "Provider returned failure");
+        }
+        sent = true;
+
+        // 11. Persist Delivery
+        delivery = await prisma.emailDelivery.create({
+          data: {
+            clientId,
+            providerType,
+            providerMessageId: sendResult.providerMessageId || null,
+            campaignId: campaign.id,
+            campaignRecipientId: recipient.id,
+            category: "PROMOTIONAL",
+            from: fromAddress,
+            to: recipient.email,
+            replyTo: replyToAddress,
+            subject: rendered.subject,
+            htmlContent: rendered.html,
+            textContent: rendered.text,
+            templateId: campaign.templateVersion.templateId,
+            templateVersionId: campaign.templateVersion.id,
+            senderIdentityId: campaign.senderIdentityId,
+            status: EmailDeliveryStatus.SENT,
+            sentAt: new Date(),
+            smtpCode: sendResult.error?.statusCode ? String(sendResult.error.statusCode) : null,
+            idempotencyKey,
+          },
+        });
+        deliveryRecorded = true;
+      }
+
+      // 12. Mark recipient SENT and count it, atomically and only if we still own the lock
+      await prisma.$transaction(async (tx) => {
+        const updated = await tx.emailCampaignRecipient.updateMany({
+          where: owned(),
+          data: { status: "SENT", lockedAt: null, lockedBy: null, errorCode: null, errorMessage: null },
+        });
+        if (updated.count === 1) {
+          await tx.emailCampaign.update({
+            where: { id: campaign.id },
+            data: { sentCount: { increment: 1 } },
+          });
+        }
       });
 
-      await prisma.emailCampaignRecipient.updateMany({
-        where: { id: recipient.id, status: "PROCESSING" },
-        data: {
-          status: "SENT",
-          lockedAt: null,
-          lockedBy: null,
-        },
-      });
-
-      await prisma.emailCampaign.update({
-        where: { id: campaign.id },
-        data: { sentCount: { increment: 1 } },
-      });
-
-      await CampaignTriggerService.checkAndCompleteCampaign(campaign.id);
+      try {
+        await CampaignTriggerService.checkAndCompleteCampaign(campaign.id);
+      } catch (completeErr) {
+        // Non-critical: reconciliation completes campaigns on its next sweep.
+        logger.warn(`[CampaignRecipientExecutor] Campaign completion check failed for ${campaign.id}:`, completeErr);
+      }
 
       logger.info(
         `[CampaignRecipientExecutor] Recipient ${recipient.id} SENT (delivery: ${delivery.id})`
@@ -346,12 +408,40 @@ export class CampaignRecipientExecutor {
     } catch (err) {
       const classification = classifyJobError(err);
 
+      if (sent) {
+        // The provider accepted the message. Never let this path lead to a second send.
+        if (deliveryRecorded) {
+          // A retry will find the delivery row and only finish bookkeeping.
+          await prisma.emailCampaignRecipient
+            .updateMany({
+              where: owned(),
+              data: { status: "PENDING", nextAttemptAt: new Date(Date.now() + 5000), lockedAt: null, lockedBy: null },
+            })
+            .catch((releaseErr) =>
+              logger.error(`[CampaignRecipientExecutor] Could not release recipient ${recipient.id}:`, releaseErr)
+            );
+          throw new RetryableError(
+            `Recipient ${recipient.id} sent; bookkeeping failed and will be retried: ${classification.message}`,
+            "BOOKKEEPING_RETRY"
+          );
+        }
+        // Delivery row could not be written: keep the in-flight marker so reconciliation flags it.
+        logger.error(
+          `[CampaignRecipientExecutor] Recipient ${recipient.id} was sent but its delivery could not be recorded. Leaving in-flight marker to prevent a duplicate send.`,
+          err
+        );
+        throw new PermanentError(
+          `Recipient ${recipient.id} sent but delivery could not be recorded: ${classification.message}`,
+          "SENT_NOT_RECORDED"
+        );
+      }
+
       if (classification.isRetryable && currentAttempt < maxAttempts) {
         const backoffMs = Math.min(300000, 1000 * Math.pow(2, currentAttempt));
         const nextAttemptAt = new Date(Date.now() + backoffMs);
 
-        await prisma.emailCampaignRecipient.update({
-          where: { id: recipient.id },
+        await prisma.emailCampaignRecipient.updateMany({
+          where: owned(),
           data: {
             status: "PENDING",
             nextAttemptAt,
@@ -371,29 +461,34 @@ export class CampaignRecipientExecutor {
           classification.code,
           backoffMs
         );
-      } else {
-        await prisma.emailCampaignRecipient.update({
-          where: { id: recipient.id },
-          data: {
-            status: "FAILED",
-            errorCode: classification.code,
-            errorMessage: classification.message,
-            lockedAt: null,
-            lockedBy: null,
-          },
-        });
-
-        await CampaignTriggerService.checkAndCompleteCampaign(campaign.id);
-
-        logger.error(
-          `[CampaignRecipientExecutor] Recipient ${recipient.id} permanently failed: ${classification.message}`
-        );
-
-        throw new PermanentError(
-          `Permanent failure sending recipient ${recipient.id}: ${classification.message}`,
-          classification.code
-        );
       }
+
+      // Permanent failure (no-op if an earlier step already moved the recipient to a terminal state)
+      await prisma.emailCampaignRecipient.updateMany({
+        where: owned(),
+        data: {
+          status: "FAILED",
+          errorCode: classification.code,
+          errorMessage: classification.message,
+          lockedAt: null,
+          lockedBy: null,
+        },
+      });
+
+      try {
+        await CampaignTriggerService.checkAndCompleteCampaign(campaignId);
+      } catch (completeErr) {
+        logger.warn(`[CampaignRecipientExecutor] Campaign completion check failed for ${campaignId}:`, completeErr);
+      }
+
+      logger.error(
+        `[CampaignRecipientExecutor] Recipient ${recipient.id} permanently failed: ${classification.message}`
+      );
+
+      throw new PermanentError(
+        `Permanent failure sending recipient ${recipient.id}: ${classification.message}`,
+        classification.code
+      );
     }
   }
 }

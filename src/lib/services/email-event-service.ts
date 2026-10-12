@@ -38,6 +38,7 @@ import {
 import { checkAndCompleteCampaign } from "../email/queue/campaign-worker";
 import { EmailAutomationService } from "./email-automation-service";
 import { logger } from "../logger";
+import { MAX_EVENT_ATTEMPTS, staleLockCutoff } from "./executors/claim-lock";
 
 // Monotonic precedence levels for delivery status
 export const STATUS_PRECEDENCE: Record<EmailDeliveryStatus, number> = {
@@ -334,7 +335,7 @@ export class EmailEventService {
 
       await queue.add(JOB_NAMES.PROCESS_EMAIL_EVENT, jobData, {
         jobId, // Queue-scoped deduplication on DB event record ID
-        attempts: 5,
+        attempts: MAX_EVENT_ATTEMPTS,
         backoff: {
           type: "exponential",
           delay: 1000,
@@ -408,8 +409,8 @@ export class EmailEventService {
       };
     }
 
-    // If terminal FAILED and not being re-driven, skip
-    if (eventRecord.status === EmailEventProcessingStatus.FAILED && eventRecord.attempts >= 5) {
+    // FAILED is terminal: retryable errors put the event back to RECEIVED instead
+    if (eventRecord.status === EmailEventProcessingStatus.FAILED) {
       logger.info(
         `[EventService] EmailEvent ${eventRecordId} is terminally FAILED.`
       );
@@ -421,19 +422,16 @@ export class EmailEventService {
     }
 
     // 2. Authoritative Atomic Claim: Conditional Transition to PROCESSING
-    const staleCutoff = new Date(Date.now() - 10 * 60 * 1000);
+    const staleCutoff = staleLockCutoff();
     const claimResult = await prisma.emailEvent.updateMany({
       where: {
         id: eventRecordId,
+        attempts: { lt: MAX_EVENT_ATTEMPTS },
         OR: [
           { status: EmailEventProcessingStatus.RECEIVED },
           {
             status: EmailEventProcessingStatus.PROCESSING,
             lastAttemptAt: { lt: staleCutoff },
-          },
-          {
-            status: EmailEventProcessingStatus.FAILED,
-            attempts: { lt: 5 },
           },
         ],
       },
@@ -605,9 +603,24 @@ export class EmailEventService {
       const isRetryable = isRetryableError(procErr);
 
       if (isRetryable) {
+        // Release the claim so the next retry (BullMQ, BackgroundJob or sweep) can pick it up
+        // immediately instead of waiting for the stale-lock window. Out of attempts -> FAILED.
+        const attemptsUsed = eventRecord.attempts + 1;
+        const exhausted = attemptsUsed >= MAX_EVENT_ATTEMPTS;
+        await prisma.emailEvent.updateMany({
+          where: { id: eventRecordId, status: EmailEventProcessingStatus.PROCESSING },
+          data: {
+            status: exhausted ? EmailEventProcessingStatus.FAILED : EmailEventProcessingStatus.RECEIVED,
+            errorMessage: msg,
+            errorCode: exhausted ? "MAX_ATTEMPTS_EXCEEDED" : "RETRYABLE_ERROR",
+          },
+        });
         logger.warn(
-          `[EventService] Retryable error processing event ${eventRecordId}: ${msg}`
+          `[EventService] Retryable error processing event ${eventRecordId} (attempt ${attemptsUsed}/${MAX_EVENT_ATTEMPTS}): ${msg}`
         );
+        if (exhausted) {
+          throw new PermanentEmailError(msg);
+        }
         throw new RetryableEmailError(msg);
       }
 

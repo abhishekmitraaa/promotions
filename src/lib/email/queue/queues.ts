@@ -2,8 +2,9 @@
  * BullMQ Queue Producers & Queue Lifecycle Management
  *
  * Supports both:
- * 1. Distributed BullMQ execution with Redis (when Redis is available / configured)
- * 2. Workerless execution on Vercel + Supabase (when WORKERLESS_MODE=true or running in serverless without Redis)
+ * 1. Workerless execution on Vercel + Supabase (default): jobs are persisted as BackgroundJob rows
+ * 2. Distributed BullMQ execution with Redis (legacy): only with WORKERLESS_MODE=false and a REDIS_URL,
+ *    and only when a dedicated BullMQ worker process is actually running
  */
 
 import { Queue, QueueOptions } from "bullmq";
@@ -23,12 +24,9 @@ import { prisma } from "../../prisma";
 import { BackgroundJobStatus, Prisma } from "@prisma/client";
 
 export function isWorkerlessMode(): boolean {
-  if (process.env.WORKERLESS_MODE === "true") return true;
-  // If running in Vercel or production without an external non-local Redis URL:
-  if (!process.env.REDIS_URL || process.env.REDIS_URL.includes("127.0.0.1") || process.env.REDIS_URL.includes("localhost")) {
-    return true;
-  }
-  return false;
+  // BullMQ is an explicit opt-in: a REDIS_URL alone (e.g. for rate limiting) must not divert
+  // jobs into Redis queues that no production process consumes.
+  return !(process.env.WORKERLESS_MODE === "false" && process.env.REDIS_URL);
 }
 
 class WorkerlessQueueAdapter<T = unknown> {

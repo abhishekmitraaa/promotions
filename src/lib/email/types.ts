@@ -188,7 +188,9 @@ export interface EmailSendRequest {
   senderIdentityId?: string;
 
   /**
-   * Idempotency key for deduplication.
+   * Stable key for this logical send. Providers may use it for deduplication if their API
+   * supports it; Gmail does not, so duplicate protection is enforced hub-side by the claim
+   * and in-flight send marker (services/executors/claim-lock.ts).
    */
   idempotencyKey?: string;
 

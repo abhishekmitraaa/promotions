@@ -33,6 +33,7 @@ import { providerRegistry } from "../registry";
 import { EmailProvider } from "../types";
 import { EmailTrackingService } from "../tracking/email-tracking-service";
 import { logger } from "../../logger";
+import { getPublicAppUrl } from "../../env";
 import { processPromotionalDeliveryJob } from "./promotional-delivery-worker";
 import { processScheduledCampaignTriggerJob } from "./campaign-trigger-worker";
 import { workerTelemetry } from "./telemetry";
@@ -349,7 +350,7 @@ export async function processCampaignRecipientJob(
   }
 
   // 7. Dispatch Email with One-Click Unsubscribe Headers
-  const baseUrl = process.env.NEXT_PUBLIC_APP_URL || "https://hub.local";
+  const baseUrl = getPublicAppUrl();
   let unsubscribeHeaders: Record<string, string> | undefined;
 
   if (recipient.contactId) {

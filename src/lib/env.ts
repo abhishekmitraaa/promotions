@@ -172,6 +172,14 @@ try {
 
 export const env = parsedEnv;
 
+/**
+ * Public base URL used in links that leave the system (unsubscribe and tracking links).
+ * NEXT_PUBLIC_APP_URL is an explicit override (kept for existing deployments); otherwise APP_URL.
+ */
+export function getPublicAppUrl(): string {
+  return (process.env.NEXT_PUBLIC_APP_URL || process.env.APP_URL || env.APP_URL).replace(/\/+$/, "");
+}
+
 export function isMetaConfigured(): boolean {
   return Boolean(
     env.META_ACCESS_TOKEN &&

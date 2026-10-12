@@ -22,6 +22,7 @@
 import crypto from "crypto";
 import { parse } from "node-html-parser";
 import { prisma } from "../../prisma";
+import { getPublicAppUrl } from "../../env";
 import {
   EmailDeliveryStatus,
   EmailEventProcessingStatus,
@@ -274,7 +275,7 @@ export class EmailTrackingService {
     }
 
     const openToken = this.generateOpenToken(clientId, deliveryId);
-    const baseUrl = (options?.baseUrl || process.env.NEXT_PUBLIC_APP_URL || "https://hub.local").replace(/\/+$/, "");
+    const baseUrl = (options?.baseUrl || getPublicAppUrl()).replace(/\/+$/, "");
     const cacheBuster = `${Date.now().toString(36)}${Math.random().toString(36).substring(2, 8)}`;
     const pixelUrl = `${baseUrl}/api/email/track/open/${openToken}?cb=${cacheBuster}`;
 
@@ -319,7 +320,7 @@ export class EmailTrackingService {
       return html || "";
     }
 
-    const baseUrl = (options?.baseUrl || process.env.NEXT_PUBLIC_APP_URL || "https://hub.local").replace(/\/+$/, "");
+    const baseUrl = (options?.baseUrl || getPublicAppUrl()).replace(/\/+$/, "");
 
     try {
       const root = parse(html, {

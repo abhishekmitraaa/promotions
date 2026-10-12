@@ -1068,6 +1068,69 @@
   - Noted Supabase security advisory regarding RLS on `_prisma_migrations` (`ALTER TABLE "public"."_prisma_migrations" ENABLE ROW LEVEL SECURITY;`).
   - Core code engine, serverless queue processor, atomic claims, and multi-channel adapters are 100% complete and certified.
 
+### Entry: 2026-10-12 — Code Review of `c5ccaf9`/`1509601`, Go-Live Gap Analysis & Documentation Set
+- **Prompt / Phase**: `/code-review` of the latest code commits, plus read-only gap analysis of what is needed to make the hub functional for a single owner project; created `documentation/README.md` and `01`–`05` docs.
+- **Status**: 🔴 Open
+- **Correction to earlier entries**: The 2026-10-11 "Final Duplicate-Processing Audit" entry recorded "None (all checks clean)". The review found defects in that commit's claim logic, which the existing suites don't cover. Full details in [02-code-review-2026-10-12.md](02-code-review-2026-10-12.md).
+- **Unresolved Concerns**:
+  - High: EmailEvent left in PROCESSING after a retryable error; skipped for 10 min; BullMQ retries silently completed (`email-event-service.ts:611`).
+  - High: contention yield never decrements `BackgroundJob.attemptCount`, so jobs fail with MAX_ATTEMPTS_EXCEEDED on the first real error (`serverless-job-processor.ts:268`).
+  - High: campaign recipient retry re-sends, then hits the P2002 unique `idempotencyKey` → marked FAILED after a double send (`campaign-recipient-executor.ts:296`).
+  - High: the Gmail provider ignores `idempotencyKey`; a stale reclaim after a crash re-sends.
+  - High: `/api/internal/process-jobs` returns HTTP 200 `success:true` even when `processAll` reports failure, so cron telemetry can't detect failures.
+  - High (config trap): a remote `REDIS_URL` without `WORKERLESS_MODE=true` routes jobs to BullMQ, which has no production consumer.
+  - High (campaigns): unsubscribe/tracking links fall back to `https://app.whatsapphub.internal` / `https://hub.local` unless `NEXTAUTH_URL` / `NEXT_PUBLIC_APP_URL` are set.
+  - Medium: FAILED deliveries re-claimable; off-by-one attempt count on the sweep path; campaign recipients stuck in PROCESSING on early errors; final writes not bound to the claim token.
+  - Medium: `.env.example` uses the wrong names (`GOOGLE_CLIENT_*` vs `GMAIL_CLIENT_*`, `PROVIDER_CREDENTIAL_KEY` vs `EMAIL_CREDENTIALS_ENCRYPTION_KEY`) and omits the production-required `WEBHOOK_SECRET_ENCRYPTION_KEY`.
+  - Low: OAuth callback accepts `googleClientSecret` as a query param; dead FAILED claim clause; claim logic duplicated across 3 services.
+  - Not functional yet: Meta credentials empty locally; no Gmail provider connected; zero rows ever processed in production.
+  - Not verified this session: the Vercel production env var list (read blocked by permission policy) and live Supabase state (the connected Supabase account only exposes project "Cosora", not `peqynzeioiauynfpdsdv`).
+- **Mitigation / Next Steps**:
+  - Follow [03-go-live-checklist.md](03-go-live-checklist.md): set `WORKERLESS_MODE=true`, `NEXT_PUBLIC_APP_URL`, `NEXTAUTH_URL`; connect Meta and Gmail; seed admin and API key; apply code fixes in the order given in doc 02; run a controlled end-to-end test to own phone and email only.
+  - Add regression tests reproducing each review scenario to `scripts/verify-cross-path-concurrency.ts` before fixing.
+
+### Entry: 2026-10-12 — Fix All Code Review Findings & Gaps
+- **Prompt / Phase**: Fix every code-side bug and gap from the 12 Oct review before starting the external setup.
+- **Status**: 🟡 In Progress (code complete and verified locally; not yet committed or deployed; external setup pending)
+- **Resolved in this entry**: All 15 findings in the previous entry, plus two gaps found while fixing them:
+  - The rate limiter dialed `127.0.0.1:6379` when `REDIS_URL` was unset, so CRITICAL limits (login, password reset, email verification, OTP request) failed closed. Now PostgreSQL is the shared backend when Redis isn't configured.
+  - Prisma transient error codes (P1001/P1002/P1008/P1017/P2024/P2034) were classified permanent. Now retryable.
+  - Details and per-finding fixes: [02-code-review-2026-10-12.md](02-code-review-2026-10-12.md). New shared module `src/lib/services/executors/claim-lock.ts`.
+- **Verification**: Regression tests were written first and confirmed failing (21/52 failing before the fixes). After the fixes, run locally against the disposable Postgres (127.0.0.1:5433) and Redis with the CI environment:
+  - `test:concurrency` 54/54 and `test:workerless` passed.
+  - The full `npm test` chain passed (all 23 suites).
+  - `test:email:hardening`, `oauth`, `lifecycle`, `events`, `tracking`, `webhooks`, `audience`, `certify`, `test:communication` and `test:ratelimit` all passed.
+  - `tsc --noEmit` and `eslint` were clean, and `next build` succeeded.
+- **Unresolved Concerns**:
+  - Behavior change: a row whose worker died during the provider call is now marked `FAILED / SEND_OUTCOME_UNKNOWN` instead of being re-sent (at-most-once for crashes mid-send; ambiguous provider timeouts are still retried, so those remain at-least-once). Needs manual review when it happens.
+  - Behavior change: `/api/internal/process-jobs` returns HTTP 500 when any category reports an error, so cron telemetry will now show failures that were previously hidden.
+  - Behavior change: if `REDIS_URL` is set in Vercel and that Redis is unreachable, login/OTP fail closed (by design). Unknown whether production currently has `REDIS_URL` set; the Vercel env read was blocked.
+  - Legacy BullMQ workers (`src/lib/email/queue/worker.ts`, `promotional-delivery-worker.ts`) still re-claim FAILED deliveries. Unused unless `WORKERLESS_MODE=false`.
+  - Changes are uncommitted on `main`; deploy requires commit + push (no DB migration needed).
+- **Mitigation / Next Steps**:
+  - Commit (on a branch or `main` as the owner prefers) and push; confirm the Vercel build and cron responses after deploy.
+  - Proceed with the external requirements in [03-go-live-checklist.md](03-go-live-checklist.md) Steps 1–4, 6, 7.
+
+### Entry: 2026-10-12 — Decision Register Added to Documentation
+- **Prompt / Phase**: The owner supplied a consolidated decision register; stored it as [06-decision-register.md](06-decision-register.md) with a 12 Oct status update.
+- **Status**: 🟡 In Progress (no new code risk; the register's remaining open items are tracked)
+- **Unresolved Concerns**:
+  - Register §14.3–14.7 remain open: no real production traffic yet; Gmail is the only real email adapter; admin DB role bypasses RLS (application-tier scoping is the trust boundary); behavior under load is untested; all quoted telemetry predates 12 Oct.
+  - The register's own body still describes §14.1, §14.2, Q-15, Q-16 and SEC-05 as open. They are marked resolved in its status preface; the original text was kept unchanged as a historical record.
+- **Mitigation / Next Steps**:
+  - Re-query Vercel deployment SHA, CI, cron and `net._http_response` after the 12 Oct fixes are deployed, and update the register's preface.
+
+### Entry: 2026-10-12 — Remaining Code Work Inventory (No External Worker)
+- **Prompt / Phase**: Owner confirmed no external worker server is used; inventoried the code still left to implement.
+- **Status**: 🔴 Open
+- **Unresolved Concerns**:
+  - **Blocker:** Gmail OAuth transaction state uses `RedisOAuthTransactionStore`. Without Redis, connecting Google fails. The memory fallback is unusable on serverless and is never selected anyway, because the ioredis constructor doesn't throw.
+  - Legacy BullMQ worker code (~3,900 lines, 15 files in `src/lib/email/queue/` + `workers/email-worker.ts`) is dead in production. `email-event-service.ts` imports `checkAndCompleteCampaign` from `campaign-worker.ts`, queue health/metrics routes use BullMQ, and 11 test scripts depend on legacy worker functions.
+  - Gmail bounce/complaint detection is not implemented (no mailbox-history parsing).
+  - WhatsApp sends are synchronous with no retry; same-key resend returns the stored FAILED record.
+- **Mitigation / Next Steps**:
+  - Move OAuth state to PostgreSQL (migration). Remove the legacy worker path and port its tests to the executors. Decide whether to drop Redis entirely (recommended for a single-project deployment).
+
 ---
 
 ## Flag Template for Subsequent Prompts

@@ -26,6 +26,7 @@ import { EmailUnsubscribeService } from "../../services/email-unsubscribe-servic
 import { EmailTrackingService } from "../tracking/email-tracking-service";
 import { normalizeEmail } from "../normalization";
 import { logger } from "../../logger";
+import { getPublicAppUrl } from "../../env";
 import { workerTelemetry } from "./telemetry";
 
 export async function processPromotionalDeliveryJob(
@@ -117,7 +118,7 @@ export async function processPromotionalDeliveryJob(
   }
 
   // 5. Verify Marketing Consent & Prepare One-Click Unsubscribe Headers
-  const baseUrl = process.env.NEXT_PUBLIC_APP_URL || "https://hub.local";
+  const baseUrl = getPublicAppUrl();
   let unsubscribeHeaders: Record<string, string> | undefined;
 
   try {

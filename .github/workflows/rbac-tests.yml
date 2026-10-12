@@ -44,7 +44,7 @@ jobs:
       AUTH_SESSION_SECRET: rbac-ci-session-secret-32-characters-minimum
       API_KEY_PEPPER: rbac-ci-api-key-pepper-32-characters-min
       WEBHOOK_SECRET_ENCRYPTION_KEY: rbac-ci-webhook-key-32-characters-min
-      PROVIDER_CREDENTIAL_KEY: rbac-ci-cred-key-32-characters-min
+      EMAIL_CREDENTIALS_ENCRYPTION_KEY: rbac-ci-cred-key-32-characters-min
       EMAIL_TRACKING_SECRET: rbac-ci-tracking-secret-32-characters
       INTERNAL_WORKER_SECRET: rbac-ci-worker-secret-32-characters-min
       GMAIL_CLIENT_ID: mock-google-client-id.apps.googleusercontent.com

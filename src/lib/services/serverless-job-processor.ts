@@ -26,6 +26,7 @@ import { WebhookDeliveryProcessor } from "./executors/webhook-delivery-processor
 import { ReconciliationExecutor, ReconciliationReport } from "./executors/reconciliation-executor";
 import { PermanentError } from "../errors/job-errors";
 import { logger } from "../logger";
+import { STALE_LOCK_MS, newClaimToken, staleLockCutoff } from "./executors/claim-lock";
 
 export interface ServerlessProcessingOptions {
   transactionalBatchSize?: number;
@@ -122,7 +123,8 @@ export class ServerlessJobProcessor {
     let claimError: string | undefined;
 
     const safeBatchSize = Math.min(100, Math.max(1, batchSize));
-    const lockedBy = `serverless-processor-${Date.now()}`;
+    const lockedBy = newClaimToken("serverless-processor");
+    const staleCutoff = staleLockCutoff();
 
     if (isTimeExhausted && isTimeExhausted()) {
       return { claimed: 0, succeeded: 0, failed: 0, durationMs: Date.now() - startTime };
@@ -151,7 +153,7 @@ export class ServerlessJobProcessor {
           FROM "BackgroundJob"
           WHERE "status" = 'QUEUED'
             AND "availableAt" <= NOW()
-            AND ("lockedAt" IS NULL OR "lockedAt" < NOW() - INTERVAL '10 minutes')
+            AND ("lockedAt" IS NULL OR "lockedAt" < ${staleCutoff})
           ORDER BY "priority" DESC, "availableAt" ASC
           LIMIT 50
           FOR UPDATE SKIP LOCKED
@@ -269,13 +271,15 @@ export class ServerlessJobProcessor {
             logger.info(
               `[ServerlessProcessor] BackgroundJob ${job.id} yielded due to contention lock on authoritative work item.`
             );
+            // Waiting on another holder is not an attempt: give the claim's increment back.
             await prisma.backgroundJob.updateMany({
-              where: { id: job.id, status: BackgroundJobStatus.PROCESSING },
+              where: { id: job.id, status: BackgroundJobStatus.PROCESSING, lockedBy },
               data: {
                 status: BackgroundJobStatus.QUEUED,
                 availableAt: new Date(Date.now() + 5000),
                 lockedAt: null,
                 lockedBy: null,
+                attemptCount: { decrement: 1 },
               },
             });
             continue;
@@ -283,7 +287,7 @@ export class ServerlessJobProcessor {
 
           // Mark job COMPLETED
           await prisma.backgroundJob.updateMany({
-            where: { id: job.id },
+            where: { id: job.id, lockedBy },
             data: {
               status: BackgroundJobStatus.COMPLETED,
               completedAt: new Date(),
@@ -303,7 +307,7 @@ export class ServerlessJobProcessor {
           const backoffDelay = Math.min(300000, 1000 * Math.pow(2, job.attemptCount) + jitterMs);
 
           await prisma.backgroundJob.updateMany({
-            where: { id: job.id },
+            where: { id: job.id, lockedBy },
             data: {
               status: shouldFail ? BackgroundJobStatus.FAILED : BackgroundJobStatus.QUEUED,
               failedAt: shouldFail ? new Date() : null,
@@ -347,7 +351,8 @@ export class ServerlessJobProcessor {
     let claimError: string | undefined;
 
     const safeBatchSize = Math.min(50, Math.max(1, batchSize));
-    const lockedBy = `serverless-processor-${Date.now()}`;
+    const lockedBy = newClaimToken("serverless-processor");
+    const staleCutoff = staleLockCutoff();
 
     if (isTimeExhausted && isTimeExhausted()) {
       return { processed: 0, succeeded: 0, failed: 0, durationMs: Date.now() - startTime };
@@ -361,7 +366,7 @@ export class ServerlessJobProcessor {
           WHERE d."status" = 'QUEUED'
             AND d."category" = 'TRANSACTIONAL'
             AND (d."nextAttemptAt" IS NULL OR d."nextAttemptAt" <= NOW())
-            AND (d."lockedAt" IS NULL OR d."lockedAt" < NOW() - INTERVAL '10 minutes')
+            AND (d."lockedAt" IS NULL OR d."lockedAt" < ${staleCutoff})
           ORDER BY d."createdAt" ASC
           LIMIT 50
           FOR UPDATE SKIP LOCKED
@@ -497,7 +502,8 @@ export class ServerlessJobProcessor {
     let claimError: string | undefined;
 
     const safeBatchSize = Math.min(100, Math.max(1, batchSize));
-    const lockedBy = `serverless-processor-${Date.now()}`;
+    const lockedBy = newClaimToken("serverless-processor");
+    const staleCutoff = staleLockCutoff();
 
     if (isTimeExhausted && isTimeExhausted()) {
       return { processed: 0, succeeded: 0, failed: 0, durationMs: Date.now() - startTime };
@@ -514,7 +520,7 @@ export class ServerlessJobProcessor {
           JOIN active_campaigns ac ON ac.id = r."campaignId"
           WHERE r."status" IN ('PENDING', 'RETRYING')
             AND (r."nextAttemptAt" IS NULL OR r."nextAttemptAt" <= NOW())
-            AND (r."lockedAt" IS NULL OR r."lockedAt" < NOW() - INTERVAL '10 minutes')
+            AND (r."lockedAt" IS NULL OR r."lockedAt" < ${staleCutoff})
           ORDER BY r."createdAt" ASC
           LIMIT 50
           FOR UPDATE SKIP LOCKED
@@ -740,7 +746,7 @@ export class ServerlessJobProcessor {
   /**
    * 9. Job Reconciliation
    */
-  static async reconcileJobs(staleMinutes = 10, isTimeExhausted?: () => boolean): Promise<ReconciliationReport | null> {
+  static async reconcileJobs(staleMinutes = STALE_LOCK_MS / 60000, isTimeExhausted?: () => boolean): Promise<ReconciliationReport | null> {
     if (isTimeExhausted && isTimeExhausted()) {
       return null;
     }
@@ -834,7 +840,7 @@ export class ServerlessJobProcessor {
     // Stage 5: Reconciliation: only executed when explicitly requested (e.g. via separate 5-minute cron)
     let reconciliationResult: ReconciliationReport | null = null;
     if (options.runReconciliation && !isTimeExhausted()) {
-      reconciliationResult = await this.reconcileJobs(10, isTimeExhausted);
+      reconciliationResult = await this.reconcileJobs(STALE_LOCK_MS / 60000, isTimeExhausted);
     }
 
     const durationMs = Date.now() - startTime;

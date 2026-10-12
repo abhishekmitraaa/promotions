@@ -17,6 +17,7 @@ import {
 } from "@prisma/client";
 import { CampaignTriggerService } from "./campaign-trigger-service";
 import { logger } from "../../logger";
+import { SEND_OUTCOME_UNKNOWN, STALE_LOCK_MS, isSendInFlight } from "./claim-lock";
 
 export interface ReconciliationOptions {
   staleMinutes?: number;
@@ -39,7 +40,7 @@ export interface ReconciliationReport {
 export class ReconciliationExecutor {
   static async reconcile(options?: ReconciliationOptions): Promise<ReconciliationReport> {
     const startTime = Date.now();
-    const staleMinutes = options?.staleMinutes || 10;
+    const staleMinutes = options?.staleMinutes || STALE_LOCK_MS / 60000;
     const maxAttempts = options?.maxAttempts || 5;
     const staleCutoff = new Date(Date.now() - staleMinutes * 60 * 1000);
 
@@ -73,7 +74,22 @@ export class ReconciliationExecutor {
     });
 
     for (const delivery of staleDeliveries) {
-      if ((delivery.attemptCount || 0) >= maxAttempts) {
+      if (isSendInFlight(delivery.lockedBy)) {
+        // The worker died during the provider call: the email may already be delivered.
+        // Never re-queue (that would risk a duplicate); surface it for manual review instead.
+        await prisma.emailDelivery.updateMany({
+          where: { id: delivery.id, status: EmailDeliveryStatus.PROCESSING, lockedBy: delivery.lockedBy },
+          data: {
+            status: EmailDeliveryStatus.FAILED,
+            errorCode: SEND_OUTCOME_UNKNOWN,
+            errorMessage: "Worker stopped during the provider send. The email may or may not have been delivered; not retried automatically.",
+            failedAt: new Date(),
+            lockedAt: null,
+            lockedBy: null,
+          },
+        });
+        failedDeliveries++;
+      } else if ((delivery.attemptCount || 0) >= maxAttempts) {
         await prisma.emailDelivery.updateMany({
           where: { id: delivery.id, status: EmailDeliveryStatus.PROCESSING },
           data: {
@@ -118,7 +134,19 @@ export class ReconciliationExecutor {
 
     for (const recipient of staleRecipients) {
       if (checkTime()) break;
-      if ((recipient.attemptCount || 0) >= maxAttempts) {
+      if (isSendInFlight(recipient.lockedBy)) {
+        await prisma.emailCampaignRecipient.updateMany({
+          where: { id: recipient.id, status: "PROCESSING", lockedBy: recipient.lockedBy },
+          data: {
+            status: "FAILED",
+            errorCode: SEND_OUTCOME_UNKNOWN,
+            errorMessage: "Worker stopped during the provider send. The email may or may not have been delivered; not retried automatically.",
+            lockedAt: null,
+            lockedBy: null,
+          },
+        });
+        failedRecipients++;
+      } else if ((recipient.attemptCount || 0) >= maxAttempts) {
         await prisma.emailCampaignRecipient.updateMany({
           where: { id: recipient.id, status: "PROCESSING" },
           data: {
