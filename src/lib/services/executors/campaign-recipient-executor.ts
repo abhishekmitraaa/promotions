@@ -33,6 +33,7 @@ import {
 } from "../../errors/job-errors";
 import { logger } from "../../logger";
 import { getPublicAppUrl } from "../../env";
+import { formatSenderAddress } from "./sender-address";
 import { EmailTrackingService } from "../../email/tracking/email-tracking-service";
 import { CampaignTriggerService } from "./campaign-trigger-service";
 import {
@@ -308,7 +309,9 @@ export class CampaignRecipientExecutor {
           const resolved = await providerRegistry.resolveForTenant(clientId);
           provider = resolved.provider;
           providerType = resolved.providerType;
-          fromAddress = resolved.senderEmail || "campaigns@whatsapphub.internal";
+          fromAddress = resolved.senderEmail
+            ? await formatSenderAddress(clientId, resolved.senderEmail)
+            : "campaigns@whatsapphub.internal";
         }
       }
 

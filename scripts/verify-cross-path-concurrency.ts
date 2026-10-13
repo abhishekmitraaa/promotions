@@ -933,6 +933,34 @@ async function main() {
   });
 
   // ============================================================================
+  // Test 19: From header carries the verified sender identity's display name
+  // ============================================================================
+  console.log("\n▶ [Regression 19] Sender display name is used in the From header...");
+
+  await prisma.emailSenderIdentity.create({
+    data: { clientId: testTenant, email: "named-sender@example.com", name: "Cosora", verified: true },
+  });
+  const namedDelivery = await prisma.emailDelivery.create({
+    data: {
+      clientId: testTenant,
+      providerType: EmailProviderType.MOCK,
+      category: EmailType.TRANSACTIONAL,
+      from: "named-sender@example.com",
+      to: "named-recipient@example.com",
+      subject: "Display name",
+      textContent: "Hello",
+      status: EmailDeliveryStatus.QUEUED,
+    },
+  });
+  trackingProvider.sentPayloads = [];
+  await EmailDeliveryExecutor.execute({ deliveryId: namedDelivery.id });
+  const namedPayload = trackingProvider.sentPayloads.find((p) => p.to === "named-recipient@example.com");
+  assert(
+    namedPayload?.from === '"Cosora" <named-sender@example.com>',
+    `From header uses the identity display name (actual: ${String(namedPayload?.from)})`
+  );
+
+  // ============================================================================
   // Test 15: Configuration safety (queue mode, public URL)
   // ============================================================================
   console.log("\n▶ [Regression 15] Configuration safety defaults...");

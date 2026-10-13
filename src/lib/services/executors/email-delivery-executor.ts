@@ -26,6 +26,7 @@ import { normalizeEmail } from "../../email/normalization";
 import { EmailTrackingService } from "../../email/tracking/email-tracking-service";
 import { EmailUnsubscribeService } from "../email-unsubscribe-service";
 import { getPublicAppUrl } from "../../env";
+import { formatSenderAddress } from "./sender-address";
 import {
   RetryableError,
   PermanentError,
@@ -324,7 +325,7 @@ export class EmailDeliveryExecutor {
       throw emptyErr;
     }
 
-    const fromAddress = providerSenderEmail || delivery.from;
+    const fromAddress = await formatSenderAddress(delivery.clientId, providerSenderEmail || delivery.from);
 
     // 7. Mark the send as in flight. From here on, a crash leaves a marker that prevents an
     //    automatic re-send (the provider may already have accepted the message).
