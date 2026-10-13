@@ -673,6 +673,27 @@ async function runOAuthVerification() {
     testAssert(instanceCConsume.status === "ALREADY_USED", "MULTI-INSTANCE: Instance C receives ALREADY_USED for state consumed on Instance B");
 
     // Simulation B: Process Restart / Serverless Cold Boot
+    // Real user ids are 36-character UUIDs. A state created for one must verify for the same
+    // admin and must stay bound to that admin (regression: long ids were mistaken for a secret).
+    const uuidAdminId = crypto.randomUUID();
+    const uuidAuthUrl = await generateGoogleAuthUrl({
+      googleClientId: "mock-client-id",
+      redirectUri: "http://localhost:3000/api/admin/email/providers/google/callback",
+      tenantId: "client-alpha",
+      adminUserId: uuidAdminId,
+    });
+    const uuidState = new URL(uuidAuthUrl).searchParams.get("state") || "";
+    const otherAdminCheck = await verifyAndConsumeOAuthState(
+      (await createOAuthState("client-alpha", uuidAdminId)),
+      crypto.randomUUID()
+    );
+    testAssert(
+      otherAdminCheck.valid === false && otherAdminCheck.reason === "ADMIN_MISMATCH",
+      `UUID ADMIN: state is bound to the initiating admin (reason: ${otherAdminCheck.reason})`
+    );
+    const uuidCheck = await verifyAndConsumeOAuthState(uuidState, uuidAdminId);
+    testAssert(uuidCheck.valid === true, `UUID ADMIN: state for a UUID admin id verifies (reason: ${uuidCheck.reason || "none"})`);
+
     const restartState = await createOAuthState("client-alpha", adminId);
 
     // Simulate process crash: clear in-process singleton backend reference

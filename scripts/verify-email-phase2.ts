@@ -286,7 +286,7 @@ async function runPhase2Tests() {
   // -------------------------------------------------------------------------
   // 9. OAuth State Generation & Verification (CSRF Protection)
   // -------------------------------------------------------------------------
-  const state = await createOAuthState("tenant-123", "test-secret-32-chars-minimum-len");
+  const state = await createOAuthState("tenant-123", undefined, "test-secret-32-chars-minimum-len");
   const stateVerify = await verifyOAuthState(state, "test-secret-32-chars-minimum-len");
   testAssert(stateVerify.valid === true && stateVerify.tenantId === "tenant-123", "OAuth state encodes and validates tenantId with HMAC signature");
 

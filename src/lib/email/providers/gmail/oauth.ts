@@ -221,25 +221,13 @@ export class OAuthTransactionStore {
  */
 export async function createOAuthState(
   tenantId: string,
-  adminUserIdOrSecret?: string,
+  adminUserId?: string,
   secret?: string
 ): Promise<string> {
-  let adminUserId: string | undefined;
-  let signingSecret: string | undefined;
-
-  if (secret !== undefined) {
-    adminUserId = adminUserIdOrSecret;
-    signingSecret = secret;
-  } else if (adminUserIdOrSecret !== undefined) {
-    // If only 2 arguments are provided:
-    // If it looks like a secret (length >= 20 or contains "secret"), treat as secret for Phase 2 backward compatibility
-    if (adminUserIdOrSecret.length >= 20 || adminUserIdOrSecret.includes("secret")) {
-      signingSecret = adminUserIdOrSecret;
-    } else {
-      adminUserId = adminUserIdOrSecret;
-      signingSecret = process.env.AUTH_SESSION_SECRET;
-    }
-  }
+  // Arguments are positional and explicit. (An earlier version guessed whether the second
+  // argument was a secret from its length, which mistook 36-character user ids for one and
+  // signed the state with the wrong key.)
+  const signingSecret = secret;
 
   const pepper = signingSecret || process.env.AUTH_SESSION_SECRET || "default_oauth_state_secret_32_chars!";
   const nonce = crypto.randomBytes(24).toString("hex");

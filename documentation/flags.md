@@ -1172,6 +1172,22 @@
 - **Mitigation / Next Steps**:
   - Owner: remove unused Vercel variables; proceed with external setup Steps 1–4 and the end-to-end test in Step 6.
 
+### Entry: 2026-10-13 — Email Setup Support: Gmail Connect Failed in Production ("Invalid or tampered OAuth state")
+- **Prompt / Phase**: Owner connecting a personal Gmail in the production dashboard.
+- **Status**: 🟡 In Progress (fix committed locally; needs deploy)
+- **Findings**:
+  - `createOAuthState(tenantId, adminUserId, secret)` treated its second argument as the signing secret when it was 20+ characters long. Real user ids are 36-character UUIDs, so every production state was signed with the user id and failed verification with `INVALID_SIGNATURE`. The test suite used a 16-character admin id and never hit it. Gmail connect could never have worked in production.
+  - Fixed: arguments are explicit, no guessing. Regression tests use a UUID admin id (`verify-email-oauth` 81/81).
+  - The live project is **`promotions`** in a different Vercel account/team (likely `my-project-4f24`). The local `.vercel/project.json` points at a stale `whatsapp-hub` project in the `abhishekmitraaa` account that has no production deployment. Earlier docs that say "project whatsapp-hub" are wrong on this point.
+  - Production contains leftover test data: 9 test API clients (5 with live API keys) and 4 `@alpha.test` users, 2 of them ADMIN. Owner has not yet decided on deletion.
+- **Unresolved Concerns**:
+  - The admin password was shared in chat; it should be changed after setup.
+  - Test admin accounts in production are a standing access risk until removed.
+  - Google app is External/Testing with a personal Gmail: the refresh token is expected to expire after about 7 days.
+  - Scopes were not declared under Data Access in Google Cloud; consent still requested `gmail.send` and `userinfo.email` at connect time.
+- **Mitigation / Next Steps**:
+  - Deploy this fix, retry Connect Google, send a test email. Decide on test-data cleanup. Fix the Vercel link or docs to name the `promotions` project.
+
 ---
 
 ## Flag Template for Subsequent Prompts
