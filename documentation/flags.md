@@ -1188,6 +1188,16 @@
 - **Mitigation / Next Steps**:
   - Deploy this fix, retry Connect Google, send a test email. Decide on test-data cleanup. Fix the Vercel link or docs to name the `promotions` project.
 
+### Entry: 2026-10-13 — First Real Email Delivered in Production
+- **Prompt / Phase**: Gmail connected (`cosora.work@gmail.com`, Development Client) after the OAuth state fix (`b5c6f5d`); owner sent a test via `/api/v1/email/send`.
+- **Status**: ✅ Email channel working end to end
+- **Verified (read-only)**: delivery created 15:26:31 UTC, `TRANSACTIONAL`, `SENT` on attempt 1 at 15:27:00 (next cron tick), Gmail message id stored; its `TRANSACTIONAL_EMAIL` BackgroundJob `COMPLETED`; owner confirmed receipt.
+- **Unresolved Concerns**:
+  - Google app in Testing mode: Gmail connection expected to expire after about 7 days; reconnect via Email → Providers.
+  - Test users/clients still in production (2 test ADMIN accounts); admin password shared in chat.
+  - WhatsApp not yet configured (deferred by owner).
+- **Mitigation / Next Steps**: clean up test data on owner approval; change admin password; WhatsApp setup when ready.
+
 ---
 
 ## Flag Template for Subsequent Prompts
